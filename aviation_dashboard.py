@@ -99,7 +99,9 @@ def download_file(url, filepath):
     return False
 
 def process_bufkit(filepath, model_name, mode='cig'):
-    if not os.path.exists(filepath): return pd.Series()
+    # FIX: Always return a Series with a name to avoid "ValueError: Other Series must have a name"
+    if not os.path.exists(filepath): return pd.Series(name=model_name.upper())
+    
     with open(filepath, 'r') as f: lines = f.readlines()
     selv_ft = 0.0
     for line in lines:
@@ -156,7 +158,7 @@ def process_bufkit(filepath, model_name, mode='cig'):
             else: results.append("--")
     return pd.Series(results, index=times, name=model_name.upper())
 
-# --- 3. MAIN LOGIC ---
+# --- 3. MAIN EXECUTION ---
 def main():
     now = datetime.now(timezone.utc)
     last_updated_str = now.strftime("%Y-%m-%d %H:%M UTC")
@@ -167,7 +169,7 @@ def main():
     hrly_time = now - timedelta(hours=2)
     cyc_h_s, cyc_h_d = f"{hrly_time.hour:02d}", hrly_time.strftime("%Y%m%d")
 
-    # BBOX Adjusted for Florida
+    # BBOX for Space Coast
     bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=279&rightlon=281&bottomlat=27"
     base_url = "https://nomads.ncep.noaa.gov/cgi-bin/"
     nomads_scripts = {'GFS':'filter_gfs_0p25_1hr.pl','NAM':'filter_nam.pl','RAP':'filter_rap.pl','HRRR':'filter_hrrr_2d.pl','ARW':'filter_hiresconus.pl','NEST':'filter_nam_conusnest.pl'}
@@ -181,7 +183,7 @@ def main():
         elif model == 'ARW': dir_path, file_tpl = f'hiresw.{cyc_d}', f'hiresw.t{cyc_s}z.arw_5km.f{{hr}}.conus.grib2'
         elif model == 'NEST': dir_path, file_tpl = f'nam.{cyc_d}', f'nam.t{cyc_s}z.conusnest.hiresf{{hr}}.tm00.grib2'
 
-        for hr in range(1, 24): 
+        for hr in range(1, 19): 
             hr_str = f"{hr:03d}" if model == 'GFS' else f"{hr:02d}"
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
@@ -205,8 +207,12 @@ def main():
     for s in TAF_SITES:
         for m in MODELS_BUFKIT:
             path = os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf")
-            c_dfs[s] = c_dfs[s].join(process_bufkit(path, m, 'cig'), how='outer')
-            l_dfs[s] = l_dfs[s].join(process_bufkit(path, m, 'llws'), how='outer')
+            # FIX: Check if data is returned before joining
+            cig_data = process_bufkit(path, m, 'cig')
+            if not cig_data.empty: c_dfs[s] = c_dfs[s].join(cig_data, how='outer')
+            
+            shear_data = process_bufkit(path, m, 'llws')
+            if not shear_data.empty: l_dfs[s] = l_dfs[s].join(shear_data, how='outer')
 
     cur_ts = pd.Timestamp.utcnow().tz_localize(None).replace(minute=0, second=0, microsecond=0)
     html_tbls = {}
@@ -232,7 +238,6 @@ def main():
     full_history = full_history[:5]
     with open(HISTORY_FILE, 'w') as f: json.dump(full_history, f)
 
-    # Final HTML Factory
     history_json = json.dumps(full_history)
     default_site = TAF_SITES[0].lower()
     
@@ -245,15 +250,15 @@ def main():
 
     dashboard_html = f"""
     <html><head><style>
-    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; transition: background-color 0.3s, color 0.3s; }}
+    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; }}
     a {{ color: #0000ee; text-decoration: none; padding: 3px 6px; border-radius: 4px; cursor: pointer; }}
     .active-link {{ background-color: #007acc !important; color: #ffffff !important; font-weight: bold; }}
     .main-container {{ display: flex; justify-content: center; gap: 30px; margin-top: 40px; }}
-    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 10px; background-color: #f0f0f0; padding: 15px; border-radius: 8px; border: 1px solid #ccc; min-width: 120px; }}
+    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 10px; background-color: #f0f0f0; padding: 15px; border-radius: 8px; border: 1px solid #ccc; }}
     table {{ border-collapse: collapse; margin: 0 auto; background-color: white; }}
     th, td {{ border: 1px solid #999; padding: 4px 8px; text-align: center; font-size: 14px; min-width: 70px; }}
     th {{ background-color: #6495ED; color: white; }}
-    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 15px; width: 320px; font-size: 13px; display: flex; flex-direction: column; }}
+    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 15px; width: 320px; font-size: 13px; }}
     .legend-grid {{ display: flex; justify-content: space-between; text-align: center; margin-bottom: 10px; }}
     .legend-item {{ margin-bottom: 8px; padding: 6px; border-radius: 4px; font-weight: bold; }}
     body.dark-mode {{ background-color: #1e1e1e; color: #e0e0e0; }}
