@@ -13,13 +13,13 @@ from datetime import datetime, timedelta, timezone
 
 warnings.filterwarnings('ignore')
 
-# --- 1. Configuration ---
+# --- 1. CONFIGURATION ---
 TAF_SITES_META = {
-    'KXMR': {'lat': 28.4675, 'lon': -80.5594},
-    'KTTS': {'lat': 28.6150, 'lon': -80.6945},
-    'KCOF': {'lat': 28.2349, 'lon': -80.6101},
-    'KTIX': {'lat': 28.5141, 'lon': -80.7992},
-    'KMLB': {'lat': 28.1028, 'lon': -80.6453}
+    'KXMR': {'lat': 28.4675, 'lon': -80.5594}, # Cape Canaveral Skid Strip
+    'KTTS': {'lat': 28.6150, 'lon': -80.6945}, # NASA Shuttle Landing Facility
+    'KCOF': {'lat': 28.2349, 'lon': -80.6101}, # Patrick Space Force Base
+    'KTIX': {'lat': 28.5141, 'lon': -80.7992}, # Space Coast Regional
+    'KMLB': {'lat': 28.1028, 'lon': -80.6453}  # Melbourne Orlando Intl
 }
 TAF_SITES = list(TAF_SITES_META.keys())
 MODELS_VIS = ['GFS', 'NAM', 'RAP', 'HRRR', 'ARW', 'NEST']
@@ -30,7 +30,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 model_init_strings = {} 
 
-# --- 2. Helpers ---
+# --- 2. HELPERS ---
 def calculate_total_rh(t_c, td_c):
     rh_water = mpcalc.relative_humidity_from_dewpoint(t_c, td_c).magnitude * 100
     if t_c.magnitude >= 0: return rh_water
@@ -62,14 +62,14 @@ def colorize_flight_rules(val):
     if pd.isna(val) or str(val).lower() in ['nan', 'n/a', '--']: return ''
     try:
         f = 0.25 if val == "1/4" else 0.5 if val == "1/2" else 0.75 if val == "3/4" else float(val)
-        if np.isnan(f) or f > 5: return ''
+        if f > 5: return ''
         elif 3 <= f <= 5: return 'background-color: #458B00; color: white;'
         elif 1 <= f < 3: return 'background-color: #CD3333; color: white;'
         else: return 'background-color: #EE82EE; color: black;'
     except: return ''
 
 def style_ceiling_table(val):
-    if val == "N/A" or val == "--": return ''
+    if val in ["N/A", "--"]: return ''
     try:
         h = int(val)
         if h > 3000: return ''
@@ -89,9 +89,8 @@ def style_llws_table(val):
     except: return ''
 
 def download_file(url, filepath):
-    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        r = requests.get(url, headers=headers, timeout=20, stream=True)
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20, stream=True)
         if r.status_code == 200:
             with open(filepath, 'wb') as f:
                 for chunk in r.iter_content(8192): f.write(chunk)
@@ -125,7 +124,7 @@ def process_bufkit(filepath, model_name, mode='cig'):
     is_gfs = (model_name.lower() == "gfs")
     for i, start_idx in enumerate(profile_starts):
         end_idx = profile_starts[i+1] if i + 1 < len(profile_starts) else len(lines)
-        data_lines = [l.split() for l in lines[start_idx+2 : end_idx] if l.strip() and "STN" not in l and "STIM" not in l]
+        data_lines = [l.split() for l in lines[start_idx+2 : end_idx] if l.strip() and "STN" not in l]
         if mode == 'cig':
             lowest_ft = np.nan
             for j in range(0, len(data_lines)-1, 2):
@@ -157,6 +156,7 @@ def process_bufkit(filepath, model_name, mode='cig'):
             else: results.append("--")
     return pd.Series(results, index=times, name=model_name.upper())
 
+# --- 3. MAIN LOGIC ---
 def main():
     now = datetime.now(timezone.utc)
     last_updated_str = now.strftime("%Y-%m-%d %H:%M UTC")
@@ -167,7 +167,7 @@ def main():
     hrly_time = now - timedelta(hours=2)
     cyc_h_s, cyc_h_d = f"{hrly_time.hour:02d}", hrly_time.strftime("%Y%m%d")
 
-    # Adjusted BBOX for Central Florida
+    # BBOX Adjusted for Florida
     bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=279&rightlon=281&bottomlat=27"
     base_url = "https://nomads.ncep.noaa.gov/cgi-bin/"
     nomads_scripts = {'GFS':'filter_gfs_0p25_1hr.pl','NAM':'filter_nam.pl','RAP':'filter_rap.pl','HRRR':'filter_hrrr_2d.pl','ARW':'filter_hiresconus.pl','NEST':'filter_nam_conusnest.pl'}
@@ -181,7 +181,7 @@ def main():
         elif model == 'ARW': dir_path, file_tpl = f'hiresw.{cyc_d}', f'hiresw.t{cyc_s}z.arw_5km.f{{hr}}.conus.grib2'
         elif model == 'NEST': dir_path, file_tpl = f'nam.{cyc_d}', f'nam.t{cyc_s}z.conusnest.hiresf{{hr}}.tm00.grib2'
 
-        for hr in range(1, 19): 
+        for hr in range(1, 24): 
             hr_str = f"{hr:03d}" if model == 'GFS' else f"{hr:02d}"
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
@@ -232,23 +232,32 @@ def main():
     full_history = full_history[:5]
     with open(HISTORY_FILE, 'w') as f: json.dump(full_history, f)
 
-    default_site = TAF_SITES[0].lower() 
+    # Final HTML Factory
     history_json = json.dumps(full_history)
+    default_site = TAF_SITES[0].lower()
     
-    # --- FIXED LINE 183 ---
     def gen_links(param):
-        return "&nbsp; ".join([f'<a {"id=\'def\' " if (i==0 and param=="cig") else ""}onmouseover="setSiteData(this, \'{param}\', \'{s.lower()}\')">{s}</a>' for i, s in enumerate(TAF_SITES)])
+        links = []
+        for i, s in enumerate(TAF_SITES):
+            id_tag = 'id="def" ' if (i == 0 and param == "cig") else ""
+            links.append(f'<a {id_tag}onmouseover="setSiteData(this, \'{param}\', \'{s.lower()}\')">{s}</a>')
+        return "&nbsp; ".join(links)
 
     dashboard_html = f"""
     <html><head><style>
-    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; }}
+    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; transition: background-color 0.3s, color 0.3s; }}
     a {{ color: #0000ee; text-decoration: none; padding: 3px 6px; border-radius: 4px; cursor: pointer; }}
     .active-link {{ background-color: #007acc !important; color: #ffffff !important; font-weight: bold; }}
     .main-container {{ display: flex; justify-content: center; gap: 30px; margin-top: 40px; }}
-    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 10px; background-color: #f0f0f0; padding: 15px; border-radius: 8px; border: 1px solid #ccc; }}
+    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 10px; background-color: #f0f0f0; padding: 15px; border-radius: 8px; border: 1px solid #ccc; min-width: 120px; }}
     table {{ border-collapse: collapse; margin: 0 auto; background-color: white; }}
-    th, td {{ border: 1px solid #999; padding: 4px 8px; text-align: center; font-size: 14px; }}
+    th, td {{ border: 1px solid #999; padding: 4px 8px; text-align: center; font-size: 14px; min-width: 70px; }}
     th {{ background-color: #6495ED; color: white; }}
+    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 15px; width: 320px; font-size: 13px; display: flex; flex-direction: column; }}
+    .legend-grid {{ display: flex; justify-content: space-between; text-align: center; margin-bottom: 10px; }}
+    .legend-item {{ margin-bottom: 8px; padding: 6px; border-radius: 4px; font-weight: bold; }}
+    body.dark-mode {{ background-color: #1e1e1e; color: #e0e0e0; }}
+    body.dark-mode td, body.dark-mode th {{ border: 1px solid #555; background-color: #444; color: white; }}
     </style>
     <script>
     var historyData = {history_json};
@@ -283,6 +292,22 @@ def main():
             <label><input type="radio" name="r" onclick="setRun(4)"> Run -4</label>
         </div>
         <div id="table-container" style="min-width: 600px; overflow-x: auto;"></div>
+        <div class="legend-container">
+            <h3>Legend</h3><hr>
+            <div class="legend-grid">
+                <div><h4>Flight Cat</h4>
+                    <div class="legend-item" style="background-color: #458B00; color: white;">MVFR</div>
+                    <div class="legend-item" style="background-color: #CD3333; color: white;">IFR</div>
+                    <div class="legend-item" style="background-color: #EE82EE; color: black;">LIFR</div>
+                </div>
+                <div><h4>LLWS</h4>
+                    <div class="legend-item" style="background-color: #FFC125; color: black;">Marginal</div>
+                    <div class="legend-item" style="background-color: #CD5B45; color: white;">Moderate</div>
+                    <div class="legend-item" style="background-color: #7A378B; color: white;">High</div>
+                </div>
+            </div>
+            <p style="font-size: 11px; font-style: italic;">* VFR (>3000ft / >5sm) is uncolored.</p>
+        </div>
     </div></div></div></body></html>
     """
     with open("index.html", "w") as f: f.write(dashboard_html)
