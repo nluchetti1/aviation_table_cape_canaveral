@@ -1,0 +1,8 @@
+requests
+numpy
+pandas
+xarray
+cfgrib
+jinja2
+metpy
+dask
