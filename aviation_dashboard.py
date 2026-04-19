@@ -14,12 +14,13 @@ from datetime import datetime, timedelta, timezone
 warnings.filterwarnings('ignore')
 
 # --- 1. CONFIGURATION ---
+# Swapped to the most reliable Central Florida BUFKIT sites
 TAF_SITES_META = {
-    'KMLB': {'lat': 28.1028, 'lon': -80.6453},  # Melbourne Orlando Intl
-    'KTIX': {'lat': 28.5141, 'lon': -80.7992},  # Space Coast Regional
-    'KVRB': {'lat': 27.6556, 'lon': -80.4179},  # Vero Beach Regional
-    'KDAB': {'lat': 29.1799, 'lon': -81.0581},  # Daytona Beach Intl
-    'KSFB': {'lat': 28.7776, 'lon': -81.2375}   # Sanford Intl
+    'KMLB': {'lat': 28.1028, 'lon': -80.6453},  # Melbourne
+    'KDAB': {'lat': 29.1799, 'lon': -81.0581},  # Daytona Beach
+    'KORL': {'lat': 28.5455, 'lon': -81.3329},  # Orlando Executive
+    'KMCO': {'lat': 28.4294, 'lon': -81.3090},  # Orlando Intl
+    'KVRB': {'lat': 27.6556, 'lon': -80.4179}   # Vero Beach
 }
 TAF_SITES = list(TAF_SITES_META.keys())
 MODELS_VIS = ['GFS', 'NAM', 'RAP', 'HRRR', 'ARW', 'NEST']
@@ -165,7 +166,7 @@ def main():
     hrly_time = now - timedelta(hours=2)
     cyc_h_s, cyc_h_d = f"{hrly_time.hour:02d}", hrly_time.strftime("%Y%m%d")
 
-    bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=279&rightlon=282&bottomlat=27"
+    bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=278&rightlon=282&bottomlat=27"
     base_url = "https://nomads.ncep.noaa.gov/cgi-bin/"
     nomads_scripts = {'GFS':'filter_gfs_0p25_1hr.pl','NAM':'filter_nam.pl','RAP':'filter_rap.pl','HRRR':'filter_hrrr_2d.pl','ARW':'filter_hiresconus.pl','NEST':'filter_nam_conusnest.pl'}
 
@@ -178,7 +179,7 @@ def main():
         elif model == 'ARW': dir_path, file_tpl = f'hiresw.{cyc_d}', f'hiresw.t{cyc_s}z.arw_5km.f{{hr}}.conus.grib2'
         elif model == 'NEST': dir_path, file_tpl = f'nam.{cyc_d}', f'nam.t{cyc_s}z.conusnest.hiresf{{hr}}.tm00.grib2'
 
-        for hr in range(1, 49): # Extended back to 48 hours
+        for hr in range(1, 49): 
             hr_str = f"{hr:03d}" if model == 'GFS' else f"{hr:02d}"
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
@@ -213,7 +214,7 @@ def main():
     def to_st_html(df, pt):
         if df.empty: return "<p>Data currently unavailable.</p>"
         d = df.copy(); d.index = pd.to_datetime(d.index).tz_localize(None)
-        d = d[~d.index.duplicated()].sort_index(); d = d[d.index >= cur_ts_utc].head(48) # Increased to 48 hours
+        d = d[~d.index.duplicated()].sort_index(); d = d[d.index >= cur_ts_utc].head(48)
         d.columns = [f"{c} [{model_init_strings.get(c.lower(), '??')}]" for c in d.columns]
         d.index = d.index.strftime('%d/%H'); d.index.name = "Time (UTC)"
         st = d.style.map(colorize_flight_rules) if pt=='vis' else d.style.map(style_ceiling_table) if pt=='cig' else d.style.format(lambda v: f"{str(v).split('|')[0]}kt | {str(v).split('|')[-1]}" if '|' in str(v) else v).map(style_llws_table)
@@ -244,24 +245,25 @@ def main():
 
     dashboard_html = f"""
     <html><head><style>
-    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; }}
+    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; transition: background-color 0.3s, color 0.3s; }}
     a {{ color: #0000ee; text-decoration: none; padding: 3px 6px; border-radius: 4px; cursor: pointer; }}
     .active-link {{ background-color: #007acc !important; color: #ffffff !important; font-weight: bold; }}
     .main-container {{ display: flex; justify-content: center; gap: 30px; margin-top: 40px; }}
-    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 10px; background-color: #f0f0f0; padding: 15px; border-radius: 8px; border: 1px solid #ccc; }}
+    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 10px; background-color: #f0f0f0; padding: 15px; border-radius: 8px; border: 1px solid #ccc; transition: background-color 0.3s, color 0.3s, border-color 0.3s; min-width: 120px; }}
     table {{ border-collapse: collapse; margin: 0 auto; background-color: white; }}
     th, td {{ border: 1px solid #999; padding: 4px 8px; text-align: center; font-size: 14px; min-width: 70px; }}
     th {{ background-color: #6495ED; color: white; }}
     
-    /* Legend CSS - Condensed Grid Style */
+    /* Condensed Legend CSS */
     .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 15px; width: 340px; font-size: 13px; }}
-    .legend-grid {{ display: flex; justify-content: space-between; text-align: left; margin-bottom: 10px; }}
+    .legend-grid {{ display: flex; justify-content: space-between; text-align: left; }}
     .legend-divider {{ width: 1px; background-color: #ccc; margin: 0 10px; }}
-    .legend-item {{ display: flex; align-items: center; margin-bottom: 4px; font-weight: bold; }}
-    .color-box {{ width: 25px; height: 18px; border: 1px solid #666; margin-right: 8px; border-radius: 2px; }}
+    .legend-item {{ display: flex; align-items: center; margin-bottom: 4px; font-weight: bold; line-height: 1.2; }}
+    .color-box {{ width: 22px; height: 18px; border: 1px solid #666; margin-right: 8px; border-radius: 2px; flex-shrink: 0; }}
     
     body.dark-mode {{ background-color: #1e1e1e; color: #e0e0e0; }}
     body.dark-mode td, body.dark-mode th {{ border: 1px solid #555; background-color: #444; color: white; }}
+    body.dark-mode .vertical-run-controls, body.dark-mode .legend-container {{ background-color: #2d2d2d; border-color: #444; color: #e0e0e0; }}
     </style>
     <script>
     var historyData = {history_json};
@@ -297,7 +299,7 @@ def main():
         </div>
         <div id="table-container" style="min-width: 600px; overflow-x: auto;"></div>
         <div class="legend-container">
-            <h3 style="margin:0 0 10px 0;">Legend</h3><hr>
+            <h3 style="margin:0 0 10px 0;">Legend</h3><hr style="margin:5px 0;">
             <div class="legend-grid">
                 <div>
                     <h4 style="margin:5px 0;">Flight Cat</h4>
@@ -313,7 +315,7 @@ def main():
                     <div class="legend-item"><div class="color-box" style="background-color: #7A378B;"></div>High</div>
                 </div>
             </div>
-            <hr>
+            <hr style="margin:10px 0;">
             <div style="text-align: left;">
                 <p style="text-decoration: underline; margin-bottom: 5px;"><strong>Information:</strong></p>
                 <ul style="padding-left: 20px; margin: 0;">
