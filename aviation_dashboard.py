@@ -14,12 +14,13 @@ from datetime import datetime, timedelta, timezone
 warnings.filterwarnings('ignore')
 
 # --- 1. CONFIGURATION ---
+# Swapped military sites for nearby civilian BUFKIT-supported sites
 TAF_SITES_META = {
-    'KXMR': {'lat': 28.4675, 'lon': -80.5594}, # Cape Canaveral Skid Strip
-    'KTTS': {'lat': 28.6150, 'lon': -80.6945}, # NASA Shuttle Landing Facility
-    'KCOF': {'lat': 28.2349, 'lon': -80.6101}, # Patrick Space Force Base
-    'KTIX': {'lat': 28.5141, 'lon': -80.7992}, # Space Coast Regional
-    'KMLB': {'lat': 28.1028, 'lon': -80.6453}  # Melbourne Orlando Intl
+    'KMLB': {'lat': 28.1028, 'lon': -80.6453},  # Melbourne Orlando Intl (Primary)
+    'KTIX': {'lat': 28.5141, 'lon': -80.7992},  # Space Coast Regional (Titusville)
+    'KVRB': {'lat': 27.6556, 'lon': -80.4179},  # Vero Beach Regional
+    'KDAB': {'lat': 29.1799, 'lon': -81.0581},  # Daytona Beach Intl
+    'KSFB': {'lat': 28.7776, 'lon': -81.2375}   # Sanford Intl
 }
 TAF_SITES = list(TAF_SITES_META.keys())
 MODELS_VIS = ['GFS', 'NAM', 'RAP', 'HRRR', 'ARW', 'NEST']
@@ -99,9 +100,7 @@ def download_file(url, filepath):
     return False
 
 def process_bufkit(filepath, model_name, mode='cig'):
-    # FIX: Always return a Series with a name to avoid "ValueError: Other Series must have a name"
     if not os.path.exists(filepath): return pd.Series(name=model_name.upper())
-    
     with open(filepath, 'r') as f: lines = f.readlines()
     selv_ft = 0.0
     for line in lines:
@@ -163,14 +162,12 @@ def main():
     now = datetime.now(timezone.utc)
     last_updated_str = now.strftime("%Y-%m-%d %H:%M UTC")
     
-    # Cycles
     cyc_6hr = 18 if now.hour < 4 else 0 if now.hour < 10 else 6 if now.hour < 16 else 12 if now.hour < 22 else 18
     cyc_6_d = (now - timedelta(days=1)).strftime("%Y%m%d") if now.hour < 4 else now.strftime("%Y%m%d")
     hrly_time = now - timedelta(hours=2)
     cyc_h_s, cyc_h_d = f"{hrly_time.hour:02d}", hrly_time.strftime("%Y%m%d")
 
-    # BBOX for Space Coast
-    bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=279&rightlon=281&bottomlat=27"
+    bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=279&rightlon=282&bottomlat=27"
     base_url = "https://nomads.ncep.noaa.gov/cgi-bin/"
     nomads_scripts = {'GFS':'filter_gfs_0p25_1hr.pl','NAM':'filter_nam.pl','RAP':'filter_rap.pl','HRRR':'filter_hrrr_2d.pl','ARW':'filter_hiresconus.pl','NEST':'filter_nam_conusnest.pl'}
 
@@ -183,14 +180,14 @@ def main():
         elif model == 'ARW': dir_path, file_tpl = f'hiresw.{cyc_d}', f'hiresw.t{cyc_s}z.arw_5km.f{{hr}}.conus.grib2'
         elif model == 'NEST': dir_path, file_tpl = f'nam.{cyc_d}', f'nam.t{cyc_s}z.conusnest.hiresf{{hr}}.tm00.grib2'
 
-        for hr in range(1, 19): 
+        for hr in range(1, 13): 
             hr_str = f"{hr:03d}" if model == 'GFS' else f"{hr:02d}"
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
 
-    buf_urls = {'nam': "http://www.meteo.psu.edu/bufkit/data/latest/nam_{site}.buf", 'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 'rap': "http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{site}.buf", 'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf", 'nest': "https://www.meteo.psu.edu/bufkit/data/NAMNEST/latest/namnest_{site}.buf", 'arw': "https://www.meteo.psu.edu/bufkit/data/HIRESW/latest/hiresw_{site}.buf"}
+    p_urls = {'nam': "http://www.meteo.psu.edu/bufkit/data/latest/nam_{site}.buf", 'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 'rap': "http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{site}.buf", 'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf", 'nest': "https://www.meteo.psu.edu/bufkit/data/NAMNEST/latest/namnest_{site}.buf", 'arw': "https://www.meteo.psu.edu/bufkit/data/HIRESW/latest/hiresw_{site}.buf"}
     for s in TAF_SITES:
-        for m, u in buf_urls.items(): download_file(u.format(site=s.lower()), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
+        for m, u in p_urls.items(): download_file(u.format(site=s.lower()), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
 
     v_dfs, c_dfs, l_dfs = {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}
     for m in MODELS_VIS:
@@ -207,19 +204,18 @@ def main():
     for s in TAF_SITES:
         for m in MODELS_BUFKIT:
             path = os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf")
-            # FIX: Check if data is returned before joining
             cig_data = process_bufkit(path, m, 'cig')
             if not cig_data.empty: c_dfs[s] = c_dfs[s].join(cig_data, how='outer')
-            
             shear_data = process_bufkit(path, m, 'llws')
             if not shear_data.empty: l_dfs[s] = l_dfs[s].join(shear_data, how='outer')
 
-    cur_ts = pd.Timestamp.utcnow().tz_localize(None).replace(minute=0, second=0, microsecond=0)
     html_tbls = {}
+    cur_ts_utc = pd.Timestamp.utcnow().tz_localize(None).replace(minute=0, second=0, microsecond=0)
+    
     def to_st_html(df, pt):
-        if df.empty: return "<p>N/A</p>"
+        if df.empty: return "<p>Data currently unavailable.</p>"
         d = df.copy(); d.index = pd.to_datetime(d.index).tz_localize(None)
-        d = d[~d.index.duplicated()].sort_index(); d = d[d.index >= cur_ts].head(24)
+        d = d[~d.index.duplicated()].sort_index(); d = d[d.index >= cur_ts_utc].head(24)
         d.columns = [f"{c} [{model_init_strings.get(c.lower(), '??')}]" for c in d.columns]
         d.index = d.index.strftime('%d/%H'); d.index.name = "Time (UTC)"
         st = d.style.map(colorize_flight_rules) if pt=='vis' else d.style.map(style_ceiling_table) if pt=='cig' else d.style.format(lambda v: f"{str(v).split('|')[0]}kt | {str(v).split('|')[-1]}" if '|' in str(v) else v).map(style_llws_table)
@@ -238,6 +234,7 @@ def main():
     full_history = full_history[:5]
     with open(HISTORY_FILE, 'w') as f: json.dump(full_history, f)
 
+    # Output dashboard
     history_json = json.dumps(full_history)
     default_site = TAF_SITES[0].lower()
     
@@ -250,19 +247,20 @@ def main():
 
     dashboard_html = f"""
     <html><head><style>
-    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; }}
+    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; transition: background-color 0.3s, color 0.3s; }}
     a {{ color: #0000ee; text-decoration: none; padding: 3px 6px; border-radius: 4px; cursor: pointer; }}
     .active-link {{ background-color: #007acc !important; color: #ffffff !important; font-weight: bold; }}
     .main-container {{ display: flex; justify-content: center; gap: 30px; margin-top: 40px; }}
-    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 10px; background-color: #f0f0f0; padding: 15px; border-radius: 8px; border: 1px solid #ccc; }}
+    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 10px; background-color: #f0f0f0; padding: 15px; border-radius: 8px; border: 1px solid #ccc; min-width: 120px; }}
     table {{ border-collapse: collapse; margin: 0 auto; background-color: white; }}
     th, td {{ border: 1px solid #999; padding: 4px 8px; text-align: center; font-size: 14px; min-width: 70px; }}
     th {{ background-color: #6495ED; color: white; }}
-    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 15px; width: 320px; font-size: 13px; }}
+    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 15px; width: 320px; font-size: 13px; display: flex; flex-direction: column; }}
     .legend-grid {{ display: flex; justify-content: space-between; text-align: center; margin-bottom: 10px; }}
+    .legend-divider {{ width: 1px; background-color: #ccc; margin: 0 10px; }}
     .legend-item {{ margin-bottom: 8px; padding: 6px; border-radius: 4px; font-weight: bold; }}
     body.dark-mode {{ background-color: #1e1e1e; color: #e0e0e0; }}
-    body.dark-mode td, body.dark-mode th {{ border: 1px solid #555; background-color: #444; color: white; }}
+    body.dark-mode td, body.dark-mode .row_heading {{ border: 1px solid #555; background-color: #444; color: white; }}
     </style>
     <script>
     var historyData = {history_json};
@@ -305,13 +303,29 @@ def main():
                     <div class="legend-item" style="background-color: #CD3333; color: white;">IFR</div>
                     <div class="legend-item" style="background-color: #EE82EE; color: black;">LIFR</div>
                 </div>
+                <div class="legend-divider"></div>
                 <div><h4>LLWS</h4>
                     <div class="legend-item" style="background-color: #FFC125; color: black;">Marginal</div>
                     <div class="legend-item" style="background-color: #CD5B45; color: white;">Moderate</div>
                     <div class="legend-item" style="background-color: #7A378B; color: white;">High</div>
                 </div>
             </div>
-            <p style="font-size: 11px; font-style: italic;">* VFR (>3000ft / >5sm) is uncolored.</p>
+            <hr>
+            <div class="info-section" style="text-align: left;">
+                <p style="text-decoration: underline;"><strong>Information:</strong></p>
+                <ul>
+                    <li>Cloud ceiling is derived as lowest model layer where RH is &ge; 95%.</li>
+                    <li>Visibility is derived using the model visibility variable at the nearest grid point.</li>
+                    <li>Wind Shear thresholds:
+                        <ul>
+                            <li><strong>Marginal:</strong> &ge; 20 kt</li>
+                            <li><strong>Moderate:</strong> &ge; 30 kt</li>
+                            <li><strong>High:</strong> &ge; 40 kt</li>
+                        </ul>
+                    </li>
+                </ul>
+                <p style="font-size: 11px; font-style: italic; text-align: center;">* VFR (>3000ft / >5sm) is uncolored.</p>
+            </div>
         </div>
     </div></div></div></body></html>
     """
