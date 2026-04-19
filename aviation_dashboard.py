@@ -255,26 +255,25 @@ def main():
 
     dashboard_html = f"""
     <html><head><style>
-    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; transition: background-color 0.3s, color 0.3s; }}
-    a {{ color: #0000ee; text-decoration: none; padding: 3px 6px; border-radius: 4px; cursor: pointer; }}
+    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; transition: background-color 0.3s, color 0.3s; font-size: 10px; }}
+    a {{ color: #0000ee; text-decoration: none; padding: 2px 4px; border-radius: 4px; cursor: pointer; }}
     .active-link {{ background-color: #007acc !important; color: #ffffff !important; font-weight: bold; }}
-    .main-container {{ display: flex; justify-content: center; gap: 30px; margin-top: 40px; }}
-    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 10px; background-color: #f0f0f0; padding: 15px; border-radius: 8px; border: 1px solid #ccc; transition: background-color 0.3s, color 0.3s, border-color 0.3s; min-width: 120px; }}
+    .main-container {{ display: flex; justify-content: center; gap: 20px; margin-top: 20px; }}
+    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 6px; background-color: #f0f0f0; padding: 10px; border-radius: 8px; border: 1px solid #ccc; transition: background-color 0.3s, color 0.3s, border-color 0.3s; min-width: 100px; }}
     table {{ border-collapse: collapse; margin: 0 auto; background-color: white; }}
-    th, td {{ border: 1px solid #999; padding: 4px 8px; text-align: center; font-size: 14px; min-width: 70px; }}
+    th, td {{ border: 1px solid #999; padding: 2px 4px; text-align: center; font-size: 10px; min-width: 55px; }}
     th {{ background-color: #6495ED; color: white; }}
     
-    /* Legend CSS - Restored to original layout */
-    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 15px; width: 320px; font-size: 13px; transition: background-color 0.3s, color 0.3s, border-color 0.3s; display: flex; flex-direction: column; }}
-    .legend-container h3 {{ text-align: center; margin: 0 0 10px 0; }}
-    .legend-grid {{ display: flex; justify-content: space-between; text-align: center; margin-bottom: 10px; }}
+    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 10px; width: 280px; font-size: 11px; display: flex; flex-direction: column; }}
+    .legend-container h3 {{ text-align: center; margin: 0 0 8px 0; font-size: 13px; }}
+    .legend-grid {{ display: flex; justify-content: space-between; text-align: center; margin-bottom: 8px; }}
     .legend-col {{ flex: 1; }}
-    .legend-col h4 {{ margin: 0 0 10px 0; font-size: 14px; }}
-    .legend-divider {{ width: 1px; background-color: #ccc; margin: 0 10px; transition: background-color 0.3s; }}
-    .legend-item {{ margin-bottom: 8px; padding: 6px; border-radius: 4px; font-weight: bold; }}
-    .info-section ul {{ padding-left: 20px; margin: 5px 0; }}
-    .info-section li {{ margin-bottom: 8px; }}
-    hr {{ border: 0; height: 1px; background: #ccc; margin: 15px 0; transition: background-color 0.3s; }}
+    .legend-col h4 {{ margin: 0 0 8px 0; font-size: 11px; }}
+    .legend-divider {{ width: 1px; background-color: #ccc; margin: 0 8px; }}
+    .legend-item {{ margin-bottom: 4px; padding: 4px; border-radius: 2px; font-weight: bold; }}
+    .info-section ul {{ padding-left: 15px; margin: 3px 0; }}
+    .info-section li {{ margin-bottom: 5px; }}
+    hr {{ border: 0; height: 1px; background: #ccc; margin: 10px 0; }}
 
     /* Dark Mode */
     body.dark-mode {{ background-color: #1e1e1e; color: #e0e0e0; }}
@@ -302,20 +301,20 @@ def main():
     function toggleTheme() {{ document.body.classList.toggle('dark-mode'); }}
     window.onload = function() {{ setSiteData(document.getElementById('def'), 'cig', '{default_site}'); }};
     </script></head><body>
-    <button style="position: absolute; top: 15px; right: 15px;" onclick="toggleTheme()">Toggle Dark Mode</button>
+    <button style="position: absolute; top: 10px; right: 10px;" onclick="toggleTheme()">Theme</button>
     <div class="main-container"><div style="text-align: center;">
-    <h3 id="ts">Run Time: {last_updated_str}</h3>
-    <p>Ceilings: {gen_links('cig')} &nbsp;&nbsp;&nbsp; Vis: {gen_links('vis')} &nbsp;&nbsp;&nbsp; Shear: {gen_links('llws')}</p>
-    <div style="display: flex; gap: 20px; align-items: flex-start;">
+    <h3 id="ts" style="margin-bottom: 10px;">Run Time: {last_updated_str}</h3>
+    <p style="margin-bottom: 15px;">Ceilings: {gen_links('cig')} &nbsp;&nbsp;&nbsp; Vis: {gen_links('vis')} &nbsp;&nbsp;&nbsp; Shear: {gen_links('llws')}</p>
+    <div style="display: flex; gap: 15px; align-items: flex-start;">
         <div class="vertical-run-controls">
             <b>Model Run</b>
-            <label><input type="radio" name="r" onclick="setRun(0)" checked> Current Run</label>
+            <label><input type="radio" name="r" onclick="setRun(0)" checked> Current</label>
             <label><input type="radio" name="r" onclick="setRun(1)"> Run -1</label>
             <label><input type="radio" name="r" onclick="setRun(2)"> Run -2</label>
             <label><input type="radio" name="r" onclick="setRun(3)"> Run -3</label>
             <label><input type="radio" name="r" onclick="setRun(4)"> Run -4</label>
         </div>
-        <div id="table-container" style="min-width: 600px; overflow-x: auto;"></div>
+        <div id="table-container" style="min-width: 550px; overflow-x: auto;"></div>
         <div class="legend-container">
             <h3>Legend</h3><hr>
             <div class="legend-grid">
@@ -341,13 +340,13 @@ def main():
                     <li>Visibility is derived using the model visibility variable, using the grid point value closest to each TAF site.</li>
                     <li>Wind Shear thresholds are defined as follows:
                         <ul>
-                            <li><strong>Marginal:</strong> Shear magnitude greater than or equal to 20 kt</li>
-                            <li><strong>Moderate:</strong> Shear magnitude greater than or equal to 30 kt</li>
-                            <li><strong>High:</strong> Shear magnitude greater than or equal to 40 kt</li>
+                            <li><strong>Marginal:</strong> Shear magnitude &ge; 20 kt</li>
+                            <li><strong>Moderate:</strong> Shear magnitude &ge; 30 kt</li>
+                            <li><strong>High:</strong> Shear magnitude &ge; 40 kt</li>
                         </ul>
                     </li>
                 </ul>
-                <p style="font-style: italic; font-size: 11px; text-align: center; margin-top: 15px;">* Note: VFR (> 3000 ft and > 5 miles) is uncolored (white).</p>
+                <p style="font-style: italic; font-size: 10px; text-align: center; margin-top: 10px;">* Note: VFR (> 3000 ft and > 5 miles) is uncolored (white).</p>
             </div>
         </div>
     </div></div></div></body></html>
