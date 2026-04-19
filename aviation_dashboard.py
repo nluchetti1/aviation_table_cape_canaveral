@@ -14,7 +14,6 @@ from datetime import datetime, timedelta, timezone
 warnings.filterwarnings('ignore')
 
 # --- 1. CONFIGURATION ---
-# The sites you requested
 TAF_SITES_META = {
     'KDAB': {'lat': 29.1799, 'lon': -81.0581},
     'KXMR': {'lat': 28.4675, 'lon': -80.5594},
@@ -36,7 +35,7 @@ def calculate_total_rh(t_c, td_c):
     rh_water = mpcalc.relative_humidity_from_dewpoint(t_c, td_c).magnitude * 100
     if t_c.magnitude >= 0: return rh_water
     T, Td = t_c.magnitude, td_c.magnitude
-    e = 6.112 * np.exp((17.67 * T) / (T + 243.5)) # Standard approximation
+    e = 6.112 * np.exp((17.67 * T) / (T + 243.5))
     e_s_ice = 6.112 * np.exp((22.46 * T) / (T + 272.62))
     return max(rh_water, (e / e_s_ice) * 100)
 
@@ -162,7 +161,7 @@ def main():
     now = datetime.now(timezone.utc)
     last_updated_str = now.strftime("%Y-%m-%d %H:%M UTC")
     
-    # 1. Download GRIBs
+    # Cycles
     cyc_6hr = 18 if now.hour < 4 else 0 if now.hour < 10 else 6 if now.hour < 16 else 12 if now.hour < 22 else 18
     cyc_6_d = (now - timedelta(days=1)).strftime("%Y%m%d") if now.hour < 4 else now.strftime("%Y%m%d")
     hrly_time = now - timedelta(hours=2)
@@ -186,12 +185,11 @@ def main():
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
 
-    # 2. BUFKIT Download - FIXED to use 'XMR' for military site IDs
     p_urls = {'nam': "http://www.meteo.psu.edu/bufkit/data/latest/nam_{site}.buf", 'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 'rap': "http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{site}.buf", 'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf", 'nest': "https://www.meteo.psu.edu/bufkit/data/NAMNEST/latest/namnest_{site}.buf", 'arw': "https://www.meteo.psu.edu/bufkit/data/HIRESW/latest/hiresw_{site}.buf"}
     f_url = "https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={model}&station={site}"
 
     for s in TAF_SITES:
-        # Strip 'K' if 4 letters (KXMR -> XMR, KMLB -> MLB)
+        # STRIP 'K' for BUFKIT sites (XMR vs KXMR)
         buf_id = s[1:].lower() if (len(s) == 4 and s.startswith('K')) else s.lower()
         for m, u in p_urls.items(): 
             success = download_file(u.format(site=buf_id), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
@@ -199,7 +197,6 @@ def main():
                 iem_mod = 'nam4km' if m == 'nest' else m
                 download_file(f_url.format(model=iem_mod, site=buf_id.upper()), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
 
-    # 3. Processing
     v_dfs, c_dfs, l_dfs = {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}
     for m in MODELS_VIS:
         files = sorted(glob.glob(os.path.join(DATA_DIR, f"{m.lower()}*.grib2")))
@@ -220,7 +217,8 @@ def main():
             shear_data = process_bufkit(path, m, 'llws')
             if not shear_data.empty: l_dfs[s] = l_dfs[s].join(shear_data, how='outer')
 
-    run_start_utc = now.replace(minute=0, second=0, microsecond=0)
+    # FIX: run_start_utc must be TZ-NAIVE to compare with model index
+    run_start_utc = now.replace(minute=0, second=0, microsecond=0, tzinfo=None)
     html_tbls = {}
     
     def to_st_html(df, pt, table_start_time):
@@ -266,11 +264,11 @@ def main():
     th, td {{ border: 1px solid #999; padding: 2px 4px; text-align: center; min-width: 60px; }}
     th {{ background-color: #6495ED; color: white; }}
     
-    /* Optimized Condensed Legend CSS */
+    /* Condensed Legend Fix */
     .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 10px; width: 260px; font-size: 11px; }}
     .legend-grid {{ display: flex; justify-content: space-between; }}
     .legend-divider {{ width: 1px; background-color: #ccc; margin: 0 6px; }}
-    .legend-item {{ display: flex; align-items: center; margin-bottom: 3px; font-weight: bold; white-space: nowrap; }}
+    .legend-item {{ display: flex; align-items: center; margin-bottom: 2px; font-weight: bold; white-space: nowrap; }}
     .color-box {{ width: 16px; height: 12px; border: 1px solid #444; margin-right: 4px; border-radius: 1px; flex-shrink: 0; }}
     
     body.dark-mode {{ background-color: #1e1e1e; color: #e0e0e0; }}
