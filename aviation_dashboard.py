@@ -157,12 +157,11 @@ def process_bufkit(filepath, model_name, mode='cig'):
             else: results.append("--")
     return pd.Series(results, index=times, name=s_name)
 
-# --- 3. MAIN LOGIC ---
+# --- 3. MAIN EXECUTION ---
 def main():
     now = datetime.now(timezone.utc)
     last_updated_str = now.strftime("%Y-%m-%d %H:%M UTC")
     
-    # Cycles
     cyc_6hr = 18 if now.hour < 4 else 0 if now.hour < 10 else 6 if now.hour < 16 else 12 if now.hour < 22 else 18
     cyc_6_d = (now - timedelta(days=1)).strftime("%Y%m%d") if now.hour < 4 else now.strftime("%Y%m%d")
     hrly_time = now - timedelta(hours=2)
@@ -186,12 +185,10 @@ def main():
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
 
-    # FIXED: Only strip 'K' for XMR specifically
     p_urls = {'nam': "http://www.meteo.psu.edu/bufkit/data/latest/nam_{site}.buf", 'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 'rap': "http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{site}.buf", 'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf", 'nest': "https://www.meteo.psu.edu/bufkit/data/NAMNEST/latest/namnest_{site}.buf", 'arw': "https://www.meteo.psu.edu/bufkit/data/HIRESW/latest/hiresw_{site}.buf"}
     f_url = "https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={model}&station={site}"
 
     for s in TAF_SITES:
-        # XMR special case, otherwise keep K
         buf_id = s[1:].lower() if s == 'KXMR' else s.lower()
         for m, u in p_urls.items(): 
             success = download_file(u.format(site=buf_id), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
@@ -258,24 +255,33 @@ def main():
 
     dashboard_html = f"""
     <html><head><style>
-    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; font-size: 11px; }}
-    a {{ color: #0000ee; text-decoration: none; padding: 2px 4px; border-radius: 4px; cursor: pointer; }}
+    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; transition: background-color 0.3s, color 0.3s; }}
+    a {{ color: #0000ee; text-decoration: none; padding: 3px 6px; border-radius: 4px; cursor: pointer; }}
     .active-link {{ background-color: #007acc !important; color: #ffffff !important; font-weight: bold; }}
-    .main-container {{ display: flex; justify-content: center; gap: 15px; margin-top: 25px; }}
-    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 6px; background-color: #f0f0f0; padding: 10px; border-radius: 8px; border: 1px solid #ccc; min-width: 105px; }}
-    table {{ border-collapse: collapse; margin: 0 auto; background-color: white; font-size: 11px; }}
-    th, td {{ border: 1px solid #999; padding: 2px 4px; text-align: center; min-width: 60px; }}
+    .main-container {{ display: flex; justify-content: center; gap: 30px; margin-top: 40px; }}
+    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 10px; background-color: #f0f0f0; padding: 15px; border-radius: 8px; border: 1px solid #ccc; transition: background-color 0.3s, color 0.3s, border-color 0.3s; min-width: 120px; }}
+    table {{ border-collapse: collapse; margin: 0 auto; background-color: white; }}
+    th, td {{ border: 1px solid #999; padding: 4px 8px; text-align: center; font-size: 14px; min-width: 70px; }}
     th {{ background-color: #6495ED; color: white; }}
     
-    /* Optimized Condensed Legend Fix */
-    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 10px; width: 280px; font-size: 11px; }}
-    .legend-grid {{ display: flex; justify-content: space-between; align-items: start; }}
-    .legend-divider {{ width: 1px; background-color: #ccc; margin: 0 8px; height: 45px; }}
-    .legend-item {{ display: flex; align-items: center; margin-bottom: 2px; font-weight: bold; white-space: nowrap; }}
-    .color-box {{ width: 18px; height: 12px; border: 1px solid #444; margin-right: 5px; border-radius: 1px; flex-shrink: 0; }}
-    
+    /* Legend CSS - Restored to original layout */
+    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 15px; width: 320px; font-size: 13px; transition: background-color 0.3s, color 0.3s, border-color 0.3s; display: flex; flex-direction: column; }}
+    .legend-container h3 {{ text-align: center; margin: 0 0 10px 0; }}
+    .legend-grid {{ display: flex; justify-content: space-between; text-align: center; margin-bottom: 10px; }}
+    .legend-col {{ flex: 1; }}
+    .legend-col h4 {{ margin: 0 0 10px 0; font-size: 14px; }}
+    .legend-divider {{ width: 1px; background-color: #ccc; margin: 0 10px; transition: background-color 0.3s; }}
+    .legend-item {{ margin-bottom: 8px; padding: 6px; border-radius: 4px; font-weight: bold; }}
+    .info-section ul {{ padding-left: 20px; margin: 5px 0; }}
+    .info-section li {{ margin-bottom: 8px; }}
+    hr {{ border: 0; height: 1px; background: #ccc; margin: 15px 0; transition: background-color 0.3s; }}
+
+    /* Dark Mode */
     body.dark-mode {{ background-color: #1e1e1e; color: #e0e0e0; }}
-    body.dark-mode td, body.dark-mode th {{ border: 1px solid #555; background-color: #444; color: white; }}
+    body.dark-mode td, body.dark-mode .row_heading {{ border: 1px solid #555; background-color: #444; color: white; }}
+    body.dark-mode a {{ color: #66b2ff; }}
+    body.dark-mode .vertical-run-controls, body.dark-mode .legend-container {{ background-color: #2d2d2d; border-color: #444; color: #e0e0e0; }}
+    body.dark-mode .legend-divider, body.dark-mode hr {{ background-color: #555; }}
     </style>
     <script>
     var historyData = {history_json};
@@ -296,46 +302,52 @@ def main():
     function toggleTheme() {{ document.body.classList.toggle('dark-mode'); }}
     window.onload = function() {{ setSiteData(document.getElementById('def'), 'cig', '{default_site}'); }};
     </script></head><body>
-    <button style="position: absolute; top: 10px; right: 10px; font-size: 9px;" onclick="toggleTheme()">Toggle Dark Mode</button>
+    <button style="position: absolute; top: 15px; right: 15px;" onclick="toggleTheme()">Toggle Dark Mode</button>
     <div class="main-container"><div style="text-align: center;">
-    <h3 id="ts" style="margin: 0 0 10px 0; font-size: 14px;">Run Time: {last_updated_str}</h3>
-    <p style="margin-bottom: 10px;">Ceilings: {gen_links('cig')} &nbsp;&nbsp;&nbsp; Vis: {gen_links('vis')} &nbsp;&nbsp;&nbsp; Shear: {gen_links('llws')}</p>
-    <div style="display: flex; gap: 10px; align-items: flex-start;">
+    <h3 id="ts">Run Time: {last_updated_str}</h3>
+    <p>Ceilings: {gen_links('cig')} &nbsp;&nbsp;&nbsp; Vis: {gen_links('vis')} &nbsp;&nbsp;&nbsp; Shear: {gen_links('llws')}</p>
+    <div style="display: flex; gap: 20px; align-items: flex-start;">
         <div class="vertical-run-controls">
-            <b style="font-size: 10px; margin-bottom: 2px;">Model Run</b>
+            <b>Model Run</b>
             <label><input type="radio" name="r" onclick="setRun(0)" checked> Current Run</label>
             <label><input type="radio" name="r" onclick="setRun(1)"> Run -1</label>
             <label><input type="radio" name="r" onclick="setRun(2)"> Run -2</label>
             <label><input type="radio" name="r" onclick="setRun(3)"> Run -3</label>
             <label><input type="radio" name="r" onclick="setRun(4)"> Run -4</label>
         </div>
-        <div id="table-container" style="min-width: 500px; overflow-x: auto;"></div>
+        <div id="table-container" style="min-width: 600px; overflow-x: auto;"></div>
         <div class="legend-container">
-            <h4 style="margin:0 0 5px 0; text-align: center;">Legend</h4><hr style="margin:2px 0;">
+            <h3>Legend</h3><hr>
             <div class="legend-grid">
-                <div>
-                    <b style="font-size: 9px; display: block; margin-bottom: 2px;">Flight Cat</b>
-                    <div class="legend-item"><div class="color-box" style="background-color: #458B00;"></div>MVFR</div>
-                    <div class="legend-item"><div class="color-box" style="background-color: #CD3333;"></div>IFR</div>
-                    <div class="legend-item"><div class="color-box" style="background-color: #EE82EE;"></div>LIFR</div>
+                <div class="legend-col">
+                    <h4>Flight Cat</h4>
+                    <div class="legend-item" style="background-color: #458B00; color: white;">MVFR</div>
+                    <div class="legend-item" style="background-color: #CD3333; color: white;">IFR</div>
+                    <div class="legend-item" style="background-color: #EE82EE; color: black;">LIFR</div>
                 </div>
                 <div class="legend-divider"></div>
-                <div>
-                    <b style="font-size: 9px; display: block; margin-bottom: 2px;">LLWS</b>
-                    <div class="legend-item"><div class="color-box" style="background-color: #FFC125;"></div>Marginal</div>
-                    <div class="legend-item"><div class="color-box" style="background-color: #CD5B45;"></div>Moderate</div>
-                    <div class="legend-item"><div class="color-box" style="background-color: #7A378B;"></div>High</div>
+                <div class="legend-col">
+                    <h4>LLWS</h4>
+                    <div class="legend-item" style="background-color: #FFC125; color: black;">Marginal</div>
+                    <div class="legend-item" style="background-color: #CD5B45; color: white;">Moderate</div>
+                    <div class="legend-item" style="background-color: #7A378B; color: white;">High</div>
                 </div>
             </div>
-            <hr style="margin:6px 0;">
-            <div style="text-align: left; font-size: 10px;">
-                <p style="text-decoration: underline; margin-bottom: 2px;"><strong>Information:</strong></p>
-                <ul style="padding-left: 12px; margin: 0;">
-                    <li>Ceiling: Layer where RH &ge; 95%.</li>
-                    <li>Vis: Model at nearest grid pt.</li>
-                    <li>Shear: &ge; 20kt, 30kt, 40kt.</li>
+            <hr>
+            <div class="info-section" style="text-align: left;">
+                <p style="text-decoration: underline; margin-bottom: 5px;"><strong>Information:</strong></p>
+                <ul>
+                    <li>Cloud ceiling is derived as lowest model layer where RH is greater than or equal to 95%.</li>
+                    <li>Visibility is derived using the model visibility variable, using the grid point value closest to each TAF site.</li>
+                    <li>Wind Shear thresholds are defined as follows:
+                        <ul>
+                            <li><strong>Marginal:</strong> Shear magnitude greater than or equal to 20 kt</li>
+                            <li><strong>Moderate:</strong> Shear magnitude greater than or equal to 30 kt</li>
+                            <li><strong>High:</strong> Shear magnitude greater than or equal to 40 kt</li>
+                        </ul>
+                    </li>
                 </ul>
-                <p style="font-size: 9px; font-style: italic; text-align: center; margin-top: 4px;">* VFR is uncolored.</p>
+                <p style="font-style: italic; font-size: 11px; text-align: center; margin-top: 15px;">* Note: VFR (> 3000 ft and > 5 miles) is uncolored (white).</p>
             </div>
         </div>
     </div></div></div></body></html>
