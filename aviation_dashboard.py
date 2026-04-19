@@ -99,7 +99,8 @@ def download_file(url, filepath):
     return False
 
 def process_bufkit(filepath, model_name, mode='cig'):
-    if not os.path.exists(filepath): return pd.Series(name=model_name.upper())
+    s_name = model_name.upper()
+    if not os.path.exists(filepath): return pd.Series(name=s_name)
     with open(filepath, 'r') as f: lines = f.readlines()
     selv_ft = 0.0
     for line in lines:
@@ -115,7 +116,7 @@ def process_bufkit(filepath, model_name, mode='cig'):
         if "TIME =" in line:
             match = re.search(r'TIME =\s*(\d{6}/\d{4})', line)
             if match:
-                dt = datetime.strptime(match.group(1), "%y%m%d/%H%M").replace(tzinfo=timezone.utc)
+                dt = datetime.strptime(match.group(1), "%y%m%d/%H%M").replace(tzinfo=None)
                 times.append(dt)
                 if model_name not in model_init_strings: model_init_strings[model_name] = dt.strftime('%m/%d %HZ')
         if "PRES TMPC" in line: profile_starts.append(i)
@@ -154,9 +155,9 @@ def process_bufkit(filepath, model_name, mode='cig'):
             if max_s >= 20: 
                 results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
             else: results.append("--")
-    return pd.Series(results, index=times, name=model_name.upper())
+    return pd.Series(results, index=times, name=s_name)
 
-# --- 3. MAIN EXECUTION ---
+# --- 3. MAIN LOGIC ---
 def main():
     now = datetime.now(timezone.utc)
     last_updated_str = now.strftime("%Y-%m-%d %H:%M UTC")
@@ -185,12 +186,13 @@ def main():
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
 
+    # FIXED: Only strip 'K' for XMR specifically
     p_urls = {'nam': "http://www.meteo.psu.edu/bufkit/data/latest/nam_{site}.buf", 'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 'rap': "http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{site}.buf", 'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf", 'nest': "https://www.meteo.psu.edu/bufkit/data/NAMNEST/latest/namnest_{site}.buf", 'arw': "https://www.meteo.psu.edu/bufkit/data/HIRESW/latest/hiresw_{site}.buf"}
     f_url = "https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={model}&station={site}"
 
     for s in TAF_SITES:
-        # STRIP 'K' for BUFKIT sites (XMR vs KXMR)
-        buf_id = s[1:].lower() if (len(s) == 4 and s.startswith('K')) else s.lower()
+        # XMR special case, otherwise keep K
+        buf_id = s[1:].lower() if s == 'KXMR' else s.lower()
         for m, u in p_urls.items(): 
             success = download_file(u.format(site=buf_id), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
             if not success:
@@ -203,10 +205,12 @@ def main():
         if not files: continue
         try:
             ds = xr.open_mfdataset(files, engine='cfgrib', combine='nested', concat_dim='valid_time', coords="minimal", compat="override")
+            valid_times = pd.to_datetime(ds.valid_time.values).tz_localize(None)
             model_init_strings[m.lower()] = pd.to_datetime(np.atleast_1d(ds['time'].values)[0]).strftime('%m/%d %HZ')
             for s, co in TAF_SITES_META.items():
                 idx = find_nearest_gridpoint(ds, co['lat'], co['lon'])
-                v_dfs[s] = v_dfs[s].join(pd.DataFrame({m: [format_visibility(v) for v in ds['vis'].values[:, idx[0], idx[1]]]}, index=pd.to_datetime(ds.valid_time.values)), how='outer')
+                new_col = pd.DataFrame({m: [format_visibility(v) for v in ds['vis'].values[:, idx[0], idx[1]]]}, index=valid_times)
+                v_dfs[s] = v_dfs[s].join(new_col, how='outer')
         except: pass
 
     for s in TAF_SITES:
@@ -217,7 +221,6 @@ def main():
             shear_data = process_bufkit(path, m, 'llws')
             if not shear_data.empty: l_dfs[s] = l_dfs[s].join(shear_data, how='outer')
 
-    # FIX: run_start_utc must be TZ-NAIVE to compare with model index
     run_start_utc = now.replace(minute=0, second=0, microsecond=0, tzinfo=None)
     html_tbls = {}
     
@@ -264,12 +267,12 @@ def main():
     th, td {{ border: 1px solid #999; padding: 2px 4px; text-align: center; min-width: 60px; }}
     th {{ background-color: #6495ED; color: white; }}
     
-    /* Condensed Legend Fix */
-    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 10px; width: 260px; font-size: 11px; }}
-    .legend-grid {{ display: flex; justify-content: space-between; }}
-    .legend-divider {{ width: 1px; background-color: #ccc; margin: 0 6px; }}
+    /* Optimized Condensed Legend Fix */
+    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 10px; width: 280px; font-size: 11px; }}
+    .legend-grid {{ display: flex; justify-content: space-between; align-items: start; }}
+    .legend-divider {{ width: 1px; background-color: #ccc; margin: 0 8px; height: 45px; }}
     .legend-item {{ display: flex; align-items: center; margin-bottom: 2px; font-weight: bold; white-space: nowrap; }}
-    .color-box {{ width: 16px; height: 12px; border: 1px solid #444; margin-right: 4px; border-radius: 1px; flex-shrink: 0; }}
+    .color-box {{ width: 18px; height: 12px; border: 1px solid #444; margin-right: 5px; border-radius: 1px; flex-shrink: 0; }}
     
     body.dark-mode {{ background-color: #1e1e1e; color: #e0e0e0; }}
     body.dark-mode td, body.dark-mode th {{ border: 1px solid #555; background-color: #444; color: white; }}
