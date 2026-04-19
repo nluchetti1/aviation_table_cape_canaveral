@@ -1,0 +1,40 @@
+name: Update TAF Dashboard
+on:
+  schedule:
+    - cron: '15 * * * *'
+  workflow_dispatch:
+
+# CRITICAL: Gives the action permission to push the index.html back to the repo
+permissions:
+  contents: write
+
+jobs:
+  update-dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip' # OPTIMIZATION: Caches your requirements to save time/minutes
+          
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update --fix-missing
+          sudo apt-get install -y libeccodes-dev
+          
+      - name: Install Libraries
+        run: pip install -r requirements.txt 
+        
+      - name: Run Script
+        run: python aviation_dashboard.py
+        
+      - name: Commit and Push
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git add index.html history.json
+          git commit -m "Update Dashboard and History $(date -u)" || exit 0
+          git push
