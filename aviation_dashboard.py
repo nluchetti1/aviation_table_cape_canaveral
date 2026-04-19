@@ -14,13 +14,13 @@ from datetime import datetime, timedelta, timezone
 warnings.filterwarnings('ignore')
 
 # --- 1. CONFIGURATION ---
-# Swapped to the most reliable Central Florida BUFKIT sites
+# The sites you requested
 TAF_SITES_META = {
-    'KMLB': {'lat': 28.1028, 'lon': -80.6453},  # Melbourne
-    'KDAB': {'lat': 29.1799, 'lon': -81.0581},  # Daytona Beach
-    'KORL': {'lat': 28.5455, 'lon': -81.3329},  # Orlando Executive
-    'KMCO': {'lat': 28.4294, 'lon': -81.3090},  # Orlando Intl
-    'KVRB': {'lat': 27.6556, 'lon': -80.4179}   # Vero Beach
+    'KDAB': {'lat': 29.1799, 'lon': -81.0581},
+    'KXMR': {'lat': 28.4675, 'lon': -80.5594},
+    'KMLB': {'lat': 28.1028, 'lon': -80.6453},
+    'KFPR': {'lat': 27.4975, 'lon': -80.3726},
+    'KPBI': {'lat': 26.6832, 'lon': -80.0956}
 }
 TAF_SITES = list(TAF_SITES_META.keys())
 MODELS_VIS = ['GFS', 'NAM', 'RAP', 'HRRR', 'ARW', 'NEST']
@@ -36,7 +36,7 @@ def calculate_total_rh(t_c, td_c):
     rh_water = mpcalc.relative_humidity_from_dewpoint(t_c, td_c).magnitude * 100
     if t_c.magnitude >= 0: return rh_water
     T, Td = t_c.magnitude, td_c.magnitude
-    e = 6.112 * np.exp((17.67 * Td) / (Td + 243.5))
+    e = 6.112 * np.exp((17.67 * T) / (T + 243.5)) # Standard approximation
     e_s_ice = 6.112 * np.exp((22.46 * T) / (T + 272.62))
     return max(rh_water, (e / e_s_ice) * 100)
 
@@ -157,16 +157,18 @@ def process_bufkit(filepath, model_name, mode='cig'):
             else: results.append("--")
     return pd.Series(results, index=times, name=model_name.upper())
 
+# --- 3. MAIN EXECUTION ---
 def main():
     now = datetime.now(timezone.utc)
     last_updated_str = now.strftime("%Y-%m-%d %H:%M UTC")
     
+    # 1. Download GRIBs
     cyc_6hr = 18 if now.hour < 4 else 0 if now.hour < 10 else 6 if now.hour < 16 else 12 if now.hour < 22 else 18
     cyc_6_d = (now - timedelta(days=1)).strftime("%Y%m%d") if now.hour < 4 else now.strftime("%Y%m%d")
     hrly_time = now - timedelta(hours=2)
     cyc_h_s, cyc_h_d = f"{hrly_time.hour:02d}", hrly_time.strftime("%Y%m%d")
 
-    bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=278&rightlon=282&bottomlat=27"
+    bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=278&rightlon=282&bottomlat=26"
     base_url = "https://nomads.ncep.noaa.gov/cgi-bin/"
     nomads_scripts = {'GFS':'filter_gfs_0p25_1hr.pl','NAM':'filter_nam.pl','RAP':'filter_rap.pl','HRRR':'filter_hrrr_2d.pl','ARW':'filter_hiresconus.pl','NEST':'filter_nam_conusnest.pl'}
 
@@ -184,10 +186,20 @@ def main():
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
 
+    # 2. BUFKIT Download - FIXED to use 'XMR' for military site IDs
     p_urls = {'nam': "http://www.meteo.psu.edu/bufkit/data/latest/nam_{site}.buf", 'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 'rap': "http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{site}.buf", 'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf", 'nest': "https://www.meteo.psu.edu/bufkit/data/NAMNEST/latest/namnest_{site}.buf", 'arw': "https://www.meteo.psu.edu/bufkit/data/HIRESW/latest/hiresw_{site}.buf"}
-    for s in TAF_SITES:
-        for m, u in p_urls.items(): download_file(u.format(site=s.lower()), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
+    f_url = "https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={model}&station={site}"
 
+    for s in TAF_SITES:
+        # Strip 'K' if 4 letters (KXMR -> XMR, KMLB -> MLB)
+        buf_id = s[1:].lower() if (len(s) == 4 and s.startswith('K')) else s.lower()
+        for m, u in p_urls.items(): 
+            success = download_file(u.format(site=buf_id), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
+            if not success:
+                iem_mod = 'nam4km' if m == 'nest' else m
+                download_file(f_url.format(model=iem_mod, site=buf_id.upper()), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
+
+    # 3. Processing
     v_dfs, c_dfs, l_dfs = {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}
     for m in MODELS_VIS:
         files = sorted(glob.glob(os.path.join(DATA_DIR, f"{m.lower()}*.grib2")))
@@ -208,13 +220,13 @@ def main():
             shear_data = process_bufkit(path, m, 'llws')
             if not shear_data.empty: l_dfs[s] = l_dfs[s].join(shear_data, how='outer')
 
+    run_start_utc = now.replace(minute=0, second=0, microsecond=0)
     html_tbls = {}
-    cur_ts_utc = pd.Timestamp.utcnow().tz_localize(None).replace(minute=0, second=0, microsecond=0)
     
-    def to_st_html(df, pt):
+    def to_st_html(df, pt, table_start_time):
         if df.empty: return "<p>Data currently unavailable.</p>"
         d = df.copy(); d.index = pd.to_datetime(d.index).tz_localize(None)
-        d = d[~d.index.duplicated()].sort_index(); d = d[d.index >= cur_ts_utc].head(48)
+        d = d[~d.index.duplicated()].sort_index(); d = d[d.index >= table_start_time].head(48)
         d.columns = [f"{c} [{model_init_strings.get(c.lower(), '??')}]" for c in d.columns]
         d.index = d.index.strftime('%d/%H'); d.index.name = "Time (UTC)"
         st = d.style.map(colorize_flight_rules) if pt=='vis' else d.style.map(style_ceiling_table) if pt=='cig' else d.style.format(lambda v: f"{str(v).split('|')[0]}kt | {str(v).split('|')[-1]}" if '|' in str(v) else v).map(style_llws_table)
@@ -222,9 +234,9 @@ def main():
 
     for s in TAF_SITES:
         ss = s.lower()
-        html_tbls[f"vis_{ss}"] = to_st_html(v_dfs[s], 'vis')
-        html_tbls[f"cig_{ss}"] = to_st_html(c_dfs[s], 'cig')
-        html_tbls[f"llws_{ss}"] = to_st_html(l_dfs[s], 'llws')
+        html_tbls[f"vis_{ss}"] = to_st_html(v_dfs[s], 'vis', run_start_utc)
+        html_tbls[f"cig_{ss}"] = to_st_html(c_dfs[s], 'cig', run_start_utc)
+        html_tbls[f"llws_{ss}"] = to_st_html(l_dfs[s], 'llws', run_start_utc)
 
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, 'r') as f: full_history = json.load(f)
@@ -245,25 +257,24 @@ def main():
 
     dashboard_html = f"""
     <html><head><style>
-    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; transition: background-color 0.3s, color 0.3s; }}
-    a {{ color: #0000ee; text-decoration: none; padding: 3px 6px; border-radius: 4px; cursor: pointer; }}
+    body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; font-size: 11px; }}
+    a {{ color: #0000ee; text-decoration: none; padding: 2px 4px; border-radius: 4px; cursor: pointer; }}
     .active-link {{ background-color: #007acc !important; color: #ffffff !important; font-weight: bold; }}
-    .main-container {{ display: flex; justify-content: center; gap: 30px; margin-top: 40px; }}
-    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 10px; background-color: #f0f0f0; padding: 15px; border-radius: 8px; border: 1px solid #ccc; transition: background-color 0.3s, color 0.3s, border-color 0.3s; min-width: 120px; }}
-    table {{ border-collapse: collapse; margin: 0 auto; background-color: white; }}
-    th, td {{ border: 1px solid #999; padding: 4px 8px; text-align: center; font-size: 14px; min-width: 70px; }}
+    .main-container {{ display: flex; justify-content: center; gap: 15px; margin-top: 25px; }}
+    .vertical-run-controls {{ display: flex; flex-direction: column; gap: 6px; background-color: #f0f0f0; padding: 10px; border-radius: 8px; border: 1px solid #ccc; min-width: 105px; }}
+    table {{ border-collapse: collapse; margin: 0 auto; background-color: white; font-size: 11px; }}
+    th, td {{ border: 1px solid #999; padding: 2px 4px; text-align: center; min-width: 60px; }}
     th {{ background-color: #6495ED; color: white; }}
     
-    /* Condensed Legend CSS */
-    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 15px; width: 340px; font-size: 13px; }}
-    .legend-grid {{ display: flex; justify-content: space-between; text-align: left; }}
-    .legend-divider {{ width: 1px; background-color: #ccc; margin: 0 10px; }}
-    .legend-item {{ display: flex; align-items: center; margin-bottom: 4px; font-weight: bold; line-height: 1.2; }}
-    .color-box {{ width: 22px; height: 18px; border: 1px solid #666; margin-right: 8px; border-radius: 2px; flex-shrink: 0; }}
+    /* Optimized Condensed Legend CSS */
+    .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 10px; width: 260px; font-size: 11px; }}
+    .legend-grid {{ display: flex; justify-content: space-between; }}
+    .legend-divider {{ width: 1px; background-color: #ccc; margin: 0 6px; }}
+    .legend-item {{ display: flex; align-items: center; margin-bottom: 3px; font-weight: bold; white-space: nowrap; }}
+    .color-box {{ width: 16px; height: 12px; border: 1px solid #444; margin-right: 4px; border-radius: 1px; flex-shrink: 0; }}
     
     body.dark-mode {{ background-color: #1e1e1e; color: #e0e0e0; }}
     body.dark-mode td, body.dark-mode th {{ border: 1px solid #555; background-color: #444; color: white; }}
-    body.dark-mode .vertical-run-controls, body.dark-mode .legend-container {{ background-color: #2d2d2d; border-color: #444; color: #e0e0e0; }}
     </style>
     <script>
     var historyData = {history_json};
@@ -284,52 +295,46 @@ def main():
     function toggleTheme() {{ document.body.classList.toggle('dark-mode'); }}
     window.onload = function() {{ setSiteData(document.getElementById('def'), 'cig', '{default_site}'); }};
     </script></head><body>
-    <button style="position: absolute; top: 15px; right: 15px;" onclick="toggleTheme()">Toggle Dark Mode</button>
+    <button style="position: absolute; top: 10px; right: 10px; font-size: 9px;" onclick="toggleTheme()">Toggle Dark Mode</button>
     <div class="main-container"><div style="text-align: center;">
-    <h3 id="ts">Run Time: {last_updated_str}</h3>
-    <p>Ceilings: {gen_links('cig')} &nbsp;&nbsp;&nbsp; Vis: {gen_links('vis')} &nbsp;&nbsp;&nbsp; Shear: {gen_links('llws')}</p>
-    <div style="display: flex; gap: 20px; align-items: flex-start;">
+    <h3 id="ts" style="margin: 0 0 10px 0; font-size: 14px;">Run Time: {last_updated_str}</h3>
+    <p style="margin-bottom: 10px;">Ceilings: {gen_links('cig')} &nbsp;&nbsp;&nbsp; Vis: {gen_links('vis')} &nbsp;&nbsp;&nbsp; Shear: {gen_links('llws')}</p>
+    <div style="display: flex; gap: 10px; align-items: flex-start;">
         <div class="vertical-run-controls">
-            <b>Model Run</b>
+            <b style="font-size: 10px; margin-bottom: 2px;">Model Run</b>
             <label><input type="radio" name="r" onclick="setRun(0)" checked> Current Run</label>
             <label><input type="radio" name="r" onclick="setRun(1)"> Run -1</label>
             <label><input type="radio" name="r" onclick="setRun(2)"> Run -2</label>
             <label><input type="radio" name="r" onclick="setRun(3)"> Run -3</label>
             <label><input type="radio" name="r" onclick="setRun(4)"> Run -4</label>
         </div>
-        <div id="table-container" style="min-width: 600px; overflow-x: auto;"></div>
+        <div id="table-container" style="min-width: 500px; overflow-x: auto;"></div>
         <div class="legend-container">
-            <h3 style="margin:0 0 10px 0;">Legend</h3><hr style="margin:5px 0;">
+            <h4 style="margin:0 0 5px 0; text-align: center;">Legend</h4><hr style="margin:2px 0;">
             <div class="legend-grid">
                 <div>
-                    <h4 style="margin:5px 0;">Flight Cat</h4>
+                    <b style="font-size: 9px; display: block; margin-bottom: 2px;">Flight Cat</b>
                     <div class="legend-item"><div class="color-box" style="background-color: #458B00;"></div>MVFR</div>
                     <div class="legend-item"><div class="color-box" style="background-color: #CD3333;"></div>IFR</div>
                     <div class="legend-item"><div class="color-box" style="background-color: #EE82EE;"></div>LIFR</div>
                 </div>
                 <div class="legend-divider"></div>
                 <div>
-                    <h4 style="margin:5px 0;">LLWS</h4>
+                    <b style="font-size: 9px; display: block; margin-bottom: 2px;">LLWS</b>
                     <div class="legend-item"><div class="color-box" style="background-color: #FFC125;"></div>Marginal</div>
                     <div class="legend-item"><div class="color-box" style="background-color: #CD5B45;"></div>Moderate</div>
                     <div class="legend-item"><div class="color-box" style="background-color: #7A378B;"></div>High</div>
                 </div>
             </div>
-            <hr style="margin:10px 0;">
-            <div style="text-align: left;">
-                <p style="text-decoration: underline; margin-bottom: 5px;"><strong>Information:</strong></p>
-                <ul style="padding-left: 20px; margin: 0;">
-                    <li>Cloud ceiling is derived as lowest model layer where RH is &ge; 95%.</li>
-                    <li>Visibility is derived using model variable at nearest grid point.</li>
-                    <li>Wind Shear thresholds:
-                        <ul style="padding-left: 15px;">
-                            <li><strong>Marginal:</strong> &ge; 20 kt</li>
-                            <li><strong>Moderate:</strong> &ge; 30 kt</li>
-                            <li><strong>High:</strong> &ge; 40 kt</li>
-                        </ul>
-                    </li>
+            <hr style="margin:6px 0;">
+            <div style="text-align: left; font-size: 10px;">
+                <p style="text-decoration: underline; margin-bottom: 2px;"><strong>Information:</strong></p>
+                <ul style="padding-left: 12px; margin: 0;">
+                    <li>Ceiling: Layer where RH &ge; 95%.</li>
+                    <li>Vis: Model at nearest grid pt.</li>
+                    <li>Shear: &ge; 20kt, 30kt, 40kt.</li>
                 </ul>
-                <p style="font-size: 11px; font-style: italic; text-align: center; margin-top: 10px;">* Note: VFR (> 3000 ft and > 5 miles) is uncolored (white).</p>
+                <p style="font-size: 9px; font-style: italic; text-align: center; margin-top: 4px;">* VFR is uncolored.</p>
             </div>
         </div>
     </div></div></div></body></html>
