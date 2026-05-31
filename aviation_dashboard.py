@@ -12,7 +12,7 @@ import xarray as xr
 import metpy.calc as mpcalc
 from metpy.units import units
 from datetime import datetime, timedelta, timezone
-from bufrpy.decode import BUFRFile
+from bufrpy import BUFRFile  # 🔑 Fixed: Import directly from the root module level
 
 # --- 1. CONFIGURATION ---
 TAF_SITES_META = {
