@@ -12,7 +12,7 @@ import xarray as xr
 import metpy.calc as mpcalc
 from metpy.units import units
 from datetime import datetime, timedelta, timezone
-from bufrpy import BUFRFile  # 🔑 Fixed: Import directly from the root module level
+from bufrpy import bufr_decode  # 🧼 Fixed: direct import of the module's extraction function
 
 # --- 1. CONFIGURATION ---
 TAF_SITES_META = {
@@ -108,55 +108,61 @@ def parse_rrfs_bufr_profile(filepath, mode='cig'):
     times, cig_results, shear_results = [], [], []
     
     try:
-        with BUFRFile(filepath) as bufr:
-            for message in bufr:
-                data = message.unpack()
-                year = data.get('year', 2026)
-                month = data.get('month', 5)
-                day = data.get('day', 31)
-                hour = data.get('hour', 12)
-                minute = data.get('minute', 0)
-                valid_dt = datetime(year, month, day, hour, minute)
-                times.append(valid_dt)
-                
-                pressures = np.atleast_1d(data.get('pressure', []))
-                heights = np.atleast_1d(data.get('height', []))
-                temps = np.atleast_1d(data.get('temperature', []))
-                dewpoints = np.atleast_1d(data.get('dewpoint', []))
-                w_dirs = np.atleast_1d(data.get('windDirection', []))
-                w_spds = np.atleast_1d(data.get('windSpeed', []))
-                stn_elev = float(data.get('heightOfStation', 0.0)) * 3.28084
-                
-                if mode == 'cig':
-                    lowest_ft = np.nan
-                    for idx in range(len(pressures)):
-                        if idx >= len(temps) or idx >= len(dewpoints) or idx >= len(heights): break
-                        h_agl = (float(heights[idx]) * 3.28084) - stn_elev
-                        if 200 <= h_agl <= 38000:
-                            rh = calculate_total_rh(float(temps[idx])*units.degC, float(dewpoints[idx])*units.degC)
-                            if rh >= 95.0:
-                                lowest_ft = h_agl
-                                break
-                    cig_results.append(str(int(round(lowest_ft/100)*100)) if not np.isnan(lowest_ft) else "--")
+        # 🧼 Safely deconstruct binary messages using functional dictionary lists
+        bufr_data = bufr_decode(filepath)
+        
+        for message in bufr_data:
+            data = message.get('data', {}) if isinstance(message, dict) else message
+            if not data: continue
+            
+            year = data.get('year', 2026)
+            month = data.get('month', 5)
+            day = data.get('day', 31)
+            hour = data.get('hour', 12)
+            minute = data.get('minute', 0)
+            valid_dt = datetime(year, month, day, hour, minute)
+            times.append(valid_dt)
+            
+            pressures = np.atleast_1d(data.get('pressure', []))
+            heights = np.atleast_1d(data.get('height', []))
+            temps = np.atleast_1d(data.get('temperature', []))
+            dewpoints = np.atleast_1d(data.get('dewpoint', []))
+            w_dirs = np.atleast_1d(data.get('windDirection', []))
+            w_spds = np.atleast_1d(data.get('windSpeed', []))
+            stn_elev = float(data.get('heightOfStation', 0.0)) * 3.28084
+            
+            if mode == 'cig':
+                lowest_ft = np.nan
+                for idx in range(len(pressures)):
+                    if idx >= len(temps) or idx >= len(dewpoints) or idx >= len(heights): break
+                    h_agl = (float(heights[idx]) * 3.28084) - stn_elev
+                    if 200 <= h_agl <= 38000:
+                        rh = calculate_total_rh(float(temps[idx])*units.degC, float(dewpoints[idx])*units.degC)
+                        if rh >= 95.0:
+                            lowest_ft = h_agl
+                            break
+                cig_results.append(str(int(round(lowest_ft/100)*100)) if not np.isnan(lowest_ft) else "--")
+            else:
+                max_s, t_h, t_d, t_s = 0.0, 0, 0, 0
+                for l in range(len(heights)):
+                    h_agl_l = (float(heights[l]) * 3.28084) - stn_elev
+                    if h_agl_l > 2100 or l >= len(w_dirs) or l >= len(w_spds): continue
+                    for u in range(l+1, len(heights)):
+                        h_agl_u = (float(heights[u]) * 3.28084) - stn_elev
+                        if h_agl_u > 2100 or u >= len(w_dirs) or u >= len(w_spds): continue
+                        dr_l, dr_u = np.radians(float(w_dirs[l])), np.radians(float(w_dirs[u]))
+                        s_l, s_u = float(w_spds[l]) * 1.94384, float(w_spds[u]) * 1.94384
+                        s = np.sqrt(max(0, s_l**2 + s_u**2 - 2*s_l*s_u*np.cos(dr_u-dr_l)))
+                        if s > max_s: max_s, t_h, t_d, t_s = s, h_agl_u, w_dirs[u], s_u
+                if max_s >= 20:
+                    shear_results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
                 else:
-                    max_s, t_h, t_d, t_s = 0.0, 0, 0, 0
-                    for l in range(len(heights)):
-                        h_agl_l = (float(heights[l]) * 3.28084) - stn_elev
-                        if h_agl_l > 2100 or l >= len(w_dirs) or l >= len(w_spds): continue
-                        for u in range(l+1, len(heights)):
-                            h_agl_u = (float(heights[u]) * 3.28084) - stn_elev
-                            if h_agl_u > 2100 or u >= len(w_dirs) or u >= len(w_spds): continue
-                            dr_l, dr_u = np.radians(float(w_dirs[l])), np.radians(float(w_dirs[u]))
-                            s_l, s_u = float(w_spds[l]) * 1.94384, float(w_spds[u]) * 1.94384
-                            s = np.sqrt(max(0, s_l**2 + s_u**2 - 2*s_l*s_u*np.cos(dr_u-dr_l)))
-                            if s > max_s: max_s, t_h, t_d, t_s = s, h_agl_u, w_dirs[u], s_u
-                    if max_s >= 20:
-                        shear_results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
-                    else:
-                        shear_results.append("--")
+                    shear_results.append("--")
+                    
         if mode == 'cig': return pd.Series(cig_results, index=times, name='RRFS')
         return pd.Series(shear_results, index=times, name='RRFS')
-    except:
+    except Exception as e:
+        print(f"Error executing universal BUFR process hook: {e}")
         return pd.Series()
 
 def process_bufkit(filepath, model_name, mode='cig'):
@@ -211,7 +217,6 @@ def process_bufkit(filepath, model_name, mode='cig'):
             for l in range(len(heights)-1):
                 for u in range(l+1, len(heights)):
                     dr_l, dr_u = np.radians(dirs[l]), np.radians(dirs[u])
-                    # 🛠️ Fixed historical component tracking logic formula bug
                     s = np.sqrt(max(0, spds[l]**2 + spds[u]**2 - 2*spds[l]*spds[u]*np.cos(dr_u-dr_l)))
                     if s > max_s: max_s, t_h, t_d, t_s = s, heights[u], dirs[u], spds[u]
             if max_s >= 20: 
