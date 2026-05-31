@@ -6,4 +6,3 @@ cfgrib
 jinja2
 metpy
 dask
-bufrpy
