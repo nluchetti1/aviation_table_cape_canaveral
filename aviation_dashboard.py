@@ -12,7 +12,7 @@ import xarray as xr
 import metpy.calc as mpcalc
 from metpy.units import units
 from datetime import datetime, timedelta, timezone
-from bufrpy import bufr_decode  # 🧼 Fixed: direct import of the module's extraction function
+import eccodes  # 🔑 Universal, version-safe decoder provided directly by ecCodes binaries
 
 # --- 1. CONFIGURATION ---
 TAF_SITES_META = {
@@ -102,67 +102,88 @@ def download_file(url, filepath):
     except: return False
     return False
 
-# 🔄 --- DYNAMIC BINARY RRFS BUFR SOUNDING PARSER --- 🔄
+def safe_eccodes_array(bufr_id, possible_keys):
+    """Fallback protection loops through message attributes safely."""
+    for key in possible_keys:
+        try:
+            return eccodes.codes_get_array(bufr_id, key)
+        except:
+            continue
+    return np.array([])
+
+# 🔄 --- UPGRADED ECCODES RRFS BUFR SOUNDING PARSER --- 🔄
 def parse_rrfs_bufr_profile(filepath, mode='cig'):
     if not os.path.exists(filepath): return pd.Series()
     times, cig_results, shear_results = [], [], []
     
     try:
-        # 🧼 Safely deconstruct binary messages using functional dictionary lists
-        bufr_data = bufr_decode(filepath)
-        
-        for message in bufr_data:
-            data = message.get('data', {}) if isinstance(message, dict) else message
-            if not data: continue
-            
-            year = data.get('year', 2026)
-            month = data.get('month', 5)
-            day = data.get('day', 31)
-            hour = data.get('hour', 12)
-            minute = data.get('minute', 0)
-            valid_dt = datetime(year, month, day, hour, minute)
-            times.append(valid_dt)
-            
-            pressures = np.atleast_1d(data.get('pressure', []))
-            heights = np.atleast_1d(data.get('height', []))
-            temps = np.atleast_1d(data.get('temperature', []))
-            dewpoints = np.atleast_1d(data.get('dewpoint', []))
-            w_dirs = np.atleast_1d(data.get('windDirection', []))
-            w_spds = np.atleast_1d(data.get('windSpeed', []))
-            stn_elev = float(data.get('heightOfStation', 0.0)) * 3.28084
-            
-            if mode == 'cig':
-                lowest_ft = np.nan
-                for idx in range(len(pressures)):
-                    if idx >= len(temps) or idx >= len(dewpoints) or idx >= len(heights): break
-                    h_agl = (float(heights[idx]) * 3.28084) - stn_elev
-                    if 200 <= h_agl <= 38000:
-                        rh = calculate_total_rh(float(temps[idx])*units.degC, float(dewpoints[idx])*units.degC)
-                        if rh >= 95.0:
-                            lowest_ft = h_agl
-                            break
-                cig_results.append(str(int(round(lowest_ft/100)*100)) if not np.isnan(lowest_ft) else "--")
-            else:
-                max_s, t_h, t_d, t_s = 0.0, 0, 0, 0
-                for l in range(len(heights)):
-                    h_agl_l = (float(heights[l]) * 3.28084) - stn_elev
-                    if h_agl_l > 2100 or l >= len(w_dirs) or l >= len(w_spds): continue
-                    for u in range(l+1, len(heights)):
-                        h_agl_u = (float(heights[u]) * 3.28084) - stn_elev
-                        if h_agl_u > 2100 or u >= len(w_dirs) or u >= len(w_spds): continue
-                        dr_l, dr_u = np.radians(float(w_dirs[l])), np.radians(float(w_dirs[u]))
-                        s_l, s_u = float(w_spds[l]) * 1.94384, float(w_spds[u]) * 1.94384
-                        s = np.sqrt(max(0, s_l**2 + s_u**2 - 2*s_l*s_u*np.cos(dr_u-dr_l)))
-                        if s > max_s: max_s, t_h, t_d, t_s = s, h_agl_u, w_dirs[u], s_u
-                if max_s >= 20:
-                    shear_results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
-                else:
-                    shear_results.append("--")
+        with open(filepath, 'rb') as f:
+            while True:
+                bufr_id = eccodes.codes_bufr_new_from_file(f)
+                if bufr_id is None: break
+                
+                try:
+                    eccodes.codes_set(bufr_id, 'unpack', 1)
+                    
+                    year = int(eccodes.codes_get(bufr_id, 'year'))
+                    month = int(eccodes.codes_get(bufr_id, 'month'))
+                    day = int(eccodes.codes_get(bufr_id, 'day'))
+                    hour = int(eccodes.codes_get(bufr_id, 'hour'))
+                    minute = int(eccodes.codes_get(bufr_id, 'minute'))
+                    valid_dt = datetime(year, month, day, hour, minute)
+                    times.append(valid_dt)
+                    
+                    # Pull values via sequence arrays (ecCodes standard conversion strings)
+                    pressures = safe_eccodes_array(bufr_id, ['pressure', 'extendedPressure'])
+                    heights = safe_eccodes_array(bufr_id, ['height', 'geopotentialHeight'])
+                    temps = safe_eccodes_array(bufr_id, ['temperature', 'airTemperature'])
+                    dewpoints = safe_eccodes_array(bufr_id, ['dewpointTemperature', 'dewpoint'])
+                    w_dirs = safe_eccodes_array(bufr_id, ['windDirection'])
+                    w_spds = safe_eccodes_array(bufr_id, ['windSpeed'])
+                    
+                    try: stn_elev = float(eccodes.codes_get(bufr_id, 'heightOfStation')) * 3.28084
+                    except: stn_elev = 0.0
+                    
+                    if mode == 'cig':
+                        lowest_ft = np.nan
+                        for idx in range(len(pressures)):
+                            if idx >= len(temps) or idx >= len(dewpoints) or idx >= len(heights): break
+                            h_agl = (float(heights[idx]) * 3.28084) - stn_elev
+                            if 200 <= h_agl <= 38000:
+                                # Convert Kelvin to Celsius safely for MetPy conversion wrapper
+                                t_c = (float(temps[idx]) - 273.15) * units.degC
+                                td_c = (float(dewpoints[idx]) - 273.15) * units.degC
+                                rh = calculate_total_rh(t_c, td_c)
+                                if rh >= 95.0:
+                                    lowest_ft = h_agl
+                                    break
+                        cig_results.append(str(int(round(lowest_ft/100)*100)) if not np.isnan(lowest_ft) else "--")
+                    else:
+                        max_s, t_h, t_d, t_s = 0.0, 0, 0, 0
+                        for l in range(len(heights)):
+                            h_agl_l = (float(heights[l]) * 3.28084) - stn_elev
+                            if h_agl_l > 2100 or l >= len(w_dirs) or l >= len(w_spds): continue
+                            for u in range(l+1, len(heights)):
+                                h_agl_u = (float(heights[u]) * 3.28084) - stn_elev
+                                if h_agl_u > 2100 or u >= len(w_dirs) or u >= len(w_spds): continue
+                                dr_l, dr_u = np.radians(float(w_dirs[l])), np.radians(float(w_dirs[u]))
+                                # Convert m/s down to Knots
+                                s_l, s_u = float(w_spds[l]) * 1.94384, float(w_spds[u]) * 1.94384
+                                s = np.sqrt(max(0, s_l**2 + s_u**2 - 2*s_l*s_u*np.cos(dr_u-dr_l)))
+                                if s > max_s: max_s, t_h, t_d, t_s = s, h_agl_u, w_dirs[u], s_u
+                        if max_s >= 20:
+                            shear_results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
+                        else:
+                            shear_results.append("--")
+                except Exception as inner_e:
+                    pass
+                finally:
+                    eccodes.codes_release(bufr_id)
                     
         if mode == 'cig': return pd.Series(cig_results, index=times, name='RRFS')
         return pd.Series(shear_results, index=times, name='RRFS')
     except Exception as e:
-        print(f"Error executing universal BUFR process hook: {e}")
+        print(f"Error parsing BUFR layout via ecCodes binary hook: {e}")
         return pd.Series()
 
 def process_bufkit(filepath, model_name, mode='cig'):
