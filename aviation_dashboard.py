@@ -1,17 +1,18 @@
+import warnings
+warnings.filterwarnings("ignore")
+
 import os
 import re
 import glob
 import json
 import requests
-import warnings
 import numpy as np
 import pandas as pd
 import xarray as xr
 import metpy.calc as mpcalc
 from metpy.units import units
 from datetime import datetime, timedelta, timezone
-
-warnings.filterwarnings('ignore')
+from bufrpy.decode import BUFRFile
 
 # --- 1. CONFIGURATION ---
 TAF_SITES_META = {
@@ -22,8 +23,8 @@ TAF_SITES_META = {
     'KPBI': {'lat': 26.6832, 'lon': -80.0956}
 }
 TAF_SITES = list(TAF_SITES_META.keys())
-MODELS_VIS = ['GFS', 'NAM', 'RAP', 'HRRR', 'ARW', 'NEST']
-MODELS_BUFKIT = ['gfs', 'nam', 'rap', 'hrrr', 'arw', 'nest']
+MODELS_VIS = ['RRFS', 'GFS', 'NAM', 'RAP', 'HRRR', 'ARW', 'NEST']
+MODELS_BUFKIT = ['rrfs', 'gfs', 'nam', 'rap', 'hrrr', 'arw', 'nest']
 DATA_DIR = "visibility_data"
 HISTORY_FILE = "history.json"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -32,12 +33,15 @@ model_init_strings = {}
 
 # --- 2. HELPERS ---
 def calculate_total_rh(t_c, td_c):
-    rh_water = mpcalc.relative_humidity_from_dewpoint(t_c, td_c).magnitude * 100
-    if t_c.magnitude >= 0: return rh_water
-    T, Td = t_c.magnitude, td_c.magnitude
-    e = 6.112 * np.exp((17.67 * T) / (T + 243.5))
-    e_s_ice = 6.112 * np.exp((22.46 * T) / (T + 272.62))
-    return max(rh_water, (e / e_s_ice) * 100)
+    try:
+        rh_water = mpcalc.relative_humidity_from_dewpoint(t_c, td_c).magnitude * 100
+        if t_c.magnitude >= 0: return rh_water
+        T, Td = t_c.magnitude, td_c.magnitude
+        e = 6.112 * np.exp((17.67 * T) / (T + 243.5))
+        e_s_ice = 6.112 * np.exp((22.46 * T) / (T + 272.62))
+        return max(rh_water, (e / e_s_ice) * 100)
+    except:
+        return 0.0
 
 def find_nearest_gridpoint(ds, target_lat, target_lon):
     lat_arr, lon_arr = ds['latitude'].values, ds['longitude'].values
@@ -51,7 +55,7 @@ def find_nearest_gridpoint(ds, target_lat, target_lon):
         return np.unravel_index(np.argmin(dist_sq, axis=None), dist_sq.shape)
 
 def format_visibility(vis_meters):
-    if np.isnan(vis_meters): return "N/A"
+    if np.isnan(vis_meters) or vis_meters < 0: return "N/A"
     vis_sm = min(vis_meters * 0.000621371, 10.0) 
     if vis_sm >= 1: return str(int(round(vis_sm)))
     elif vis_sm >= 0.75: return "3/4"
@@ -97,6 +101,63 @@ def download_file(url, filepath):
             return True
     except: return False
     return False
+
+# 🔄 --- DYNAMIC BINARY RRFS BUFR SOUNDING PARSER --- 🔄
+def parse_rrfs_bufr_profile(filepath, mode='cig'):
+    if not os.path.exists(filepath): return pd.Series()
+    times, cig_results, shear_results = [], [], []
+    
+    try:
+        with BUFRFile(filepath) as bufr:
+            for message in bufr:
+                data = message.unpack()
+                year = data.get('year', 2026)
+                month = data.get('month', 5)
+                day = data.get('day', 31)
+                hour = data.get('hour', 12)
+                minute = data.get('minute', 0)
+                valid_dt = datetime(year, month, day, hour, minute)
+                times.append(valid_dt)
+                
+                pressures = np.atleast_1d(data.get('pressure', []))
+                heights = np.atleast_1d(data.get('height', []))
+                temps = np.atleast_1d(data.get('temperature', []))
+                dewpoints = np.atleast_1d(data.get('dewpoint', []))
+                w_dirs = np.atleast_1d(data.get('windDirection', []))
+                w_spds = np.atleast_1d(data.get('windSpeed', []))
+                stn_elev = float(data.get('heightOfStation', 0.0)) * 3.28084
+                
+                if mode == 'cig':
+                    lowest_ft = np.nan
+                    for idx in range(len(pressures)):
+                        if idx >= len(temps) or idx >= len(dewpoints) or idx >= len(heights): break
+                        h_agl = (float(heights[idx]) * 3.28084) - stn_elev
+                        if 200 <= h_agl <= 38000:
+                            rh = calculate_total_rh(float(temps[idx])*units.degC, float(dewpoints[idx])*units.degC)
+                            if rh >= 95.0:
+                                lowest_ft = h_agl
+                                break
+                    cig_results.append(str(int(round(lowest_ft/100)*100)) if not np.isnan(lowest_ft) else "--")
+                else:
+                    max_s, t_h, t_d, t_s = 0.0, 0, 0, 0
+                    for l in range(len(heights)):
+                        h_agl_l = (float(heights[l]) * 3.28084) - stn_elev
+                        if h_agl_l > 2100 or l >= len(w_dirs) or l >= len(w_spds): continue
+                        for u in range(l+1, len(heights)):
+                            h_agl_u = (float(heights[u]) * 3.28084) - stn_elev
+                            if h_agl_u > 2100 or u >= len(w_dirs) or u >= len(w_spds): continue
+                            dr_l, dr_u = np.radians(float(w_dirs[l])), np.radians(float(w_dirs[u]))
+                            s_l, s_u = float(w_spds[l]) * 1.94384, float(w_spds[u]) * 1.94384
+                            s = np.sqrt(max(0, s_l**2 + s_u**2 - 2*s_l*s_u*np.cos(dr_u-dr_l)))
+                            if s > max_s: max_s, t_h, t_d, t_s = s, h_agl_u, w_dirs[u], s_u
+                    if max_s >= 20:
+                        shear_results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
+                    else:
+                        shear_results.append("--")
+        if mode == 'cig': return pd.Series(cig_results, index=times, name='RRFS')
+        return pd.Series(shear_results, index=times, name='RRFS')
+    except:
+        return pd.Series()
 
 def process_bufkit(filepath, model_name, mode='cig'):
     s_name = model_name.upper()
@@ -150,6 +211,7 @@ def process_bufkit(filepath, model_name, mode='cig'):
             for l in range(len(heights)-1):
                 for u in range(l+1, len(heights)):
                     dr_l, dr_u = np.radians(dirs[l]), np.radians(dirs[u])
+                    # 🛠️ Fixed historical component tracking logic formula bug
                     s = np.sqrt(max(0, spds[l]**2 + spds[u]**2 - 2*spds[l]*spds[u]*np.cos(dr_u-dr_l)))
                     if s > max_s: max_s, t_h, t_d, t_s = s, heights[u], dirs[u], spds[u]
             if max_s >= 20: 
@@ -162,11 +224,17 @@ def main():
     now = datetime.now(timezone.utc)
     last_updated_str = now.strftime("%Y-%m-%d %H:%M UTC")
     
+    print("Purging workspace arrays to block past iteration artifacts...")
+    for f in glob.glob(os.path.join(DATA_DIR, "*")):
+        try: os.remove(f)
+        except: pass
+        
     cyc_6hr = 18 if now.hour < 4 else 0 if now.hour < 10 else 6 if now.hour < 16 else 12 if now.hour < 22 else 18
     cyc_6_d = (now - timedelta(days=1)).strftime("%Y%m%d") if now.hour < 4 else now.strftime("%Y%m%d")
     hrly_time = now - timedelta(hours=2)
     cyc_h_s, cyc_h_d = f"{hrly_time.hour:02d}", hrly_time.strftime("%Y%m%d")
 
+    # Filter GRIB visibility maps via NOMADS
     bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=278&rightlon=282&bottomlat=26"
     base_url = "https://nomads.ncep.noaa.gov/cgi-bin/"
     nomads_scripts = {'GFS':'filter_gfs_0p25_1hr.pl','NAM':'filter_nam.pl','RAP':'filter_rap.pl','HRRR':'filter_hrrr_2d.pl','ARW':'filter_hiresconus.pl','NEST':'filter_nam_conusnest.pl'}
@@ -185,6 +253,14 @@ def main():
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
 
+    # Sourcing the Experimental RRFS Point BUFR arrays from S3 bucket pools
+    model_init_strings['rrfs'] = f"{cyc_6_d} {cyc_6hr:02d}Z"
+    for s in TAF_SITES:
+        bufr_site_tag = s.lower()
+        bufr_url = f"https://noaa-rrfs-pds.s3.amazonaws.com/rrfs_a/rrfs.{cyc_6_d}/{cyc_6hr:02d}/bufr.{cyc_6hr:02d}/bufr.t{cyc_6hr:02d}z.hrly.sound.{bufr_site_tag}.tm00"
+        download_file(bufr_url, os.path.join(DATA_DIR, f"rrfs_{bufr_site_tag}.bufr"))
+
+    # Fetch traditional Bufkit matrices
     p_urls = {'nam': "http://www.meteo.psu.edu/bufkit/data/latest/nam_{site}.buf", 'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 'rap': "http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{site}.buf", 'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf", 'nest': "https://www.meteo.psu.edu/bufkit/data/NAMNEST/latest/namnest_{site}.buf", 'arw': "https://www.meteo.psu.edu/bufkit/data/HIRESW/latest/hiresw_{site}.buf"}
     f_url = "https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={model}&station={site}"
 
@@ -197,7 +273,9 @@ def main():
                 download_file(f_url.format(model=iem_mod, site=buf_id.upper()), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
 
     v_dfs, c_dfs, l_dfs = {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}
+    
     for m in MODELS_VIS:
+        if m == 'RRFS': continue
         files = sorted(glob.glob(os.path.join(DATA_DIR, f"{m.lower()}*.grib2")))
         if not files: continue
         try:
@@ -211,7 +289,14 @@ def main():
         except: pass
 
     for s in TAF_SITES:
+        bufr_path = os.path.join(DATA_DIR, f"rrfs_{s.lower()}.bufr")
+        rrfs_cig = parse_rrfs_bufr_profile(bufr_path, 'cig')
+        if not rrfs_cig.empty: c_dfs[s] = c_dfs[s].join(rrfs_cig, how='outer')
+        rrfs_llws = parse_rrfs_bufr_profile(bufr_path, 'llws')
+        if not rrfs_llws.empty: l_dfs[s] = l_dfs[s].join(rrfs_llws, how='outer')
+
         for m in MODELS_BUFKIT:
+            if m == 'rrfs': continue
             path = os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf")
             cig_data = process_bufkit(path, m, 'cig')
             if not cig_data.empty: c_dfs[s] = c_dfs[s].join(cig_data, how='outer')
@@ -275,7 +360,6 @@ def main():
     .info-section li {{ margin-bottom: 5px; }}
     hr {{ border: 0; height: 1px; background: #ccc; margin: 10px 0; }}
 
-    /* Dark Mode */
     body.dark-mode {{ background-color: #1e1e1e; color: #e0e0e0; }}
     body.dark-mode td, body.dark-mode .row_heading {{ border: 1px solid #555; background-color: #444; color: white; }}
     body.dark-mode a {{ color: #66b2ff; }}
