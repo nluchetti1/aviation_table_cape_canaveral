@@ -22,9 +22,8 @@ TAF_SITES_META = {
     'KPBI': {'lat': 26.6832, 'lon': -80.0956}
 }
 TAF_SITES = list(TAF_SITES_META.keys())
-# RRFS sits proudly as your primary left-hand column lead
-MODELS_VIS = ['RRFS', 'GFS', 'NAM', 'RAP', 'HRRR', 'ARW', 'NEST']
-MODELS_BUFKIT = ['rrfs', 'gfs', 'nam', 'rap', 'hrrr', 'arw', 'nest']
+MODELS_VIS = ['RRFS', 'GFS', 'RAP', 'HRRR']
+MODELS_BUFKIT = ['rrfs', 'gfs', 'rap', 'hrrr']
 DATA_DIR = "visibility_data"
 HISTORY_FILE = "history.json"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -81,10 +80,6 @@ def style_ceiling_table(val):
         elif 500 <= h < 1000: return 'background-color: #CD3333; color: white;'
         else: return 'background-color: #EE82EE; color: black;'
     except: return ''
-
-def Illusion_style_llws_table(val):
-    # Backward compatibility wrapper mapping layout variables safely
-    return style_llws_table(val)
 
 def style_llws_table(val):
     if pd.isna(val) or "|" not in str(val): return ''
@@ -148,15 +143,14 @@ def process_bufkit(filepath, model_name, mode='cig'):
             results.append(str(int(round(lowest_ft/100)*100)) if not np.isnan(lowest_ft) else "--")
             
         elif mode == 'vis':
-            # 🧼 Calculates accurate text soundings visibility dynamically from the boundary layer parameters
             try:
                 l1 = data_lines[0]
                 rh = calculate_total_rh(float(l1[1])*units.degC, float(l1[3])*units.degC)
-                if rh >= 99.0: vis_meters = 400.0   # LIFR Fog bounds
-                elif rh >= 96.5: vis_meters = 800.0  # IFR Standard 
-                elif rh >= 93.0: vis_meters = 2000.0 # MVFR Ceiling Strata
-                elif rh >= 88.0: vis_meters = 6000.0 # Marginal VFR 
-                else: vis_meters = 16093.0          # Unrestricted VFR
+                if rh >= 99.0: vis_meters = 400.0   
+                elif rh >= 96.5: vis_meters = 800.0  
+                elif rh >= 93.0: vis_meters = 2000.0 
+                elif rh >= 88.0: vis_meters = 6000.0 
+                else: vis_meters = 16093.0          
             except: 
                 vis_meters = np.nan
             results.append(format_visibility(vis_meters))
@@ -197,40 +191,40 @@ def main():
     hrly_time = now - timedelta(hours=2)
     cyc_h_s, cyc_h_d = f"{hrly_time.hour:02d}", hrly_time.strftime("%Y%m%d")
 
-    # Sync and extract 2D visibility maps from NOAA NOMADS
+    # Fetch spatial files via NOMADS
     bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=278&rightlon=282&bottomlat=26"
     base_url = "https://nomads.ncep.noaa.gov/cgi-bin/"
-    nomads_scripts = {'GFS':'filter_gfs_0p25_1hr.pl','NAM':'filter_nam.pl','RAP':'filter_rap.pl','HRRR':'filter_hrrr_2d.pl','ARW':'filter_hiresconus.pl','NEST':'filter_nam_conusnest.pl'}
+    nomads_scripts = {'GFS':'filter_gfs_0p25_1hr.pl', 'RAP':'filter_rap.pl', 'HRRR':'filter_hrrr_2d.pl'}
 
     for model, script in nomads_scripts.items():
         cyc_s, cyc_d = (cyc_h_s, cyc_h_d) if model in ['HRRR', 'RAP'] else (f"{cyc_6hr:02d}", cyc_6_d)
         if model == 'GFS': dir_path, file_tpl = f'gfs.{cyc_d}/{cyc_s}/atmos', f'gfs.t{cyc_s}z.pgrb2.0p25.f{{hr}}'
-        elif model == 'NAM': dir_path, file_tpl = f'nam.{cyc_d}', f'nam.t{cyc_s}z.awphys{{hr}}.tm00.grib2'
         elif model == 'RAP': dir_path, file_tpl = f'rap.{cyc_d}', f'rap.t{cyc_s}z.awp130pgrbf{{hr}}.grib2'
         elif model == 'HRRR': dir_path, file_tpl = f'hrrr.{cyc_d}/conus', f'hrrr.t{cyc_s}z.wrfsfcf{{hr}}.grib2'
-        elif model == 'ARW': dir_path, file_tpl = f'hiresw.{cyc_d}', f'hiresw.t{cyc_s}z.arw_5km.f{{hr}}.conus.grib2'
-        elif model == 'NEST': dir_path, file_tpl = f'nam.{cyc_d}', f'nam.t{cyc_s}z.conusnest.hiresf{{hr}}.tm00.grib2'
 
         for hr in range(1, 49): 
             hr_str = f"{hr:03d}" if model == 'GFS' else f"{hr:02d}"
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
 
-    # 🧼 --- TARGET AND DOWNLOAD UNIFIED REFS STREAM FROM THE IEM METEOROLOGY SOUNDING ENGINE --- 🧼
+    # Download updated text profiles via IEM engine API
+    model_init_strings['rrfs'] = f"{cyc_6_d[4:6]}/{cyc_6_d[6:8]} {cyc_6hr:02d}Z"
     for s in TAF_SITES:
         buf_id = s[1:].lower() if s == 'KXMR' else s.lower()
         
-        # Pulls live text soundings directly via standard API channels
         rrfs_url = f"https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model=rrfs&station={buf_id.upper()}"
         download_file(rrfs_url, os.path.join(DATA_DIR, f"rrfs_{s.lower()}.buf"))
 
-        p_urls = {'nam': "http://www.meteo.psu.edu/bufkit/data/latest/nam_{site}.buf", 'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 'rap': "http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{site}.buf", 'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf", 'nest': "https://www.meteo.psu.edu/bufkit/data/NAMNEST/latest/namnest_{site}.buf", 'arw': "https://www.meteo.psu.edu/bufkit/data/HIRESW/latest/hiresw_{site}.buf"}
-        f_url = "https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={model}&station={site}"
+        p_urls = {
+            'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 
+            'rap': "http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{site}.buf", 
+            'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf"
+        }
         for m, u in p_urls.items(): 
             success = download_file(u.format(site=buf_id), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
             if not success:
-                iem_mod = 'nam4km' if m == 'nest' else m
-                download_file(f_url.format(model=iem_mod, site=buf_id.upper()), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
+                f_url = f"https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={m}&station={buf_id.upper()}"
+                download_file(f_url, os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
 
     v_dfs, c_dfs, l_dfs = {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}
     for m in MODELS_VIS:
@@ -258,7 +252,6 @@ def main():
             shear_data = process_bufkit(path, m, 'llws')
             if not shear_data.empty: l_dfs[s] = l_dfs[s].join(shear_data, how='outer')
             
-            # 🧼 Injects the calculated visibility map cleanly into the core dataframe lists
             if m == 'rrfs':
                 vis_data = process_bufkit(path, m, 'vis')
                 if not vis_data.empty: v_dfs[s] = v_dfs[s].join(vis_data, how='outer')
@@ -273,7 +266,6 @@ def main():
         
         d.columns = [f"{c} [{model_init_strings.get(c.lower(), '??')}]" for c in d.columns]
         
-        # Enforces a static alphabetical/hierarchical sort order across all presenting metrics
         expected_order = [f"{c} [{model_init_strings.get(c.lower(), '??')}]" for c in MODELS_VIS]
         existing_ordered_cols = [c for c in expected_order if c in d.columns]
         d = d[existing_ordered_cols]
@@ -305,6 +297,7 @@ def main():
             links.append(f'<a {id_tag}onmouseover="setSiteData(this, \'{param}\', \'{s.lower()}\')">{s}</a>')
         return "&nbsp; ".join(links)
 
+    # 🎨 --- OPTIMIZED HORIZONTAL FOOTPRINT CSS --- 🎨
     dashboard_html = f"""
     <html><head><style>
     body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; transition: background-color 0.3s, color 0.3s; font-size: 10px; }}
@@ -313,7 +306,8 @@ def main():
     .main-container {{ display: flex; justify-content: center; gap: 20px; margin-top: 20px; }}
     .vertical-run-controls {{ display: flex; flex-direction: column; gap: 6px; background-color: #f0f0f0; padding: 10px; border-radius: 8px; border: 1px solid #ccc; transition: background-color 0.3s, color 0.3s, border-color 0.3s; min-width: 100px; }}
     table {{ border-collapse: collapse; margin: 0 auto; background-color: white; }}
-    th, td {{ border: 1px solid #999; padding: 2px 4px; text-align: center; font-size: 10px; min-width: 55px; }}
+    /* 🎨 Column minimum width optimized to 72px to handle text lengths without vertical breaking */
+    th, td {{ border: 1px solid #999; padding: 3px 5px; text-align: center; font-size: 10px; min-width: 72px; }}
     th {{ background-color: #6495ED; color: white; }}
     
     .legend-container {{ background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 8px; padding: 10px; width: 280px; font-size: 11px; display: flex; flex-direction: column; }}
@@ -365,7 +359,7 @@ def main():
             <label><input type="radio" name="r" onclick="setRun(3)"> Run -3</label>
             <label><input type="radio" name="r" onclick="setRun(4)"> Run -4</label>
         </div>
-        <div id="table-container" style="min-width: 550px; overflow-x: auto;"></div>
+        <div id="table-container" style="min-width: 450px; overflow-x: auto;"></div>
         <div class="legend-container">
             <h3>Legend</h3><hr>
             <div class="legend-grid">
