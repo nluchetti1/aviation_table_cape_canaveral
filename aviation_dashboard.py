@@ -1,17 +1,17 @@
+import warnings
+warnings.filterwarnings("ignore")
+
 import os
 import re
 import glob
 import json
 import requests
-import warnings
 import numpy as np
 import pandas as pd
 import xarray as xr
 import metpy.calc as mpcalc
 from metpy.units import units
 from datetime import datetime, timedelta, timezone
-
-warnings.filterwarnings('ignore')
 
 # --- 1. CONFIGURATION ---
 TAF_SITES_META = {
@@ -94,11 +94,15 @@ def style_llws_table(val):
 def download_file(url, filepath):
     try:
         r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20, stream=True)
+        # 📢 GitHub Actions Logger Output
+        print(f"   [HTTP {r.status_code}] -> Sourcing: {url}")
         if r.status_code == 200:
             with open(filepath, 'wb') as f:
                 for chunk in r.iter_content(8192): f.write(chunk)
             return True
-    except: return False
+    except Exception as e:
+        print(f"   [ERROR] -> Download failure: {e}")
+        return False
     return False
 
 def process_bufkit(filepath, model_name, mode='cig'):
@@ -181,7 +185,7 @@ def main():
     now = datetime.now(timezone.utc)
     last_updated_str = now.strftime("%Y-%m-%d %H:%M UTC")
     
-    print("Clearing temporary cache directories...")
+    print("\n=== STAGE 1: Purging workspace storage folder ===")
     for f in glob.glob(os.path.join(DATA_DIR, "*")):
         try: os.remove(f)
         except: pass
@@ -191,7 +195,7 @@ def main():
     hrly_time = now - timedelta(hours=2)
     cyc_h_s, cyc_h_d = f"{hrly_time.hour:02d}", hrly_time.strftime("%Y%m%d")
 
-    # Fetch spatial files via NOMADS
+    print("\n=== STAGE 2: Querying Gridded Visibility files ===")
     bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=278&rightlon=282&bottomlat=26"
     base_url = "https://nomads.ncep.noaa.gov/cgi-bin/"
     nomads_scripts = {'GFS':'filter_gfs_0p25_1hr.pl', 'RAP':'filter_rap.pl', 'HRRR':'filter_hrrr_2d.pl'}
@@ -207,13 +211,15 @@ def main():
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
 
-    # Download updated text profiles via IEM engine API
+    print("\n=== STAGE 3: Querying live Sounding stations ===")
+    # Primary download mapping targeting the production AWS S3 buckets directly
     model_init_strings['rrfs'] = f"{cyc_6_d[4:6]}/{cyc_6_d[6:8]} {cyc_6hr:02d}Z"
     for s in TAF_SITES:
-        buf_id = s[1:].lower() if s == 'KXMR' else s.lower()
+        bufr_site_tag = s.lower()
         
-        rrfs_url = f"https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model=rrfs&station={buf_id.upper()}"
-        download_file(rrfs_url, os.path.join(DATA_DIR, f"rrfs_{s.lower()}.buf"))
+        # S3 explicit file mapping target path
+        bufr_url = f"https://noaa-rrfs-pds.s3.amazonaws.com/rrfs_a/rrfs.{cyc_6_d}/{cyc_6hr:02d}/bufr.{cyc_6hr:02d}/bufr.t{cyc_6hr:02d}z.hrly.sound.{bufr_site_tag}.tm00"
+        download_file(bufr_url, os.path.join(DATA_DIR, f"rrfs_{bufr_site_tag}.buf"))
 
         p_urls = {
             'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 
@@ -221,12 +227,14 @@ def main():
             'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf"
         }
         for m, u in p_urls.items(): 
-            success = download_file(u.format(site=buf_id), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
+            success = download_file(u.format(site=bufr_site_tag if s == 'KXMR' else s.lower()), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
             if not success:
-                f_url = f"https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={m}&station={buf_id.upper()}"
+                f_url = f"https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={m}&station={s.upper()}"
                 download_file(f_url, os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
 
-    v_dfs, c_dfs, l_dfs = {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}
+    print("\n=== STAGE 4: Aggregating Weather Matrices ===")
+    v_dict, c_dict, l_dict = {s: {} for s in TAF_SITES}, {s: {} for s in TAF_SITES}, {s: {} for s in TAF_SITES}
+    
     for m in MODELS_VIS:
         if m == 'RRFS': continue
         files = sorted(glob.glob(os.path.join(DATA_DIR, f"{m.lower()}*.grib2")))
@@ -237,24 +245,37 @@ def main():
             model_init_strings[m.lower()] = pd.to_datetime(np.atleast_1d(ds['time'].values)[0]).strftime('%m/%d %HZ')
             for s, co in TAF_SITES_META.items():
                 idx = find_nearest_gridpoint(ds, co['lat'], co['lon'])
-                new_col = pd.DataFrame({m: [format_visibility(v) for v in ds['vis'].values[:, idx[0], idx[1]]]}, index=valid_times)
-                v_dfs[s] = v_dfs[s].join(new_col, how='outer')
-        except: pass
+                vis_vals = [format_visibility(v) for v in ds['vis'].values[:, idx[0], idx[1]]]
+                v_dict[s][m] = pd.Series(vis_vals, index=valid_times)
+        except Exception as e:
+            print(f"   Error formatting spatial index grids for {m}: {e}")
 
     for s in TAF_SITES:
         for m in MODELS_BUFKIT:
             path = os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf")
             if not os.path.exists(path): continue
             
+            s_name = m.upper()
             cig_data = process_bufkit(path, m, 'cig')
-            if not cig_data.empty: c_dfs[s] = c_dfs[s].join(cig_data, how='outer')
+            if not cig_data.empty: 
+                c_dict[s][s_name] = cig_data
+                print(f"   [PARSED] -> {s_name} Cloud Ceiling for {s} (Rows: {len(cig_data)})")
             
             shear_data = process_bufkit(path, m, 'llws')
-            if not shear_data.empty: l_dfs[s] = l_dfs[s].join(shear_data, how='outer')
+            if not shear_data.empty: 
+                l_dict[s][s_name] = shear_data
+                print(f"   [PARSED] -> {s_name} Wind Shear for {s} (Rows: {len(shear_data)})")
             
             if m == 'rrfs':
                 vis_data = process_bufkit(path, m, 'vis')
-                if not vis_data.empty: v_dfs[s] = v_dfs[s].join(vis_data, how='outer')
+                if not vis_data.empty: 
+                    v_dict[s][s_name] = vis_data
+                    print(f"   [PARSED] -> {s_name} Surface Visibility for {s} (Rows: {len(vis_data)})")
+
+    # Safe post-aggregation fallback structure prevents pandas serialization drop bugs
+    v_dfs = {s: pd.DataFrame(v_dict[s]) for s in TAF_SITES}
+    c_dfs = {s: pd.DataFrame(c_dict[s]) for s in TAF_SITES}
+    l_dfs = {s: pd.DataFrame(l_dict[s]) for s in TAF_SITES}
 
     run_start_utc = now.replace(minute=0, second=0, microsecond=0, tzinfo=None)
     html_tbls = {}
@@ -280,9 +301,15 @@ def main():
         html_tbls[f"cig_{ss}"] = to_st_html(c_dfs[s], 'cig', run_start_utc)
         html_tbls[f"llws_{ss}"] = to_st_html(l_dfs[s], 'llws', run_start_utc)
 
+    # Clean cache history reset tracking sequence
     if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, 'r') as f: full_history = json.load(f)
+        try:
+            with open(HISTORY_FILE, 'r') as f: full_history = json.load(f)
+            if len(full_history) > 0 and "NAM" in str(full_history[0]):
+                full_history = []
+        except: full_history = []
     else: full_history = []
+        
     full_history.insert(0, {"timestamp": last_updated_str, "tables": html_tbls})
     full_history = full_history[:5]
     with open(HISTORY_FILE, 'w') as f: json.dump(full_history, f)
@@ -297,7 +324,6 @@ def main():
             links.append(f'<a {id_tag}onmouseover="setSiteData(this, \'{param}\', \'{s.lower()}\')">{s}</a>')
         return "&nbsp; ".join(links)
 
-    # 🎨 --- OPTIMIZED HORIZONTAL FOOTPRINT CSS --- 🎨
     dashboard_html = f"""
     <html><head><style>
     body {{ font-family: sans-serif; margin: 8px; background-color: #ffffff; color: #000000; transition: background-color 0.3s, color 0.3s; font-size: 10px; }}
@@ -306,7 +332,6 @@ def main():
     .main-container {{ display: flex; justify-content: center; gap: 20px; margin-top: 20px; }}
     .vertical-run-controls {{ display: flex; flex-direction: column; gap: 6px; background-color: #f0f0f0; padding: 10px; border-radius: 8px; border: 1px solid #ccc; transition: background-color 0.3s, color 0.3s, border-color 0.3s; min-width: 100px; }}
     table {{ border-collapse: collapse; margin: 0 auto; background-color: white; }}
-    /* 🎨 Column minimum width optimized to 72px to handle text lengths without vertical breaking */
     th, td {{ border: 1px solid #999; padding: 3px 5px; text-align: center; font-size: 10px; min-width: 72px; }}
     th {{ background-color: #6495ED; color: white; }}
     
@@ -397,7 +422,7 @@ def main():
     </div></div></div></body></html>
     """
     with open("index.html", "w") as f: f.write(dashboard_html)
-    print("Update Complete.")
+    print("\nUpdate Complete.")
 
 if __name__ == "__main__":
     main()
