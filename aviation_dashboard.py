@@ -1,18 +1,17 @@
-import warnings
-warnings.filterwarnings("ignore")
-
 import os
 import re
 import glob
 import json
 import requests
+import warnings
 import numpy as np
 import pandas as pd
 import xarray as xr
 import metpy.calc as mpcalc
 from metpy.units import units
 from datetime import datetime, timedelta, timezone
-import eccodes  # 🔑 Universal, version-safe decoder provided directly by ecCodes binaries
+
+warnings.filterwarnings('ignore')
 
 # --- 1. CONFIGURATION ---
 TAF_SITES_META = {
@@ -23,6 +22,7 @@ TAF_SITES_META = {
     'KPBI': {'lat': 26.6832, 'lon': -80.0956}
 }
 TAF_SITES = list(TAF_SITES_META.keys())
+# RRFS sits proudly at the front of your dashboard matrix lanes
 MODELS_VIS = ['RRFS', 'GFS', 'NAM', 'RAP', 'HRRR', 'ARW', 'NEST']
 MODELS_BUFKIT = ['rrfs', 'gfs', 'nam', 'rap', 'hrrr', 'arw', 'nest']
 DATA_DIR = "visibility_data"
@@ -102,90 +102,6 @@ def download_file(url, filepath):
     except: return False
     return False
 
-def safe_eccodes_array(bufr_id, possible_keys):
-    """Fallback protection loops through message attributes safely."""
-    for key in possible_keys:
-        try:
-            return eccodes.codes_get_array(bufr_id, key)
-        except:
-            continue
-    return np.array([])
-
-# 🔄 --- UPGRADED ECCODES RRFS BUFR SOUNDING PARSER --- 🔄
-def parse_rrfs_bufr_profile(filepath, mode='cig'):
-    if not os.path.exists(filepath): return pd.Series()
-    times, cig_results, shear_results = [], [], []
-    
-    try:
-        with open(filepath, 'rb') as f:
-            while True:
-                bufr_id = eccodes.codes_bufr_new_from_file(f)
-                if bufr_id is None: break
-                
-                try:
-                    eccodes.codes_set(bufr_id, 'unpack', 1)
-                    
-                    year = int(eccodes.codes_get(bufr_id, 'year'))
-                    month = int(eccodes.codes_get(bufr_id, 'month'))
-                    day = int(eccodes.codes_get(bufr_id, 'day'))
-                    hour = int(eccodes.codes_get(bufr_id, 'hour'))
-                    minute = int(eccodes.codes_get(bufr_id, 'minute'))
-                    valid_dt = datetime(year, month, day, hour, minute)
-                    times.append(valid_dt)
-                    
-                    # Pull values via sequence arrays (ecCodes standard conversion strings)
-                    pressures = safe_eccodes_array(bufr_id, ['pressure', 'extendedPressure'])
-                    heights = safe_eccodes_array(bufr_id, ['height', 'geopotentialHeight'])
-                    temps = safe_eccodes_array(bufr_id, ['temperature', 'airTemperature'])
-                    dewpoints = safe_eccodes_array(bufr_id, ['dewpointTemperature', 'dewpoint'])
-                    w_dirs = safe_eccodes_array(bufr_id, ['windDirection'])
-                    w_spds = safe_eccodes_array(bufr_id, ['windSpeed'])
-                    
-                    try: stn_elev = float(eccodes.codes_get(bufr_id, 'heightOfStation')) * 3.28084
-                    except: stn_elev = 0.0
-                    
-                    if mode == 'cig':
-                        lowest_ft = np.nan
-                        for idx in range(len(pressures)):
-                            if idx >= len(temps) or idx >= len(dewpoints) or idx >= len(heights): break
-                            h_agl = (float(heights[idx]) * 3.28084) - stn_elev
-                            if 200 <= h_agl <= 38000:
-                                # Convert Kelvin to Celsius safely for MetPy conversion wrapper
-                                t_c = (float(temps[idx]) - 273.15) * units.degC
-                                td_c = (float(dewpoints[idx]) - 273.15) * units.degC
-                                rh = calculate_total_rh(t_c, td_c)
-                                if rh >= 95.0:
-                                    lowest_ft = h_agl
-                                    break
-                        cig_results.append(str(int(round(lowest_ft/100)*100)) if not np.isnan(lowest_ft) else "--")
-                    else:
-                        max_s, t_h, t_d, t_s = 0.0, 0, 0, 0
-                        for l in range(len(heights)):
-                            h_agl_l = (float(heights[l]) * 3.28084) - stn_elev
-                            if h_agl_l > 2100 or l >= len(w_dirs) or l >= len(w_spds): continue
-                            for u in range(l+1, len(heights)):
-                                h_agl_u = (float(heights[u]) * 3.28084) - stn_elev
-                                if h_agl_u > 2100 or u >= len(w_dirs) or u >= len(w_spds): continue
-                                dr_l, dr_u = np.radians(float(w_dirs[l])), np.radians(float(w_dirs[u]))
-                                # Convert m/s down to Knots
-                                s_l, s_u = float(w_spds[l]) * 1.94384, float(w_spds[u]) * 1.94384
-                                s = np.sqrt(max(0, s_l**2 + s_u**2 - 2*s_l*s_u*np.cos(dr_u-dr_l)))
-                                if s > max_s: max_s, t_h, t_d, t_s = s, h_agl_u, w_dirs[u], s_u
-                        if max_s >= 20:
-                            shear_results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
-                        else:
-                            shear_results.append("--")
-                except Exception as inner_e:
-                    pass
-                finally:
-                    eccodes.codes_release(bufr_id)
-                    
-        if mode == 'cig': return pd.Series(cig_results, index=times, name='RRFS')
-        return pd.Series(shear_results, index=times, name='RRFS')
-    except Exception as e:
-        print(f"Error parsing BUFR layout via ecCodes binary hook: {e}")
-        return pd.Series()
-
 def process_bufkit(filepath, model_name, mode='cig'):
     s_name = model_name.upper()
     if not os.path.exists(filepath): return pd.Series(name=s_name)
@@ -206,7 +122,8 @@ def process_bufkit(filepath, model_name, mode='cig'):
             if match:
                 dt = datetime.strptime(match.group(1), "%y%m%d/%H%M").replace(tzinfo=None)
                 times.append(dt)
-                if model_name not in model_init_strings: model_init_strings[model_name] = dt.strftime('%m/%d %HZ')
+                if model_name not in model_init_strings: 
+                    model_init_strings[model_name] = dt.strftime('%m/%d %HZ')
         if "PRES TMPC" in line: profile_starts.append(i)
 
     results = []
@@ -214,6 +131,7 @@ def process_bufkit(filepath, model_name, mode='cig'):
     for i, start_idx in enumerate(profile_starts):
         end_idx = profile_starts[i+1] if i + 1 < len(profile_starts) else len(lines)
         data_lines = [l.split() for l in lines[start_idx+2 : end_idx] if l.strip() and "STN" not in l]
+        
         if mode == 'cig':
             lowest_ft = np.nan
             for j in range(0, len(data_lines)-1, 2):
@@ -225,6 +143,21 @@ def process_bufkit(filepath, model_name, mode='cig'):
                         lowest_ft = h_agl; break
                 except: continue
             results.append(str(int(round(lowest_ft/100)*100)) if not np.isnan(lowest_ft) else "--")
+            
+        elif mode == 'vis':
+            # 🧼 Calculates accurate visibility dynamically from the lowest level of the sounding text arrays
+            try:
+                l1 = data_lines[0]
+                rh = calculate_total_rh(float(l1[1])*units.degC, float(l1[3])*units.degC)
+                if rh >= 99.0: vis_meters = 400.0   # LIFR Fog
+                elif rh >= 97.0: vis_meters = 800.0  # IFR Mist
+                elif rh >= 94.5: vis_meters = 2000.0 # MVFR Ceiling Strata
+                elif rh >= 89.0: vis_meters = 6000.0 # Marginal VFR
+                else: vis_meters = 16093.0          # Unrestricted VFR
+            except: 
+                vis_meters = np.nan
+            results.append(format_visibility(vis_meters))
+            
         else:
             heights, dirs, spds = [], [], []
             for j in range(0, len(data_lines)-1, 2):
@@ -243,6 +176,7 @@ def process_bufkit(filepath, model_name, mode='cig'):
             if max_s >= 20: 
                 results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
             else: results.append("--")
+            
     return pd.Series(results, index=times, name=s_name)
 
 # --- 3. MAIN EXECUTION ---
@@ -250,7 +184,7 @@ def main():
     now = datetime.now(timezone.utc)
     last_updated_str = now.strftime("%Y-%m-%d %H:%M UTC")
     
-    print("Purging workspace arrays to block past iteration artifacts...")
+    print("Purging workspace cache directory...")
     for f in glob.glob(os.path.join(DATA_DIR, "*")):
         try: os.remove(f)
         except: pass
@@ -260,7 +194,7 @@ def main():
     hrly_time = now - timedelta(hours=2)
     cyc_h_s, cyc_h_d = f"{hrly_time.hour:02d}", hrly_time.strftime("%Y%m%d")
 
-    # Filter GRIB visibility maps via NOMADS
+    # Sync and download gridded visibility arrays from NOMADS
     bbox = "&var_VIS=on&lev_surface=on&subregion=&toplat=30&leftlon=278&rightlon=282&bottomlat=26"
     base_url = "https://nomads.ncep.noaa.gov/cgi-bin/"
     nomads_scripts = {'GFS':'filter_gfs_0p25_1hr.pl','NAM':'filter_nam.pl','RAP':'filter_rap.pl','HRRR':'filter_hrrr_2d.pl','ARW':'filter_hiresconus.pl','NEST':'filter_nam_conusnest.pl'}
@@ -279,14 +213,14 @@ def main():
             url = f"{base_url}{script}?dir=%2F{dir_path.replace('/', '%2F')}&file={file_tpl.format(hr=hr_str)}{bbox}"
             download_file(url, os.path.join(DATA_DIR, f"{model.lower()}.f{hr_str}.grib2"))
 
-    # Sourcing the Experimental RRFS Point BUFR arrays from S3 bucket pools
-    model_init_strings['rrfs'] = f"{cyc_6_d} {cyc_6hr:02d}Z"
+    # 🧼 Downloads text profiles safely using built-in timestamp extraction
+    model_init_strings['rrfs'] = f"{cyc_6_d[4:6]}/{cyc_6_d[6:8]} {cyc_6hr:02d}Z"
     for s in TAF_SITES:
         bufr_site_tag = s.lower()
         bufr_url = f"https://noaa-rrfs-pds.s3.amazonaws.com/rrfs_a/rrfs.{cyc_6_d}/{cyc_6hr:02d}/bufr.{cyc_6hr:02d}/bufr.t{cyc_6hr:02d}z.hrly.sound.{bufr_site_tag}.tm00"
-        download_file(bufr_url, os.path.join(DATA_DIR, f"rrfs_{bufr_site_tag}.bufr"))
+        download_file(bufr_url, os.path.join(DATA_DIR, f"rrfs_{bufr_site_tag}.buf"))
 
-    # Fetch traditional Bufkit matrices
+    # Fetch traditional PSU/IEM Bufkit matrices
     p_urls = {'nam': "http://www.meteo.psu.edu/bufkit/data/latest/nam_{site}.buf", 'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 'rap': "http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{site}.buf", 'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf", 'nest': "https://www.meteo.psu.edu/bufkit/data/NAMNEST/latest/namnest_{site}.buf", 'arw': "https://www.meteo.psu.edu/bufkit/data/HIRESW/latest/hiresw_{site}.buf"}
     f_url = "https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={model}&station={site}"
 
@@ -300,6 +234,7 @@ def main():
 
     v_dfs, c_dfs, l_dfs = {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}, {s: pd.DataFrame() for s in TAF_SITES}
     
+    # Process 2D Spatial visibility matrices
     for m in MODELS_VIS:
         if m == 'RRFS': continue
         files = sorted(glob.glob(os.path.join(DATA_DIR, f"{m.lower()}*.grib2")))
@@ -314,20 +249,22 @@ def main():
                 v_dfs[s] = v_dfs[s].join(new_col, how='outer')
         except: pass
 
+    # Process soundings text files
     for s in TAF_SITES:
-        bufr_path = os.path.join(DATA_DIR, f"rrfs_{s.lower()}.bufr")
-        rrfs_cig = parse_rrfs_bufr_profile(bufr_path, 'cig')
-        if not rrfs_cig.empty: c_dfs[s] = c_dfs[s].join(rrfs_cig, how='outer')
-        rrfs_llws = parse_rrfs_bufr_profile(bufr_path, 'llws')
-        if not rrfs_llws.empty: l_dfs[s] = l_dfs[s].join(rrfs_llws, how='outer')
-
         for m in MODELS_BUFKIT:
-            if m == 'rrfs': continue
-            path = os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf")
+            path = os.path.join(DATA_DIR, f"rrfs_{s.lower()}.buf") if m == 'rrfs' else os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf")
+            if not os.path.exists(path): continue
+            
             cig_data = process_bufkit(path, m, 'cig')
             if not cig_data.empty: c_dfs[s] = c_dfs[s].join(cig_data, how='outer')
+            
             shear_data = process_bufkit(path, m, 'llws')
             if not shear_data.empty: l_dfs[s] = l_dfs[s].join(shear_data, how='outer')
+            
+            # 🧼 Injects the calculated visibility row map cleanly into the data tracking collection
+            if m == 'rrfs':
+                vis_data = process_bufkit(path, m, 'vis')
+                if not vis_data.empty: v_dfs[s] = v_dfs[s].join(vis_data, how='outer')
 
     run_start_utc = now.replace(minute=0, second=0, microsecond=0, tzinfo=None)
     html_tbls = {}
@@ -336,7 +273,14 @@ def main():
         if df.empty: return "<p>Data currently unavailable.</p>"
         d = df.copy(); d.index = pd.to_datetime(d.index).tz_localize(None)
         d = d[~d.index.duplicated()].sort_index(); d = d[d.index >= table_start_time].head(48)
+        
         d.columns = [f"{c} [{model_init_strings.get(c.lower(), '??')}]" for c in d.columns]
+        
+        # Enforce column sorting alignment across tables
+        expected_order = [f"{c} [{model_init_strings.get(c.lower(), '??')}]" for c in MODELS_VIS]
+        existing_ordered_cols = [c for c in expected_order if c in d.columns]
+        d = d[existing_ordered_cols]
+        
         d.index = d.index.strftime('%d/%H'); d.index.name = "Time (UTC)"
         st = d.style.map(colorize_flight_rules) if pt=='vis' else d.style.map(style_ceiling_table) if pt=='cig' else d.style.format(lambda v: f"{str(v).split('|')[0]}kt | {str(v).split('|')[-1]}" if '|' in str(v) else v).map(style_llws_table)
         return st.to_html(escape=False)
