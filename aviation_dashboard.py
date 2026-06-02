@@ -12,7 +12,6 @@ import xarray as xr
 import metpy.calc as mpcalc
 from metpy.units import units
 from datetime import datetime, timedelta, timezone
-import eccodes  # Universal binary decoder
 
 # --- 1. CONFIGURATION ---
 TAF_SITES_META = {
@@ -24,7 +23,7 @@ TAF_SITES_META = {
 }
 TAF_SITES = list(TAF_SITES_META.keys())
 MODELS_VIS = ['RRFS', 'GFS', 'RAP', 'HRRR']
-MODELS_BUFKIT = ['gfs', 'rap', 'hrrr']
+MODELS_BUFKIT = ['rrfs', 'gfs', 'rap', 'hrrr']
 DATA_DIR = "visibility_data"
 HISTORY_FILE = "history.json"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -44,15 +43,18 @@ def calculate_total_rh(t_c, td_c):
         return 0.0
 
 def find_nearest_gridpoint(ds, target_lat, target_lon):
-    lat_arr, lon_arr = ds['latitude'].values, ds['longitude'].values
-    if lon_arr.max() > 180 and target_lon < 0: target_lon += 360
-    if lat_arr.ndim == 1 and lon_arr.ndim == 1:
-        lat_idx = np.abs(lat_arr - target_lat).argmin()
-        lon_idx = np.abs(lon_arr - target_lon).argmin()
-        return (lat_idx, lon_idx)
-    else:
-        dist_sq = (lat_arr - target_lat)**2 + (lon_arr - target_lon)**2
-        return np.unravel_index(np.argmin(dist_sq, axis=None), dist_sq.shape)
+    try:
+        lat_arr, lon_arr = ds['latitude'].values, ds['longitude'].values
+        if lon_arr.max() > 180 and target_lon < 0: target_lon += 360
+        if lat_arr.ndim == 1 and lon_arr.ndim == 1:
+            lat_idx = np.abs(lat_arr - target_lat).argmin()
+            lon_idx = np.abs(lon_arr - target_lon).argmin()
+            return (lat_idx, lon_idx)
+        else:
+            dist_sq = (lat_arr - target_lat)**2 + (lon_arr - target_lon)**2
+            return np.unravel_index(np.argmin(dist_sq, axis=None), dist_sq.shape)
+    except:
+        return (0, 0)
 
 def format_visibility(vis_meters):
     if np.isnan(vis_meters) or vis_meters < 0: return "N/A"
@@ -105,95 +107,6 @@ def download_file(url, filepath):
         return False
     return False
 
-def safe_eccodes_array(bufr_id, possible_keys):
-    for key in possible_keys:
-        try: return eccodes.codes_get_array(bufr_id, key)
-        except: continue
-    return np.array([])
-
-# --- BINARY RRFS BUFR SOUNDING DECODER ---
-def parse_rrfs_bufr_profile(filepath, mode='cig'):
-    if not os.path.exists(filepath): return pd.Series()
-    times, cig_results, shear_results, vis_results = [], [], [], []
-    
-    try:
-        with open(filepath, 'rb') as f:
-            while True:
-                bufr_id = eccodes.codes_bufr_new_from_file(f)
-                if bufr_id is None: break
-                
-                try:
-                    eccodes.codes_set(bufr_id, 'unpack', 1)
-                    year = int(eccodes.codes_get(bufr_id, 'year'))
-                    month = int(eccodes.codes_get(bufr_id, 'month'))
-                    day = int(eccodes.codes_get(bufr_id, 'day'))
-                    hour = int(eccodes.codes_get(bufr_id, 'hour'))
-                    minute = int(eccodes.codes_get(bufr_id, 'minute'))
-                    valid_dt = datetime(year, month, day, hour, minute)
-                    
-                    pressures = safe_eccodes_array(bufr_id, ['pressure', 'extendedPressure', 'verticalSoundingPressure'])
-                    heights = safe_eccodes_array(bufr_id, ['height', 'geopotentialHeight', 'nonCoordinateGeopotentialHeight'])
-                    temps = safe_eccodes_array(bufr_id, ['temperature', 'airTemperature', 'dryBulbTemperature'])
-                    dewpoints = safe_eccodes_array(bufr_id, ['dewpointTemperature', 'dewpoint'])
-                    w_dirs = safe_eccodes_array(bufr_id, ['windDirection'])
-                    w_spds = safe_eccodes_array(bufr_id, ['windSpeed'])
-                    
-                    try: stn_elev = float(eccodes.codes_get(bufr_id, 'heightOfStation')) * 3.28084
-                    except: stn_elev = 0.0
-                    
-                    if len(pressures) == 0 or len(heights) == 0 or len(temps) == 0: continue
-                    times.append(valid_dt)
-                    
-                    if mode == 'cig':
-                        lowest_ft = np.nan
-                        for idx in range(len(pressures)):
-                            if idx >= len(temps) or idx >= len(dewpoints) or idx >= len(heights): break
-                            if float(temps[idx]) > 500 or float(dewpoints[idx]) > 500: continue
-                            h_agl = (float(heights[idx]) * 3.28084) - stn_elev
-                            if 200 <= h_agl <= 38000:
-                                rh = calculate_total_rh((float(temps[idx])-273.15)*units.degC, (float(dewpoints[idx])-273.15)*units.degC)
-                                if rh >= 94.5: lowest_ft = h_agl; break
-                        cig_results.append(str(int(round(lowest_ft/100)*100)) if not np.isnan(lowest_ft) else "--")
-                        
-                    elif mode == 'vis':
-                        try:
-                            valid_idx = 0
-                            for idx in range(len(temps)):
-                                if float(temps[idx]) < 500 and float(dewpoints[idx]) < 500:
-                                    valid_idx = idx; break
-                            rh = calculate_total_rh((float(temps[valid_idx])-273.15)*units.degC, (float(dewpoints[valid_idx])-273.15)*units.degC)
-                            if rh >= 99.0: vis_meters = 400.0
-                            elif rh >= 97.0: vis_meters = 800.0
-                            elif rh >= 94.5: vis_meters = 2000.0
-                            elif rh >= 89.0: vis_meters = 6000.0
-                            else: vis_meters = 16093.0
-                        except: vis_meters = np.nan
-                        vis_results.append(format_visibility(vis_meters))
-                        
-                    else:
-                        max_s, t_h, t_d, t_s = 0.0, 0, 0, 0
-                        for l in range(len(heights)):
-                            if l >= len(w_dirs) or l >= len(w_spds) or float(w_spds[l]) > 500: continue
-                            h_agl_l = (float(heights[l]) * 3.28084) - stn_elev
-                            if h_agl_l > 2100: continue
-                            for u in range(l+1, len(heights)):
-                                if u >= len(w_dirs) or u >= len(w_spds) or float(w_spds[u]) > 500: continue
-                                h_agl_u = (float(heights[u]) * 3.28084) - stn_elev
-                                if h_agl_u > 2100: continue
-                                dr_l, dr_u = np.radians(float(w_dirs[l])), np.radians(float(w_dirs[u]))
-                                s_l, s_u = float(w_spds[l]) * 1.94384, float(w_spds[u]) * 1.94384
-                                s = np.sqrt(max(0, s_l**2 + s_u**2 - 2*s_l*s_u*np.cos(dr_u-dr_l)))
-                                if s > max_s: max_s, t_h, t_d, t_s = s, h_agl_u, w_dirs[u], s_u
-                        if max_s >= 20: shear_results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
-                        else: shear_results.append("--")
-                except: pass
-                finally: eccodes.codes_release(bufr_id)
-                
-        if mode == 'cig': return pd.Series(cig_results, index=times, name='RRFS')
-        elif mode == 'vis': return pd.Series(vis_results, index=times, name='RRFS')
-        return pd.Series(shear_results, index=times, name='RRFS')
-    except: return pd.Series()
-
 def process_bufkit(filepath, model_name, mode='cig'):
     s_name = model_name.upper()
     if not os.path.exists(filepath): return pd.Series(name=s_name)
@@ -222,6 +135,7 @@ def process_bufkit(filepath, model_name, mode='cig'):
     for i, start_idx in enumerate(profile_starts):
         end_idx = profile_starts[i+1] if i + 1 < len(profile_starts) else len(lines)
         data_lines = [l.split() for l in lines[start_idx+2 : end_idx] if l.strip() and "STN" not in l]
+        
         if mode == 'cig':
             lowest_ft = np.nan
             for j in range(0, len(data_lines)-1, 2):
@@ -233,6 +147,20 @@ def process_bufkit(filepath, model_name, mode='cig'):
                         lowest_ft = h_agl; break
                 except: continue
             results.append(str(int(round(lowest_ft/100)*100)) if not np.isnan(lowest_ft) else "--")
+            
+        elif mode == 'vis':
+            try:
+                l1 = data_lines[0]
+                rh = calculate_total_rh(float(l1[1])*units.degC, float(l1[3])*units.degC)
+                if rh >= 99.0: vis_meters = 400.0   
+                elif rh >= 96.5: vis_meters = 800.0  
+                elif rh >= 93.0: vis_meters = 2000.0 
+                elif rh >= 88.0: vis_meters = 6000.0 
+                else: vis_meters = 16093.0          
+            except: 
+                vis_meters = np.nan
+            results.append(format_visibility(vis_meters))
+            
         else:
             heights, dirs, spds = [], [], []
             for j in range(0, len(data_lines)-1, 2):
@@ -248,8 +176,10 @@ def process_bufkit(filepath, model_name, mode='cig'):
                     dr_l, dr_u = np.radians(dirs[l]), np.radians(dirs[u])
                     s = np.sqrt(max(0, spds[l]**2 + spds[u]**2 - 2*spds[l]*spds[u]*np.cos(dr_u-dr_l)))
                     if s > max_s: max_s, t_h, t_d, t_s = s, heights[u], dirs[u], spds[u]
-            if max_s >= 20: results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
+            if max_s >= 20: 
+                results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
             else: results.append("--")
+            
     return pd.Series(results, index=times, name=s_name)
 
 # --- 3. MAIN EXECUTION ---
@@ -286,55 +216,63 @@ def main():
     print("\n=== STAGE 3: Querying live Sounding stations ===")
     model_init_strings['rrfs'] = f"{cyc_6_d[4:6]}/{cyc_6_d[6:8]} {cyc_6hr:02d}Z"
     for s in TAF_SITES:
-        tag_3char = s[1:].lower() if (len(s) == 4 and s.upper().startswith('K')) else s.lower()
-        tag_4char = s.lower()
+        tag_4char = s.upper()
+        tag_3char = s[1:].upper() if s.upper().startswith('K') else s.upper()
+        if s.upper() == 'KXMR': tag_3char = 'XMR'
         
-        success_rrfs = False
-        for current_tag in [tag_3char, tag_4char]:
-            bufr_url = f"https://noaa-rrfs-pds.s3.amazonaws.com/rrfs_a/rrfs.{cyc_6_d}/{cyc_6hr:02d}/bufr.{cyc_6hr:02d}/bufr.t{cyc_6hr:02d}z.hrly.sound.{current_tag}.tm00"
-            success_rrfs = download_file(bufr_url, os.path.join(DATA_DIR, f"rrfs_{s.lower()}.bufr"))
-            if success_rrfs: break
+        # 1. Download RRFS cleanly from stable text APIs
+        for station_tag in [tag_4char, tag_3char]:
+            rrfs_url = f"https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model=rrfs&station={station_tag}"
+            if download_file(rrfs_url, os.path.join(DATA_DIR, f"rrfs_{s.lower()}.buf")): break
 
-        p_urls = {
-            'gfs': "http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{site}.buf", 
-            'rap': "http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{site}.buf", 
-            'hrrr': "https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{site}.buf"
-        }
-        for m, u in p_urls.items(): 
-            success_b = download_file(u.format(site=tag_3char), os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
-            if not success_b:
-                f_url = f"https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={m}&station={s.upper()}"
-                download_file(f_url, os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf"))
+        # 2. Download legacy Bufkit profiles using character matrix fallback arrays
+        for m in ['gfs', 'rap', 'hrrr']:
+            urls_to_try = []
+            if m == 'gfs':
+                urls_to_try.extend([f"http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{tag_4char.lower()}.buf", f"http://www.meteo.psu.edu/bufkit/data/GFS/latest/gfs3_{tag_3char.lower()}.buf"])
+            elif m == 'rap':
+                urls_to_try.extend([f"http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{tag_4char.lower()}.buf", f"http://www.meteo.psu.edu/bufkit/data/RAP/latest/rap_{tag_3char.lower()}.buf"])
+            elif m == 'hrrr':
+                urls_to_try.extend([f"https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{tag_4char.lower()}.buf", f"https://www.meteo.psu.edu/bufkit/data/HRRR/latest/hrrr_{tag_3char.lower()}.buf"])
+            
+            urls_to_try.extend([f"https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={m}&station={tag_4char}", f"https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model={m}&station={tag_3char}"])
+            
+            for url in urls_to_try:
+                if download_file(url, os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf")): break
 
     print("\n=== STAGE 4: Aggregating Weather Matrices ===")
     v_dict, c_dict, l_dict = {s: {} for s in TAF_SITES}, {s: {} for s in TAF_SITES}, {s: {} for s in TAF_SITES}
     
+    # Fast, isolated loop-based grid extraction avoids silent open_mfdataset dim drops
     for m in MODELS_VIS:
         if m == 'RRFS': continue
-        files = sorted(glob.glob(os.path.join(DATA_DIR, f"{m.lower()}*.grib2")))
+        files = sorted(glob.glob(os.path.join(DATA_DIR, f"{m.lower()}.f*.grib2")))
         if not files: continue
-        try:
-            ds = xr.open_mfdataset(files, engine='cfgrib', combine='nested', concat_dim='valid_time', coords="minimal", compat="override")
-            valid_times = pd.to_datetime(ds.valid_time.values).tz_localize(None)
-            model_init_strings[m.lower()] = pd.to_datetime(np.atleast_1d(ds['time'].values)[0]).strftime('%m/%d %HZ')
-            for s, co in TAF_SITES_META.items():
-                idx = find_nearest_gridpoint(ds, co['lat'], co['lon'])
-                vis_vals = [format_visibility(v) for v in ds['vis'].values[:, idx[0], idx[1]]]
-                v_dict[s][m] = pd.Series(vis_vals, index=valid_times)
-        except: pass
+        
+        model_series_data = {s: [] for s in TAF_SITES}
+        model_times = []
+        
+        for fpath in files:
+            try:
+                with xr.open_dataset(fpath, engine='cfgrib') as ds:
+                    if m.lower() not in model_init_strings:
+                        model_init_strings[m.lower()] = pd.to_datetime(np.atleast_1d(ds['time'].values)[0]).strftime('%m/%d %HZ')
+                    
+                    valid_time = pd.to_datetime(ds['valid_time'].values).tz_localize(None)
+                    model_times.append(valid_time)
+                    
+                    for s, co in TAF_SITES_META.items():
+                        idx = find_nearest_gridpoint(ds, co['lat'], co['lon'])
+                        vis_val = ds['vis'].values[idx[0], idx[1]] if ds['vis'].ndim == 2 else ds['vis'].values[idx]
+                        model_series_data[s].append(format_visibility(vis_val))
+            except: pass
+            
+        if model_times:
+            for s in TAF_SITES:
+                v_dict[s][m] = pd.Series(model_series_data[s], index=model_times)
 
+    # Process sounding files text matrices
     for s in TAF_SITES:
-        bufr_file = os.path.join(DATA_DIR, f"rrfs_{s.lower()}.bufr")
-        if os.path.exists(bufr_file):
-            rrfs_cig = parse_rrfs_bufr_profile(bufr_file, 'cig')
-            if not rrfs_cig.empty: c_dict[s]['RRFS'] = rrfs_cig
-            
-            rrfs_vis = parse_rrfs_bufr_profile(bufr_file, 'vis')
-            if not rrfs_vis.empty: v_dict[s]['RRFS'] = rrfs_vis
-            
-            rrfs_llws = parse_rrfs_bufr_profile(bufr_file, 'llws')
-            if not rrfs_llws.empty: l_dict[s]['RRFS'] = rrfs_llws
-
         for m in MODELS_BUFKIT:
             path = os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf")
             if not os.path.exists(path): continue
@@ -345,6 +283,10 @@ def main():
             
             shear_data = process_bufkit(path, m, 'llws')
             if not shear_data.empty: l_dict[s][s_name] = shear_data
+            
+            if m == 'rrfs':
+                vis_data = process_bufkit(path, m, 'vis')
+                if not vis_data.empty: v_dict[s][s_name] = vis_data
 
     v_dfs = {s: pd.DataFrame(v_dict[s]) for s in TAF_SITES}
     c_dfs = {s: pd.DataFrame(c_dict[s]) for s in TAF_SITES}
@@ -363,6 +305,8 @@ def main():
         existing_ordered_cols = [c for c in expected_order if c in d.columns]
         d = d[existing_ordered_cols]
         
+        if d.empty: return "<p>Data currently unavailable.</p>"
+        
         d.index = d.index.strftime('%d/%H'); d.index.name = "Time (UTC)"
         st = d.style.map(colorize_flight_rules) if pt=='vis' else d.style.map(style_ceiling_table) if pt=='cig' else d.style.format(lambda v: f"{str(v).split('|')[0]}kt | {str(v).split('|')[-1]}" if '|' in str(v) else v).map(style_llws_table)
         return st.to_html(escape=False)
@@ -376,8 +320,7 @@ def main():
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, 'r') as f: full_history = json.load(f)
-            if len(full_history) > 0 and "NAM" in str(full_history[0]):
-                full_history = []
+            if len(full_history) > 0 and "NAM" in str(full_history[0]): full_history = []
         except: full_history = []
     else: full_history = []
         
