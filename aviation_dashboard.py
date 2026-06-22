@@ -198,22 +198,26 @@ def process_bufkit(filepath, model_name, mode='cig'):
                 l1, l2 = data_lines[j], data_lines[j+1]
                 if len(l1) < 7 or len(l2) < 4: continue
                 try:
-                    pres = float(l1[0]) * units.mbar
-                    tmpc = float(l1[1]) * units.degC
-                    dwpc = float(l1[3]) * units.degC
-                    wspd = float(l1[6])
+                    pres = float(l1[0])  # mb
+                    tmpc = float(l1[1])  # C
+                    dwpc = float(l1[3])  # C
+                    wspd = float(l1[6])  # knots
                     
-                    theta = mpcalc.potential_temperature(pres, tmpc)
-                    mixing_ratio = mpcalc.mixing_ratio_from_dewpoint(pres, dwpc)
-                    theta_v = mpcalc.virtual_potential_temperature(pres, tmpc, mixing_ratio).magnitude
+                    # Robust thermodynamic calculation bypassing MetPy dependency issues
+                    tk = tmpc + 273.15
+                    e_vap = 6.112 * np.exp((17.67 * dwpc) / (dwpc + 243.5))
+                    w_mix = 0.622 * e_vap / (pres - e_vap)
+                    tvk = tk * (1.0 + 0.61 * w_mix)
+                    theta_v = tvk * ((1000.0 / pres) ** 0.286)
+                    
+                    pbl_winds.append(wspd)
                     
                     if surface_theta_v is None:
                         surface_theta_v = theta_v
                     
-                    if (theta_v - surface_theta_v) > 1.5:
+                    # Core criteria check for top of boundary layer mixed profile
+                    if (theta_v - surface_theta_v) > 2.0:
                         break
-                        
-                    pbl_winds.append(wspd)
                 except: continue
                 
             if not pbl_winds: 
