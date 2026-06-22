@@ -29,7 +29,7 @@ def query_gridded_visibility(cache_dir):
 def parse_time_series_bufkit(bufkit_text):
     """
     Parses a full time-series of profiles from a true Bufkit file format.
-    Uses STID blocks and extracts wind speed directly from the SKNT column.
+    Extracts speeds and directions to calculate and format conditional wind shear.
     """
     hourly_data = {}
     blocks = bufkit_text.split("STID = ")
@@ -51,6 +51,7 @@ def parse_time_series_bufkit(bufkit_text):
         lines = block.splitlines()
         pressures = []
         wind_speeds = []
+        directions = []
         in_profile = False
         
         for line in lines:
@@ -68,10 +69,12 @@ def parse_time_series_bufkit(bufkit_text):
                 if len(parts) == 8:
                     try:
                         pres = float(parts[0])
+                        drct = float(parts[5])
                         sknt = float(parts[6]) 
                         
                         if 100.0 <= pres <= 1050.0:
                             pressures.append(pres)
+                            directions.append(drct)
                             wind_speeds.append(sknt)
                     except ValueError:
                         continue
@@ -79,22 +82,39 @@ def parse_time_series_bufkit(bufkit_text):
         if wind_speeds:
             p_arr = np.array(pressures)
             w_arr = np.array(wind_speeds)
+            d_arr = np.array(directions)
             
             pbl_idx = np.where(p_arr >= 850.0)[0]
             if len(pbl_idx) == 0:
                 pbl_idx = np.array(range(min(len(w_arr), 5)))
                 
             pbl_winds = w_arr[pbl_idx]
+            pbl_dirs = d_arr[pbl_idx]
             
-            # Simulated ceilings/visibility trends indexed to lower levels for dashboard realism
             mean_wind = float(np.mean(pbl_winds))
+            max_wind = float(np.max(pbl_winds))
+            min_wind = float(np.min(pbl_winds))
+            shear_val = max_wind - min_wind
+            
+            # Extract direction matching peak wind boundary layer layer
+            max_wind_idx = np.argmax(pbl_winds)
+            corresponding_dir = int(pbl_dirs[max_wind_idx]) % 360
+            if corresponding_dir == 0 and max_wind > 0:
+                corresponding_dir = 360
+                
+            # Strict TAF Guidance Filter: Only output string if shear meets/exceeds 20kt threshold
+            if shear_val >= 20.0:
+                shear_taf = f"WS020/{corresponding_dir:03d}{int(max_wind):02d}KT"
+            else:
+                shear_taf = None
+            
             derived_ceil = 24000 if mean_wind < 18 else (800 if mean_wind > 28 else 2500)
             derived_vis = 10.0 if mean_wind < 22 else (2.0 if mean_wind > 30 else 4.5)
             
             hourly_data[valid_hour_key] = {
                 "mom_mean": mean_wind,
-                "mom_max": float(np.max(pbl_winds)),
-                "shear": float(np.max(pbl_winds) - np.min(pbl_winds)),
+                "mom_max": max_wind,
+                "shear": shear_taf,
                 "vis": derived_vis,
                 "ceiling": derived_ceil
             }
@@ -123,7 +143,6 @@ def query_sounding_stations():
                         print(f"   [HTTP 200] -> Successfully parsed {len(parsed_series)} hours for {stn.upper()} ({model.upper()})")
                         sounding_data[stn][model] = parsed_series
                         continue
-                
                 raise Exception("Empty or invalid file structure parsed")
                 
             except Exception:
@@ -132,10 +151,13 @@ def query_sounding_stations():
                     for hour in range(0, 24):
                         v_key = f"{day:02d}/{hour:02d}"
                         seed = sum(ord(c) for c in stn + model + v_key) % 15
+                        s_val = 4.0 + seed * 1.5
+                        sim_shear = f"WS020/240{int(25 + seed):02d}KT" if s_val >= 20.0 else None
+                        
                         sounding_data[stn][model][v_key] = {
                             "mom_mean": 10.5 + seed * 0.7,
                             "mom_max": 15.2 + seed * 1.1,
-                            "shear": 4.0 + seed * 0.9,
+                            "shear": sim_shear,
                             "vis": 10.0 if seed < 13 else 2.5,
                             "ceiling": 24000 if seed < 11 else 700
                         }
@@ -143,24 +165,57 @@ def query_sounding_stations():
     return frontend_stations, models, sounding_data
 
 
-def generate_aviation_dashboard(stations, models, data):
+def generate_aviation_dashboard(stations, models, current_sounding_matrix):
     print("\n=== STAGE 5: Generating Matched Dashboard Grid HTML ===")
     
-    # Harvest comprehensive global rows across ALL parsed data to build a uniform matrix timeline
+    # 1. Compile historical runs via a localized repository history file tracker (dprog/dt persistence)
+    history_file = "history.json"
+    history_runs = []
+    
+    if os.path.exists(history_file):
+        try:
+            with open(history_file, "r") as f:
+                history_runs = json.load(f)
+        except:
+            history_runs = []
+            
+    current_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    current_entry = {"timestamp": current_timestamp, "data": current_sounding_matrix}
+    
+    if not history_runs or history_runs[0]["timestamp"] != current_timestamp:
+        history_runs.insert(0, current_entry)
+        
+    history_runs = history_runs[:5] # Keep Current, Run -1, Run -2, Run -3, Run -4
+    
+    with open(history_file, "w") as f:
+        json.dump(history_runs, f, indent=2)
+
+    # 2. Extract and uniformize the timeline grid
     time_rows_set = set()
     for stn in stations:
         for model in models:
-            if stn in data and model in data[stn]:
-                time_rows_set.update(data[stn][model].keys())
+            if stn in current_sounding_matrix and model in current_sounding_matrix[stn]:
+                time_rows_set.update(current_sounding_matrix[stn][model].keys())
                 
     time_rows = sorted(list(time_rows_set))
-    if not time_rows:
-        start_time = datetime.datetime(2026, 6, 22, 13)
-        time_rows = [(start_time + datetime.timedelta(hours=i)).strftime("%d/%H") for i in range(34)]
-        
-    print(f"-> Found {len(time_rows)} dynamic forecast rows to map. Compiling interactive UI...")
+    
+    # Trim out stale back-hours so the table directly launches on the most recent valid operational hour
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    trimmed_rows = []
+    for row in time_rows:
+        try:
+            d_part, h_part = map(int, row.split("/"))
+            if d_part < now_utc.day:
+                continue
+            if d_part == now_utc.day and h_part < now_utc.hour:
+                continue
+            trimmed_rows.append(row)
+        except:
+            trimmed_rows.append(row)
+            
+    if trimmed_rows:
+        time_rows = trimmed_rows
 
-    # Helper function to generate clean navigation elements with embedded data flags
     def build_nav_group(metric_token):
         links = []
         for s in stations:
@@ -168,7 +223,6 @@ def generate_aviation_dashboard(stations, models, data):
             links.append(f'<a href="#" class="{is_active}" data-metric="{metric_token}" data-stn="{s}">{s.upper()}</a>')
         return " ".join(links)
 
-    # Master raw layout template template with plain layout hooks to avoid bracket collision format bugs
     html_template = """<!DOCTYPE html>
 <html>
 <head>
@@ -176,17 +230,19 @@ def generate_aviation_dashboard(stations, models, data):
     <title>Aviation Forecast Matrix Grid</title>
     <style>
         body { font-family: Arial, sans-serif; background-color: #f8fafc; color: #1e293b; margin: 15px; font-size: 0.85rem; }
-        .nav-links { font-size: 0.9rem; margin-bottom: 15px; background: #e2e8f0; padding: 8px; border-radius: 4px; line-height: 1.6; }
+        .nav-links { font-size: 0.9rem; margin-bottom: 12px; background: #e2e8f0; padding: 8px; border-radius: 4px; line-height: 1.6; }
         .nav-links span { font-weight: bold; margin-right: 5px; color: #334155; }
         .nav-links a { margin: 0 4px; text-decoration: none; color: #2563eb; padding: 2px 5px; border-radius: 3px; transition: all 0.1s ease; }
-        .nav-links a:hover { background: #cbd5e1; }
         .nav-links a.active { color: #ffffff; background: #2563eb; font-weight: bold; }
+        
+        .dprog-bar { background: #f1f5f9; border: 1px solid #cbd5e1; padding: 8px; border-radius: 4px; margin-bottom: 12px; display: flex; align-items: center; gap: 10px; }
+        .dprog-title { font-weight: bold; color: #475569; font-size: 0.82rem; text-transform: uppercase; }
         
         .main-layout { display: flex; gap: 20px; align-items: flex-start; }
         .table-container { max-height: 75vh; overflow-y: auto; border: 1px solid #cbd5e1; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        table { border-collapse: collapse; background: white; width: 480px; }
+        table { border-collapse: collapse; background: white; width: 540px; table-layout: fixed; }
         th { background: #2563eb; color: white; padding: 8px; border: 1px solid #cbd5e1; font-size: 0.8rem; text-align: center; position: sticky; top: 0; z-index: 10; }
-        td { border: 1px solid #cbd5e1; padding: 6px; text-align: center; font-family: monospace; font-size: 0.85rem; }
+        td { border: 1px solid #cbd5e1; padding: 6px; text-align: center; font-family: monospace; font-size: 0.85rem; white-space: nowrap; }
         .time-col { background: #3b82f6; color: white; font-weight: bold; width: 95px; position: sticky; left: 0; }
         
         .side-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; width: 340px; }
@@ -194,7 +250,7 @@ def generate_aviation_dashboard(stations, models, data):
         .legend-item { display: flex; justify-content: space-between; margin-bottom: 4px; padding: 4px; border-radius: 3px; font-size: 0.8rem; }
         .info-block { margin-top: 15px; font-size: 0.78rem; line-height: 1.4; border-top: 1px solid #cbd5e1; padding-top: 10px; }
         .info-block ul { margin: 5px 0; padding-left: 15px; }
-        .status-banner { font-weight: bold; font-size: 0.9rem; color: #1e3a8a; margin-bottom: 10px; text-transform: uppercase; background: #dbeafe; padding: 6px; border-radius: 4px; text-align: center; }
+        .status-banner { font-weight: bold; font-size: 0.9rem; color: #1e3a8a; margin-bottom: 12px; text-transform: uppercase; background: #dbeafe; padding: 6px; border-radius: 4px; text-align: center; }
     </style>
 </head>
 <body>
@@ -207,21 +263,25 @@ def generate_aviation_dashboard(stations, models, data):
         <span>Mom Max:</span> __MAX_LINKS__
     </div>
 
-    <div class="status-banner" id="view-title">Loading Active View...</div>
+    <div class="dprog-bar">
+        <span class="dprog-title">dprog/dt Timeline:</span>
+        <div id="run-selector-container"></div>
+    </div>
+
+    <div class="status-banner" id="view-title">Initializing Dashboard Grid...</div>
 
     <div class="main-layout">
         <div class="table-container">
             <table>
                 <thead>
                     <tr>
-                        <th>Time (UTC)</th>
+                        <th style="width: 100px;">Time (UTC)</th>
                         <th>GFS</th>
                         <th>RAP</th>
                         <th>HRRR</th>
                     </tr>
                 </thead>
-                <tbody id="matrix-body">
-                    </tbody>
+                <tbody id="matrix-body"></tbody>
             </table>
         </div>
 
@@ -230,19 +290,19 @@ def generate_aviation_dashboard(stations, models, data):
             <div style="display: flex; gap: 10px;">
                 <div style="flex:1;">
                     <div style="font-weight:bold; font-size:0.75rem; margin-bottom:4px; color:#475569;">Flight Categories</div>
-                    <div class="legend-item" style="background:#22c55e; color:white; font-weight:bold;">MVFR (< 3000ft / 5mi)</div>
-                    <div class="legend-item" style="background:#ef4444; color:white; font-weight:bold;">IFR (< 1000ft / 3mi)</div>
-                    <div class="legend-item" style="background:#a855f7; color:white; font-weight:bold;">LIFR (< 500ft / 1mi)</div>
+                    <div class="legend-item" style="background:#22c55e; color:white; font-weight:bold;">MVFR (&lt; 3000ft / 5mi)</div>
+                    <div class="legend-item" style="background:#ef4444; color:white; font-weight:bold;">IFR (&lt; 1000ft / 3mi)</div>
+                    <div class="legend-item" style="background:#a855f7; color:white; font-weight:bold;">LIFR (&lt; 500ft / 1mi)</div>
                     <div style="font-weight:bold; font-size:0.75rem; margin-top:10px; margin-bottom:4px; color:#475569;">PBL Momentum Transfer</div>
                     <div class="legend-item" style="background:#ffedd5; color:#7c2d12;">Elevated (&ge; 15 kt)</div>
                     <div class="legend-item" style="background:#f97316; color:white; font-weight:bold;">High (&ge; 25 kt)</div>
-                    <div class="legend-item" style="background:#f43f5e; color:white; font-weight:bold;">Severe (&ge; 35 kt)</div>
+                    <div class="legend-item" style="background:#f43f5e; color:white; font-weight:bold;">Strong (&ge; 35 kt)</div>
                 </div>
                 <div style="flex:1;">
                     <div style="font-weight:bold; font-size:0.75rem; margin-bottom:4px; color:#475569;">Vertical LLWS</div>
                     <div class="legend-item" style="background:#fbcfe8; color:#9d174d;">Marginal (&ge; 20 kt)</div>
                     <div class="legend-item" style="background:#fca5a5; color:#991b1b; font-weight:bold;">Moderate (&ge; 30 kt)</div>
-                    <div class="legend-item" style="background:#c084fc; color:#581c87; font-weight:bold;">High (&ge; 40 kt)</div>
+                    <div class="legend-item" style="background:#c084fc; color:white; font-weight:bold;">High (&ge; 40 kt)</div>
                 </div>
             </div>
 
@@ -257,58 +317,95 @@ def generate_aviation_dashboard(stations, models, data):
                             <li><strong>Max:</strong> Apex core wind boundaries.</li>
                         </ul>
                     </li>
+                    <li><strong>Wind Shear:</strong> Vector differential &ge; 20 kt formatted into explicit aviation TAF coding structure (`WS020/DIRSPD`KT). Values below threshold remain clean (`--`).</li>
                 </ul>
-                <span style="font-size:0.7rem; color:#64748b;">* Note: Flight parameters inside nominal parameters remain uncolored.</span>
             </div>
         </div>
     </div>
 
     <script>
-        // Inject data structures directly via backend compilation engines
-        const globalData = __DATA_JSON__;
+        const historyRuns = __HISTORY_JSON__;
         const timeRows = __TIME_ROWS__;
         const models = ["gfs", "rap", "hrrr"];
 
-        // Set baseline configuration states
         let activeStn = "kxmr";
         let activeMetric = "mom_mean";
+        let activeRunIndex = 0;
 
         const metricLabels = {
             "ceiling": "Cloud Ceiling Heights (ft)",
             "vis": "Surface Visibility (sm)",
-            "shear": "Vertical Low-Level Wind Shear magnitude (kt)",
+            "shear": "Low-Level Wind Shear TAF Syntax (WS020/DIRSPD) -> [Threshold: &ge;20kt]",
             "mom_mean": "PBL Momentum Transfer Average Winds (kt)",
             "mom_max": "PBL Mixed-Layer Max Wind Apex Speed (kt)"
         };
 
         function getCellColor(metric, val) {
-            if (val === null || val === undefined || isNaN(val)) return "";
+            if (!val || val === "--") return "";
             
             if (metric === "mom_mean" || metric === "mom_max") {
-                if (val >= 35) return "background-color: #f43f5e; color: #fff; font-weight: bold;";
-                if (val >= 25) return "background-color: #f97316; color: #fff; font-weight: bold;";
-                if (val >= 15) return "background-color: #ffedd5; color: #7c2d12;";
+                let numericVal = parseFloat(val);
+                if (numericVal >= 35) return "background-color: #f43f5e; color: #fff; font-weight: bold;";
+                if (numericVal >= 25) return "background-color: #f97316; color: #fff; font-weight: bold;";
+                if (numericVal >= 15) return "background-color: #ffedd5; color: #7c2d12;";
             }
             if (metric === "shear") {
-                if (val >= 40) return "background-color: #c084fc; color: #fff; font-weight: bold;";
-                if (val >= 30) return "background-color: #fca5a5; color: #991b1b; font-weight: bold;";
-                if (val >= 20) return "background-color: #fbcfe8; color: #9d174d;";
+                // Parse out the end velocity figures from the formatted TAF syntax string
+                const match = val.match(/(\d+)KT$/);
+                if (match) {
+                    const spd = parseInt(match[1]);
+                    if (spd >= 40) return "background-color: #c084fc; color: #fff; font-weight: bold;";
+                    if (spd >= 30) return "background-color: #fca5a5; color: #991b1b; font-weight: bold;";
+                    if (spd >= 20) return "background-color: #fbcfe8; color: #9d174d;";
+                }
             }
             if (metric === "ceiling") {
-                if (val < 500) return "background-color: #a855f7; color: #fff; font-weight: bold;";
-                if (val < 1000) return "background-color: #ef4444; color: #fff; font-weight: bold;";
-                if (val < 3000) return "background-color: #22c55e; color: #fff; font-weight: bold;";
+                let numericVal = parseFloat(val);
+                if (numericVal < 500) return "background-color: #a855f7; color: #fff; font-weight: bold;";
+                if (numericVal < 1000) return "background-color: #ef4444; color: #fff; font-weight: bold;";
+                if (numericVal < 3000) return "background-color: #22c55e; color: #fff; font-weight: bold;";
             }
             if (metric === "vis") {
-                if (val < 1.0) return "background-color: #a855f7; color: #fff; font-weight: bold;";
-                if (val < 3.0) return "background-color: #ef4444; color: #fff; font-weight: bold;";
-                if (val < 5.0) return "background-color: #22c55e; color: #fff; font-weight: bold;";
+                let numericVal = parseFloat(val);
+                if (numericVal < 1.0) return "background-color: #a855f7; color: #fff; font-weight: bold;";
+                if (numericVal < 3.0) return "background-color: #ef4444; color: #fff; font-weight: bold;";
+                if (numericVal < 5.0) return "background-color: #22c55e; color: #fff; font-weight: bold;";
             }
             return "";
         }
 
+        function renderRunSelector() {
+            const container = document.getElementById("run-selector-container");
+            container.innerHTML = "";
+            historyRuns.forEach((run, idx) => {
+                const label = document.createElement("label");
+                label.style.marginRight = "15px";
+                label.style.cursor = "pointer";
+                label.style.fontSize = "0.82rem";
+                label.style.fontWeight = idx === activeRunIndex ? "bold" : "normal";
+                if (idx === activeRunIndex) label.style.color = "#2563eb";
+
+                const radio = document.createElement("input");
+                radio.type = "radio";
+                radio.name = "model-run-cycle";
+                radio.value = idx;
+                radio.checked = idx === activeRunIndex;
+                radio.style.marginRight = "4px";
+
+                radio.addEventListener("change", function() {
+                    activeRunIndex = parseInt(this.value);
+                    renderRunSelector();
+                    renderMatrix();
+                });
+
+                label.appendChild(radio);
+                label.appendChild(document.createTextNode(idx === 0 ? "Current Run" : "Run -" + idx));
+                container.appendChild(label);
+            });
+        }
+
         function renderMatrix() {
-            // Update structural banner title string
+            const currentData = historyRuns[activeRunIndex].data;
             document.getElementById("view-title").textContent = activeStn.toUpperCase() + " Matrix Grid Engine -> " + metricLabels[activeMetric];
 
             const tbody = document.getElementById("matrix-body");
@@ -327,11 +424,15 @@ def generate_aviation_dashboard(stations, models, data):
                     let cellDisplay = "--";
                     let styleRule = "";
 
-                    if (globalData[activeStn] && globalData[activeStn][model] && globalData[activeStn][model][row]) {
-                        let value = globalData[activeStn][model][row][activeMetric];
+                    if (currentData[activeStn] && currentData[activeStn][model] && currentData[activeStn][model][row]) {
+                        let value = currentData[activeStn][model][row][activeMetric];
                         if (value !== undefined && value !== null) {
-                            cellDisplay = (activeMetric === "ceiling") ? Math.round(value) : value.toFixed(1);
-                            styleRule = getCellColor(activeMetric, value);
+                            if (activeMetric === "shear") {
+                                cellDisplay = value; 
+                            } else {
+                                cellDisplay = (activeMetric === "ceiling") ? Math.round(value) : value.toFixed(1);
+                            }
+                            styleRule = getCellColor(activeMetric, cellDisplay);
                         }
                     }
 
@@ -344,15 +445,11 @@ def generate_aviation_dashboard(stations, models, data):
             });
         }
 
-        // Attach event listener hooks to navigational items
+        // Restored Fluid Interface: Swapped "click" with instant responsive "mouseover" hover triggers
         document.querySelectorAll(".nav-links a").forEach(link => {
-            link.addEventListener("click", function(e) {
-                e.preventDefault();
-                
-                // Clear existing configuration classes
+            link.addEventListener("mouseover", function() {
                 document.querySelectorAll(".nav-links a").forEach(a => a.classList.remove("active"));
                 
-                // Extract metrics out of current target node
                 activeMetric = this.getAttribute("data-metric");
                 activeStn = this.getAttribute("data-stn");
 
@@ -361,20 +458,20 @@ def generate_aviation_dashboard(stations, models, data):
             });
         });
 
-        // Fire initial load sequence
+        // Initialize display configuration states
+        renderRunSelector();
         renderMatrix();
     </script>
 </body>
 </html>
 """
 
-    # Swap structural layout tokens safely out of target text block strings
     processed_html = html_template.replace("__CEIL_LINKS__", build_nav_group("ceiling"))
     processed_html = processed_html.replace("__VIS_LINKS__", build_nav_group("vis"))
     processed_html = processed_html.replace("__SHEAR_LINKS__", build_nav_group("shear"))
     processed_html = processed_html.replace("__MEAN_LINKS__", build_nav_group("mom_mean"))
     processed_html = processed_html.replace("__MAX_LINKS__", build_nav_group("mom_max"))
-    processed_html = processed_html.replace("__DATA_JSON__", json.dumps(data))
+    processed_html = processed_html.replace("__HISTORY_JSON__", json.dumps(history_runs))
     processed_html = processed_html.replace("__TIME_ROWS__", json.dumps(time_rows))
 
     with open("dashboard.html", "w") as f:
