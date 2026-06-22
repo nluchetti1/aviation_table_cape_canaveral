@@ -2,7 +2,6 @@ import datetime
 import json
 import os
 import re
-import numpy as np
 import requests
 
 
@@ -26,8 +25,7 @@ def pressure_to_height_ft(pres_hpa):
 def parse_time_series_bufkit(bufkit_text):
     """
     Parses vertical profile sounding chunks out of a raw Bufkit file.
-    Dynamically identifies column index order to completely resolve 
-    wind speed (SKNT) vs wind direction (DRCT) overlapping data bugs.
+    Tracks header placements across lines to support varying GFS/RAP/HRRR schemas.
     """
     hourly_data = {}
     blocks = bufkit_text.split("STID = ")
@@ -49,30 +47,38 @@ def parse_time_series_bufkit(bufkit_text):
         profile_layers = []
         in_profile = False
         
-        # Hard structural fallback indices
+        # Safe baseline structural index guesses
         pres_idx, tmpc_idx, dwpt_idx, sknt_idx = 0, 1, 3, 5
+        header_names = []
         
         for line in lines:
             cleaned = line.strip()
-            if "PRES" in cleaned and "TMPC" in cleaned:
+            
+            # Catch headers even if split across multiple lines
+            if "PRES" in cleaned or "TMPC" in cleaned or "SKNT" in cleaned:
                 in_profile = True
-                header_parts = cleaned.split()
+                header_names.extend(cleaned.split())
                 try:
-                    pres_idx = header_parts.index("PRES")
-                    tmpc_idx = header_parts.index("TMPC")
-                    dwpt_idx = header_parts.index("DWPT")
-                    sknt_idx = header_parts.index("SKNT")
+                    if "PRES" in header_names: pres_idx = header_names.index("PRES")
+                    if "TMPC" in header_names: tmpc_idx = header_names.index("TMPC")
+                    if "DWPT" in header_names: dwpt_idx = header_names.index("DWPT")
+                    if "SKNT" in header_names: sknt_idx = header_names.index("SKNT")
                 except ValueError:
-                    pass 
+                    pass
                 continue
                 
             if in_profile:
-                # Terminate loop cleanly when leaving the profile stack block
-                if "STID" in cleaned or "STNM" in cleaned or not cleaned or cleaned.isalpha():
+                # Stop parsing if we hit station metadata at the bottom of the profile stack
+                if "STID" in cleaned or "STNM" in cleaned or not cleaned:
                     break
+                
                 parts = cleaned.split()
                 if len(parts) > max(pres_idx, tmpc_idx, dwpt_idx, sknt_idx):
                     try:
+                        # Skip description/header lines that aren't numeric profile data
+                        if not parts[0].replace('.', '', 1).replace('-', '', 1).isdigit():
+                            continue
+                            
                         pres = float(parts[pres_idx])
                         tmpc = float(parts[tmpc_idx])
                         dwpt = float(parts[dwpt_idx])
@@ -137,7 +143,6 @@ def parse_time_series_bufkit(bufkit_text):
         lowest_ceiling = 24000.0  # Clear air standard default
         
         if cloud_layers:
-            # Clamp negative standard atmosphere calculations to absolute zero at the surface
             lowest_ceiling = max(0.0, cloud_layers[0]["base"])
             highest_cloud_top = max(0.0, max([c["top"] for c in cloud_layers])) / 1000.0
             max_layer_thickness = max([max(0.0, c["top"] - c["base"]) for c in cloud_layers]) / 1000.0
@@ -202,7 +207,6 @@ def query_sounding_stations():
             except Exception as e:
                 print(f" Connection Error accessing URL for {stn.upper()} [{model.upper()}]: {str(e)}")
                 
-            # Gracefully handle server downtime without injecting raw numeric bugs
             sounding_data[stn][model] = {}
                         
     return frontend_stations, models, sounding_data
@@ -279,9 +283,6 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
         .side-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; width: 360px; }
         .legend-title { font-weight: bold; border-bottom: 1px solid #cbd5e1; padding-bottom: 5px; margin-bottom: 10px; text-align: center; font-size: 0.95rem; color: #1e293b; }
         .legend-item { display: flex; justify-content: space-between; margin-bottom: 4px; padding: 5px; border-radius: 3px; font-size: 0.8rem; }
-        
-        .legend-info-text { font-size: 0.78rem; color: #475569; line-height: 1.4; margin-top: 8px; padding-top: 8px; border-top: 1px dashed #cbd5e1; }
-        .legend-info-text strong { color: #1e293b; }
         
         #hover-popup-card {
             position: absolute;
@@ -473,7 +474,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                                 else if (num >= 15) cssText = "background-color: #ffedd5; color: #7c2d12;";
                             } else if (activeMetric === "ceiling") {
                                 let num = parseFloat(value);
-                                if (num === 24000) {
+                                if (num >= 23000) {
                                     cellDisplay = "CLR";
                                 } else {
                                     if (num < 500) cssText = "background-color: #a855f7; color: white; font-weight: bold;";
@@ -482,9 +483,13 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                                 }
                             } else if (activeMetric === "vis") {
                                 let num = parseFloat(value);
-                                if (num < 1.0) cssText = "background-color: #a855f7; color: white; font-weight: bold;";
-                                else if (num < 3.0) cssText = "background-color: #ef4444; color: white; font-weight: bold;";
-                                else if (num <= 5.0) cssText = "background-color: #22c55e; color: white; font-weight: bold;";
+                                if (num >= 10.0) {
+                                    cellDisplay = "10";
+                                } else {
+                                    if (num < 1.0) cssText = "background-color: #a855f7; color: white; font-weight: bold;";
+                                    else if (num < 3.0) cssText = "background-color: #ef4444; color: white; font-weight: bold;";
+                                    else if (num <= 5.0) cssText = "background-color: #22c55e; color: white; font-weight: bold;";
+                                }
                             } else if (activeMetric === "shear" && value !== null) {
                                 cssText = "background-color: #fca5a5; color: #7f1d1d; font-weight: bold;";
                             }
@@ -552,7 +557,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                     <div class="popup-header">${data.model} Aviation Profile</div>
                     • Mean PBL Wind: <strong>${data.w_mean} kt</strong><br>
                     • Max PBL Wind: <strong>${data.w_max} kt</strong><br>
-                    • Lowest Ceiling: <strong>${data.ceil === 24000 ? "Clear" : data.ceil + " ft"}</strong><br>
+                    • Lowest Ceiling: <strong>${data.ceil >= 23000 ? "Clear" : data.ceil + " ft"}</strong><br>
                     • Visibility: <strong>${data.visibility} sm</strong><br>
                     • Wind Shear: <strong>${data.w_shear ? data.w_shear : "None Detected"}</strong>
                 `;
