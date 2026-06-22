@@ -28,44 +28,29 @@ def query_gridded_visibility(cache_dir):
 def parse_time_series_bufkit(bufkit_text):
     """
     Parses a full time-series of profiles from a Bufkit file.
-    Calculates Mom Mean (PBL average wind) and Mom Max (PBL apex wind) for each hour.
 
-    Bufkit sounding profile format (after PRES TMPC TMWC DWPC THTE DRCT SKNT OMEG header):
-      col 0: PRES (hPa)
-      col 1: TMPC
-      col 2: TMWC
-      col 3: DWPC
-      col 4: THTE
-      col 5: DRCT (wind direction, degrees)
-      col 6: SKNT (wind speed, knots)
-      col 7: OMEG
+    File structure (confirmed from live file):
+      - Each sounding block starts with a line matching:
+            STID = KDAB STNM = 722056 TIME = 260622/1400
+      - Profile column header is TWO lines:
+            PRES TMPC TMWC DWPC THTE DRCT SKNT OMEG
+            CFRL HGHT
+      - Each pressure level is also TWO lines:
+            1017.20 27.24 25.05 24.21 354.96 236.31 3.50 0.00   <- SKNT at index 6
+            0.00 20.74                                            <- CFRL HGHT (skip)
 
-    Mom Mean = mean(SKNT) for all levels from surface down to surface_pres - 150 hPa
-    Mom Max  = max(SKNT)  for that same PBL slab
-    Shear    = |SKNT[surface] - SKNT[top_of_slab]|
+    PBL slab: all levels from surface down to surface_pres - 150 hPa (~1.5 km AGL)
+    Mom Mean = mean(SKNT) across slab  [knots]
+    Mom Max  = max(SKNT)  across slab  [knots]
+    Shear    = |surface SKNT - top-of-slab SKNT|
     """
     hourly_data = {}
 
-    # ------------------------------------------------------------------ #
-    # Split file into per-hour station blocks.                            #
-    # Each block starts with "STN YYMMDD/HHMM" on a line by itself.      #
-    # ------------------------------------------------------------------ #
-    block_pattern = re.compile(
-        r"STN\s+YYMMDD/HHMM\s+SLAT\s+SLON\s+SELV\s+STIM\b",
-        re.IGNORECASE
-    )
-    # Find all block start positions
-    block_starts = [m.start() for m in re.finditer(
-        r"^STN\s+YYMMDD/HHMM", bufkit_text, re.MULTILINE
-    )]
-
+    # Split into per-sounding blocks on "STID = " lines
+    # e.g. "STID = KDAB STNM = 722056 TIME = 260622/1400"
+    block_starts = [m.start() for m in re.finditer(r"^STID\s*=", bufkit_text, re.MULTILINE)]
     if not block_starts:
-        # Fallback: try splitting on the data-row "STID = " pattern
-        block_starts = [m.start() for m in re.finditer(
-            r"^STID\s*=", bufkit_text, re.MULTILINE
-        )]
-
-    if not block_starts:
+        print("      [parse] ERROR: No 'STID =' lines found — check file format")
         return hourly_data
 
     blocks = []
@@ -73,109 +58,91 @@ def parse_time_series_bufkit(bufkit_text):
         end = block_starts[i + 1] if i + 1 < len(block_starts) else len(bufkit_text)
         blocks.append(bufkit_text[start:end])
 
+    print(f"      [parse] Found {len(blocks)} sounding blocks")
+
     for block in blocks:
-        # ---------------------------------------------------------------- #
-        # Extract valid time.  Bufkit line looks like:                     #
-        #   TIME = 260622/1300                                             #
-        # ---------------------------------------------------------------- #
-        time_match = re.search(r"TIME\s*=\s*\d{2}(\d{2})(\d{2})/(\d{2})(\d{2})", block)
+        # Extract TIME from header line, e.g. TIME = 260622/1400
+        time_match = re.search(r"TIME\s*=\s*\d{4}(\d{2})(\d{2})/(\d{2})(\d{2})", block)
         if not time_match:
-            # Try alternate format YYMMDD/HHMM
-            time_match = re.search(r"\b(\d{2})(\d{2})(\d{2})/(\d{2})(\d{2})\b", block)
-            if not time_match:
-                continue
-            yy, mm, dd, hh, mn = time_match.groups()
-        else:
-            mm, dd, hh, mn = time_match.groups()
+            continue
+        mm, dd, hh, mn = time_match.groups()
+        valid_hour_key = f"{int(dd):02d}/{int(hh):02d}"
 
-        dd = int(dd)
-        hh = int(hh)
-        valid_hour_key = f"{dd:02d}/{hh:02d}"
-
-        # ---------------------------------------------------------------- #
-        # Find the sounding profile table.                                 #
-        # Header line contains: PRES  TMPC  TMWC  DWPC  THTE  DRCT  SKNT #
-        # ---------------------------------------------------------------- #
         lines = block.splitlines()
+
+        # Find the two-line header "PRES TMPC ... OMEG" / "CFRL HGHT"
         header_idx = None
         for idx, line in enumerate(lines):
-            if re.search(r"\bPRES\b.*\bSKNT\b", line, re.IGNORECASE):
+            if re.match(r"\s*PRES\s+TMPC", line):
                 header_idx = idx
                 break
 
         if header_idx is None:
             continue
 
+        # Data starts after the two header lines
+        data_start = header_idx + 2
+
         pressures = []
-        wind_speeds_kt = []
+        wind_speeds = []
 
-        for line in lines[header_idx + 1:]:
-            stripped = line.strip()
-            # Stop at blank line or next section keyword
-            if not stripped or re.match(r"^[A-Z]{2,}", stripped):
-                if pressures:          # we already collected data — done
-                    break
-                continue               # skip leading blank/header lines
+        # Read pairs of lines: line A (8 values incl SKNT), line B (CFRL HGHT — skip)
+        i = data_start
+        while i + 1 < len(lines):
+            line_a = lines[i].strip()
+            line_b = lines[i + 1].strip()
 
-            parts = stripped.split()
-            # Need at least 7 columns: PRES TMPC TMWC DWPC THTE DRCT SKNT
-            if len(parts) < 7:
-                continue
+            # Stop if we hit an empty line or a new keyword section
+            if not line_a or re.match(r"^[A-Z]{2,}\s*=", line_a):
+                break
 
-            try:
-                pres = float(parts[0])
-                sknt = float(parts[6])   # knots — positional, not tail index
+            parts_a = line_a.split()
+            parts_b = line_b.split()
 
-                # Sanity-check: pressures in a sounding run 1050→100 hPa
-                if not (50.0 <= pres <= 1060.0):
+            # Line A should have 8 columns: PRES TMPC TMWC DWPC THTE DRCT SKNT OMEG
+            # Line B should have 2 columns: CFRL HGHT
+            if len(parts_a) == 8 and len(parts_b) == 2:
+                try:
+                    pres = float(parts_a[0])
+                    sknt = float(parts_a[6])
+
+                    if 50.0 <= pres <= 1060.0 and 0.0 <= sknt <= 300.0:
+                        pressures.append(pres)
+                        wind_speeds.append(sknt)
+                    i += 2  # advance by a pair
                     continue
-                if not (0.0 <= sknt <= 300.0):
-                    continue
+                except ValueError:
+                    pass
 
-                pressures.append(pres)
-                wind_speeds_kt.append(sknt)
-            except ValueError:
-                continue
+            # If the pair didn't match, step by 1 and try again
+            i += 1
 
         if len(pressures) < 2:
             continue
 
-        p_arr  = np.array(pressures)
-        ws_arr = np.array(wind_speeds_kt)   # already in knots
+        p_arr  = np.array(pressures)    # descending: surface first
+        ws_arr = np.array(wind_speeds)  # knots
 
-        # ---------------------------------------------------------------- #
-        # Define PBL slab: surface level down to surface_pres - 150 hPa   #
-        # Bufkit lists levels from surface (high P) to top (low P),        #
-        # so index 0 = surface.                                            #
-        # ---------------------------------------------------------------- #
+        # PBL slab: surface pressure down to surface_pres - 150 hPa
         surface_pres = p_arr[0]
-        pbl_top_pres = surface_pres - 150.0          # ~1.5 km AGL approx
+        pbl_top_pres = surface_pres - 150.0
 
         pbl_mask = p_arr >= pbl_top_pres
         if pbl_mask.sum() < 1:
             pbl_mask = np.ones(len(p_arr), dtype=bool)
 
         pbl_winds = ws_arr[pbl_mask]
-        pbl_pres  = p_arr[pbl_mask]
 
         mom_mean = float(np.mean(pbl_winds))
         mom_max  = float(np.max(pbl_winds))
-
-        # Shear = speed difference between surface and top of PBL slab
-        shear = float(abs(ws_arr[0] - pbl_winds[-1]))
-
-        # ---------------------------------------------------------------- #
-        # Ceiling / vis placeholders (replace with gridded data later)     #
-        # ---------------------------------------------------------------- #
-        ceil_val   = 25000 if mom_mean < 15 else 1200
-        vis_val    = 10.0
+        shear    = float(abs(ws_arr[0] - pbl_winds[-1]))
 
         hourly_data[valid_hour_key] = {
             "mom_mean": mom_mean,
             "mom_max":  mom_max,
             "shear":    shear,
-            "vis":      vis_val,
-            "ceiling":  ceil_val,
+            "vis":      10.0,
+            "ceiling":  25000 if mom_mean < 15 else 1200,
         }
 
     return hourly_data
@@ -201,8 +168,11 @@ def query_sounding_stations():
                     parsed_series = parse_time_series_bufkit(response.text)
                     if parsed_series:
                         sounding_data[stn][model] = parsed_series
-                        print(f"      Parsed {len(parsed_series)} hours for {stn}/{model}. "
-                              f"Sample: {next(iter(parsed_series.items()))}")
+                        first_key, first_val = next(iter(parsed_series.items()))
+                        print(f"      OK: {len(parsed_series)} hours parsed. "
+                              f"First: {first_key} -> "
+                              f"mean={first_val['mom_mean']:.1f}kt "
+                              f"max={first_val['mom_max']:.1f}kt")
                         continue
                     else:
                         print(f"      WARNING: parse returned empty dict for {stn}/{model}")
@@ -249,11 +219,11 @@ def generate_aviation_dashboard(stations, models, data, output_path="dashboard.h
         if val >= 15: return "background-color: #ffedd5; color: #7c2d12;"
         return ""
 
-    ceil_links = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
-    vis_links  = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
+    ceil_links  = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
+    vis_links   = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
     shear_links = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
-    mean_links = " ".join([f'<a href="#" class="{"active" if s=="kxmr" else ""}">{s.upper()}</a>' for s in stations])
-    max_links  = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
+    mean_links  = " ".join([f'<a href="#" class="{"active" if s=="kxmr" else ""}">{s.upper()}</a>' for s in stations])
+    max_links   = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
 
     html_header = f"""<!DOCTYPE html>
 <html>
@@ -309,7 +279,7 @@ def generate_aviation_dashboard(stations, models, data, output_path="dashboard.h
         for model in models:
             model_data = data["kxmr"][model]
             if row in model_data:
-                val = model_data[row]["mom_mean"]
+                val   = model_data[row]["mom_mean"]
                 style = get_mom_color(val)
                 html_rows += f'                    <td style="{style}">{val:.1f}</td>\n'
             else:
