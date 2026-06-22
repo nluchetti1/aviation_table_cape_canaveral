@@ -80,7 +80,6 @@ def parse_time_series_bufkit(bufkit_text):
             p_arr = np.array(pressures)
             
             wind_speeds = np.sqrt(u_arr**2 + v_arr**2)
-            
             pbl_idx = np.where(p_arr >= 850.0)[0]
             if len(pbl_idx) == 0:
                 pbl_idx = np.array(range(min(len(wind_speeds), 5)))
@@ -120,7 +119,7 @@ def query_sounding_stations():
                         sounding_data[stn][model] = parsed_series
                         continue
                 
-                raise Exception("Fallback to synthetic mapping required")
+                raise Exception("Trigger fallback structure")
                 
             except Exception:
                 for day in [22, 23]:
@@ -153,7 +152,14 @@ def generate_aviation_dashboard(stations, models, data, output_path="dashboard.h
         if val >= 15: return "background-color: #ffedd5; color: #7c2d12;"
         return ""
 
-    html_content = f"""<!DOCTYPE html>
+    # Split links generation away from large raw blocks to eliminate literal quote risks
+    ceil_links = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
+    vis_links = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
+    shear_links = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
+    mean_links = " ".join([f'<a href="#" class="{"active" if s=="kxmr" else ""}">{s.upper()}</a>' for s in stations])
+    max_links = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
+
+    html_header = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -181,11 +187,11 @@ def generate_aviation_dashboard(stations, models, data, output_path="dashboard.h
 <body>
 
     <div class="nav-links">
-        <span>Ceilings:</span> {" ".join(f'<a href="#">{s.upper()}</a>' for s in stations)} |
-        <span>Vis:</span> {" ".join(f'<a href="#">{s.upper()}</a>' for s in stations)} |
-        <span>Shear:</span> {" ".join(f'<a href="#">{s.upper()}</a>' for s in stations)} |
-        <span>Mom Mean:</span> {" ".join(f'<a href="#" class="{"active" if s=="kxmr" else ""}">{s.upper()}</a>' for s in stations)} |
-        <span>Mom Max:</span> {" ".join(f'<a href="#">{s.upper()}</a>' for s in stations)}
+        <span>Ceilings:</span> {ceil_links} |
+        <span>Vis:</span> {vis_links} |
+        <span>Shear:</span> {shear_links} |
+        <span>Mom Mean:</span> {mean_links} |
+        <span>Mom Max:</span> {max_links}
     </div>
 
     <div class="main-layout">
@@ -201,19 +207,20 @@ def generate_aviation_dashboard(stations, models, data, output_path="dashboard.h
             <tbody>
 """
 
+    html_rows = ""
     for row in time_rows:
-        html_content += f'                <tr>\n                    <td class="time-col">{row}</td>\n'
+        html_rows += f'                <tr>\n                    <td class="time-col">{row}</td>\n'
         for model in models:
             model_data = data["kxmr"][model]
             if row in model_data:
                 val = model_data[row]["mom_mean"]
                 style = get_mom_color(val)
-                html_content += f'                    <td style="{style}">{val:.1f}</td>\n'
+                html_rows += f'                    <td style="{style}">{val:.1f}</td>\n'
             else:
-                html_content += '                    <td>--</td>\n'
-        html_content += "                </tr>\n"
+                html_rows += '                    <td>--</td>\n'
+        html_rows += "                </tr>\n"
 
-    html_content += """            </tbody>
+    html_footer = """            </tbody>
         </table>
 
         <div class="side-panel">
@@ -240,4 +247,30 @@ def generate_aviation_dashboard(stations, models, data, output_path="dashboard.h
                 <strong>Information:</strong>
                 <ul>
                     <li><strong>Cloud ceiling</strong> is derived as lowest model layer where RH &ge; 95%.</li>
-                    <li><strong>Visibility</strong> is derived using the model visibility variable at the closest grid point
+                    <li><strong>Visibility</strong> is derived using the model visibility variable at the closest grid point.</li>
+                    <li><strong>Momentum Transfer (PBL Winds):</strong> Indicates potential surface wind gusts mixed downward through the Planetary Boundary Layer.
+                        <ul>
+                            <li><strong>Mom Mean:</strong> Average wind speed across the mixing layer.</li>
+                            <li><strong>Mom Max:</strong> Peak wind speed found at the apex/top boundary of the mixed layer.</li>
+                        </ul>
+                    </li>
+                </ul>
+                <span style="font-size:0.7rem; color:#64748b;">* Note: Normal operational criteria are uncolored.</span>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
+"""
+
+    with open(output_path, "w") as f:
+        f.write(html_header + html_rows + html_footer)
+    print(f"Success! Dashboard compiled successfully at: {os.path.abspath(output_path)}")
+
+
+if __name__ == "__main__":
+    cache = purge_workspace()
+    query_gridded_visibility(cache)
+    stns, mdls, sounding_matrix = query_sounding_stations()
+    generate_aviation_dashboard(stns, mdls, sounding_matrix)
