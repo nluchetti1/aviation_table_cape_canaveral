@@ -87,11 +87,21 @@ def style_ceiling_table(val):
 def style_llws_table(val):
     if pd.isna(val) or "|" not in str(val): return ''
     try:
-        mag = float(str(val).split('|')[0].strip())
+        mag = float(str(val).split('|')[0].replace('kt', '').strip())
         if mag < 20: return ''
         elif 20 <= mag < 30: return 'background-color: #FFC125; color: black;'
         elif 30 <= mag < 40: return 'background-color: #CD5B45; color: white;'
         else: return 'background-color: #7A378B; color: white;'
+    except: return ''
+
+def style_momentum_table(val):
+    if pd.isna(val) or val in ["N/A", "--"] or "kt" not in str(val): return ''
+    try:
+        v = int(str(val).replace('kt', '').strip())
+        if v < 15: return ''
+        elif 15 <= v < 25: return 'background-color: #E0EEEE; color: black;'
+        elif 25 <= v < 35: return 'background-color: #FF8C00; color: white;'
+        else: return 'background-color: #FF3030; color: white;'
     except: return ''
 
 def download_file(url, filepath):
@@ -161,7 +171,7 @@ def process_bufkit(filepath, model_name, mode='cig'):
                 vis_meters = np.nan
             results.append(format_visibility(vis_meters))
             
-        else:
+        elif mode == 'llws':
             heights, dirs, spds = [], [], []
             for j in range(0, len(data_lines)-1, 2):
                 l1, l2 = data_lines[j], data_lines[j+1]
@@ -177,9 +187,42 @@ def process_bufkit(filepath, model_name, mode='cig'):
                     s = np.sqrt(max(0, spds[l]**2 + spds[u]**2 - 2*spds[l]*spds[u]*np.cos(dr_u-dr_l)))
                     if s > max_s: max_s, t_h, t_d, t_s = s, heights[u], dirs[u], spds[u]
             if max_s >= 20: 
-                results.append(f"{int(round(max_s))}|WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
+                results.append(f"{int(round(max_s))}kt | WS{int(round(t_h/100.0)):03d}/{int(round(t_d/10.0)*10):03d}{int(round(t_s/5.0)*5):02d}KT")
             else: results.append("--")
+
+        elif mode in ['mom_mean', 'mom_max']:
+            pbl_winds = []
+            surface_theta_v = None
             
+            for j in range(0, len(data_lines)-1, 2):
+                l1, l2 = data_lines[j], data_lines[j+1]
+                if len(l1) < 7 or len(l2) < 4: continue
+                try:
+                    pres = float(l1[0]) * units.mbar
+                    tmpc = float(l1[1]) * units.degC
+                    dwpc = float(l1[3]) * units.degC
+                    wspd = float(l1[6])
+                    
+                    theta = mpcalc.potential_temperature(pres, tmpc)
+                    mixing_ratio = mpcalc.mixing_ratio_from_dewpoint(pres, dwpc)
+                    theta_v = mpcalc.virtual_potential_temperature(pres, tmpc, mixing_ratio).magnitude
+                    
+                    if surface_theta_v is None:
+                        surface_theta_v = theta_v
+                    
+                    if (theta_v - surface_theta_v) > 1.5:
+                        break
+                        
+                    pbl_winds.append(wspd)
+                except: continue
+                
+            if not pbl_winds: 
+                results.append("--")
+            elif mode == 'mom_max':
+                results.append(f"{int(round(max(pbl_winds)))}kt")
+            else:
+                results.append(f"{int(round(np.mean(pbl_winds)))}kt")
+                
     return pd.Series(results, index=times, name=s_name)
 
 # --- 3. MAIN EXECUTION ---
@@ -220,12 +263,10 @@ def main():
         tag_3char = s[1:].upper() if s.upper().startswith('K') else s.upper()
         if s.upper() == 'KXMR': tag_3char = 'XMR'
         
-        # 1. Download RRFS cleanly from stable text APIs
         for station_tag in [tag_4char, tag_3char]:
             rrfs_url = f"https://mesonet.agron.iastate.edu/api/1/bufkit.txt?model=rrfs&station={station_tag}"
             if download_file(rrfs_url, os.path.join(DATA_DIR, f"rrfs_{s.lower()}.buf")): break
 
-        # 2. Download legacy Bufkit profiles using character matrix fallback arrays
         for m in ['gfs', 'rap', 'hrrr']:
             urls_to_try = []
             if m == 'gfs':
@@ -241,9 +282,12 @@ def main():
                 if download_file(url, os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf")): break
 
     print("\n=== STAGE 4: Aggregating Weather Matrices ===")
-    v_dict, c_dict, l_dict = {s: {} for s in TAF_SITES}, {s: {} for s in TAF_SITES}, {s: {} for s in TAF_SITES}
+    v_dict = {s: {} for s in TAF_SITES}
+    c_dict = {s: {} for s in TAF_SITES}
+    l_dict = {s: {} for s in TAF_SITES}
+    m_mean_dict = {s: {} for s in TAF_SITES}
+    m_max_dict = {s: {} for s in TAF_SITES}
     
-    # Fast, isolated loop-based grid extraction avoids silent open_mfdataset dim drops
     for m in MODELS_VIS:
         if m == 'RRFS': continue
         files = sorted(glob.glob(os.path.join(DATA_DIR, f"{m.lower()}.f*.grib2")))
@@ -271,18 +315,24 @@ def main():
             for s in TAF_SITES:
                 v_dict[s][m] = pd.Series(model_series_data[s], index=model_times)
 
-    # Process sounding files text matrices
     for s in TAF_SITES:
         for m in MODELS_BUFKIT:
             path = os.path.join(DATA_DIR, f"{m}_{s.lower()}.buf")
             if not os.path.exists(path): continue
             
             s_name = m.upper()
+            
             cig_data = process_bufkit(path, m, 'cig')
             if not cig_data.empty: c_dict[s][s_name] = cig_data
             
             shear_data = process_bufkit(path, m, 'llws')
             if not shear_data.empty: l_dict[s][s_name] = shear_data
+            
+            mm_data = process_bufkit(path, m, 'mom_mean')
+            if not mm_data.empty: m_mean_dict[s][s_name] = mm_data
+            
+            mx_data = process_bufkit(path, m, 'mom_max')
+            if not mx_data.empty: m_max_dict[s][s_name] = mx_data
             
             if m == 'rrfs':
                 vis_data = process_bufkit(path, m, 'vis')
@@ -291,6 +341,8 @@ def main():
     v_dfs = {s: pd.DataFrame(v_dict[s]) for s in TAF_SITES}
     c_dfs = {s: pd.DataFrame(c_dict[s]) for s in TAF_SITES}
     l_dfs = {s: pd.DataFrame(l_dict[s]) for s in TAF_SITES}
+    mm_dfs = {s: pd.DataFrame(m_mean_dict[s]) for s in TAF_SITES}
+    mx_dfs = {s: pd.DataFrame(m_max_dict[s]) for s in TAF_SITES}
 
     run_start_utc = now.replace(minute=0, second=0, microsecond=0, tzinfo=None)
     html_tbls = {}
@@ -301,14 +353,26 @@ def main():
         d = d[~d.index.duplicated()].sort_index(); d = d[d.index >= table_start_time].head(48)
         
         d.columns = [f"{c} [{model_init_strings.get(c.lower(), '??')}]" for c in d.columns]
-        expected_order = [f"{c} [{model_init_strings.get(c.lower(), '??')}]" for c in MODELS_VIS]
+        
+        expected_order = [f"{c} [{model_init_strings.get(c.lower(), '??')}]" for c in ['RRFS', 'GFS', 'RAP', 'HRRR']]
         existing_ordered_cols = [c for c in expected_order if c in d.columns]
+        if not existing_ordered_cols:
+            existing_ordered_cols = d.columns
         d = d[existing_ordered_cols]
         
         if d.empty: return "<p>Data currently unavailable.</p>"
         
         d.index = d.index.strftime('%d/%H'); d.index.name = "Time (UTC)"
-        st = d.style.map(colorize_flight_rules) if pt=='vis' else d.style.map(style_ceiling_table) if pt=='cig' else d.style.format(lambda v: f"{str(v).split('|')[0]}kt | {str(v).split('|')[-1]}" if '|' in str(v) else v).map(style_llws_table)
+        
+        if pt == 'vis':
+            st = d.style.map(colorize_flight_rules)
+        elif pt == 'cig':
+            st = d.style.map(style_ceiling_table)
+        elif pt in ['mom_mean', 'mom_max']:
+            st = d.style.map(style_momentum_table)
+        else:
+            st = d.style.map(style_llws_table)
+            
         return st.to_html(escape=False)
 
     for s in TAF_SITES:
@@ -316,6 +380,8 @@ def main():
         html_tbls[f"vis_{ss}"] = to_st_html(v_dfs[s], 'vis', run_start_utc)
         html_tbls[f"cig_{ss}"] = to_st_html(c_dfs[s], 'cig', run_start_utc)
         html_tbls[f"llws_{ss}"] = to_st_html(l_dfs[s], 'llws', run_start_utc)
+        html_tbls[f"mm_{ss}"] = to_st_html(mm_dfs[s], 'mom_mean', run_start_utc)
+        html_tbls[f"mx_{ss}"] = to_st_html(mx_dfs[s], 'mom_max', run_start_utc)
 
     if os.path.exists(HISTORY_FILE):
         try:
@@ -388,7 +454,13 @@ def main():
     <button style="position: absolute; top: 10px; right: 10px;" onclick="toggleTheme()">Theme</button>
     <div class="main-container"><div style="text-align: center;">
     <h3 id="ts" style="margin-bottom: 10px;">Run Time: {last_updated_str}</h3>
-    <p style="margin-bottom: 15px;">Ceilings: {gen_links('cig')} &nbsp;&nbsp;&nbsp; Vis: {gen_links('vis')} &nbsp;&nbsp;&nbsp; Shear: {gen_links('llws')}</p>
+    <p style="margin-bottom: 15px;">
+        Ceilings: {gen_links('cig')} &nbsp;&nbsp;&nbsp; 
+        Vis: {gen_links('vis')} &nbsp;&nbsp;&nbsp; 
+        Shear: {gen_links('llws')} &nbsp;&nbsp;&nbsp;
+        Mom Mean: {gen_links('mm')} &nbsp;&nbsp;&nbsp;
+        Mom Max: {gen_links('mx')}
+    </p>
     <div style="display: flex; gap: 15px; align-items: flex-start;">
         <div class="vertical-run-controls">
             <b>Model Run</b>
@@ -403,10 +475,13 @@ def main():
             <h3>Legend</h3><hr>
             <div class="legend-grid">
                 <div class="legend-col">
-                    <h4>Flight Cat</h4>
+                    <h4>Flight Cat / Winds</h4>
                     <div class="legend-item" style="background-color: #458B00; color: white;">MVFR</div>
                     <div class="legend-item" style="background-color: #CD3333; color: white;">IFR</div>
                     <div class="legend-item" style="background-color: #EE82EE; color: black;">LIFR</div>
+                    <div class="legend-item" style="background-color: #E0EEEE; color: black;">Elevated (15kt+)</div>
+                    <div class="legend-item" style="background-color: #FF8C00; color: white;">High (25kt+)</div>
+                    <div class="legend-item" style="background-color: #FF3030; color: white;">Severe (35kt+)</div>
                 </div>
                 <div class="legend-divider"></div>
                 <div class="legend-col">
@@ -422,6 +497,12 @@ def main():
                 <ul>
                     <li>Cloud ceiling is derived as lowest model layer where RH is greater than or equal to 95%.</li>
                     <li>Visibility is derived using the model visibility variable, using the grid point value closest to each TAF site.</li>
+                    <li><strong>Momentum Transfer (PBL Winds):</strong> Indicates potential surface wind gusts mixed downward through the Planetary Boundary Layer.
+                        <ul>
+                            <li><strong>Mom Mean:</strong> Average wind speed across the mixing layer.</li>
+                            <li><strong>Mom Max:</strong> Peak wind speed found at the apex/top boundary of the mixed layer.</li>
+                        </ul>
+                    </li>
                     <li>Wind Shear thresholds are defined as follows:
                         <ul>
                             <li><strong>Marginal:</strong> Shear magnitude &ge; 20 kt</li>
@@ -430,7 +511,7 @@ def main():
                         </ul>
                     </li>
                 </ul>
-                <p style="font-style: italic; font-size: 10px; text-align: center; margin-top: 10px;">* Note: VFR (> 3000 ft and > 5 miles) is uncolored (white).</p>
+                <p style="font-style: italic; font-size: 10px; text-align: center; margin-top: 10px;">* Note: Normal operational criteria are uncolored (white).</p>
             </div>
         </div>
     </div></div></div></body></html>
