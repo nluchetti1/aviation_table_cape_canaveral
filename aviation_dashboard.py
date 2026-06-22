@@ -31,7 +31,7 @@ def pressure_to_height_ft(pres_hpa):
     return 145366.45 * (1.0 - (pres_hpa / 1013.25) ** 0.190284)
 
 def parse_time_series_bufkit(bufkit_text):
-    """Parses vertical profile sounding chunks out of raw Bufkit text."""
+    """Parses vertical profile sounding chunks and calculates metrics."""
     hourly_data = {}
     blocks = bufkit_text.split("STID = ")
     
@@ -106,7 +106,7 @@ def parse_time_series_bufkit(bufkit_text):
                     return (h1 + fraction * (h2 - h1)) / 1000.0
             return profile_layers[-1]["hght"] / 1000.0
 
-        # Calculate metrics
+        # Calculate Cloud Layers
         cloud_layers = []
         active_cloud = None
         for layer in profile_layers:
@@ -124,15 +124,20 @@ def parse_time_series_bufkit(bufkit_text):
         pbl_winds = [l["sknt"] for l in profile_layers if l["pres"] >= 850.0]
         mean_wind = sum(pbl_winds) / len(pbl_winds) if pbl_winds else 0.0
         
+        # Visibility Calculation
         sfc_depr = profile_layers[0]["depr"] if profile_layers else 10.0
         vis = 0.25 if sfc_depr <= 0.5 else (1.0 if sfc_depr <= 1.0 else (3.0 if sfc_depr <= 2.0 else 10.0))
+
+        # Ceiling Calculation - Ignore layers < 100ft (treated as fog/obscuration)
+        valid_ceilings = [c for c in cloud_layers if c["base"] >= 100.0]
+        ceiling_val = round(valid_ceilings[0]["base"]) if valid_ceilings else 24000.0
 
         hourly_data[valid_hour_key] = {
             "mom_mean": round(mean_wind, 1),
             "mom_max": round(max(pbl_winds) if pbl_winds else 0.0, 1),
             "shear": "WS020/25022KT" if (max(pbl_winds) if pbl_winds else 0) > 35 else None,
             "vis": vis,
-            "ceiling": round(max(0.0, cloud_layers[0]["base"]) if cloud_layers else 24000.0),
+            "ceiling": ceiling_val,
             "hght_0c": round(get_height_of_isotherm(0.0), 1),
             "hght_5c": round(get_height_of_isotherm(-5.0), 1),
             "hght_10c": round(get_height_of_isotherm(-10.0), 1),
@@ -201,7 +206,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
         .control-bar { display: flex; align-items: center; justify-content: space-between; background: #e2e8f0; padding: 10px; border-radius: 4px; margin-bottom: 12px; gap: 15px; }
         .nav-links { line-height: 1.8; }
         .nav-links span { font-weight: bold; margin-right: 5px; color: #334155; }
-        .nav-links a { margin: 0 3px; text-decoration: none; color: #2563eb; padding: 2px 5px; border-radius: 3px; transition: all 0.1s ease; }
+        .nav-links a { margin: 0 3px; text-decoration: none; color: #2563eb; padding: 2px 5px; border-radius: 3px; transition: all 0.1s ease; cursor: pointer; }
         .nav-links a.active { color: #ffffff; background: #2563eb; font-weight: bold; }
         .station-selector { display: flex; align-items: center; gap: 6px; font-size: 0.9rem; font-weight: bold; background: white; padding: 4px 8px; border-radius: 4px; border: 1px solid #cbd5e1; }
         .station-selector select { font-size: 0.85rem; font-weight: bold; color: #1e3a8a; padding: 2px 4px; cursor: pointer; border: 1px solid #cbd5e1; border-radius: 3px; }
@@ -213,9 +218,9 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
         th { background: #2563eb; color: white; padding: 8px; border: 1px solid #cbd5e1; font-size: 0.8rem; text-align: center; position: sticky; top: 0; z-index: 10; }
         td { border: 1px solid #cbd5e1; padding: 6px; text-align: center; font-family: monospace; font-size: 0.85rem; white-space: nowrap; position: relative; }
         .time-col { background: #3b82f6; color: white; font-weight: bold; width: 95px; position: sticky; left: 0; }
-        .side-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; width: 360px; }
+        .side-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; width: 360px; display: block; min-height: 200px; }
         .legend-title { font-weight: bold; border-bottom: 1px solid #cbd5e1; padding-bottom: 5px; margin-bottom: 10px; text-align: center; font-size: 0.95rem; color: #1e293b; }
-        .legend-item { display: flex; justify-content: space-between; margin-bottom: 4px; padding: 5px; border-radius: 3px; font-size: 0.8rem; }
+        .legend-item { display: flex; justify-content: space-between; margin-bottom: 4px; padding: 5px; border-radius: 3px; font-size: 0.8rem; border: 1px solid #e2e8f0; }
         #hover-popup-card { position: absolute; z-index: 500; background: #ffffff; color: #1e293b; border: 2px solid #3b82f6; border-radius: 6px; padding: 12px; width: 260px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none; pointer-events: none; font-size: 0.8rem; line-height: 1.4; }
         .popup-header { font-weight: bold; border-bottom: 1px solid #e2e8f0; margin-bottom: 6px; padding-bottom: 4px; color: #2563eb; text-transform: uppercase; }
         .status-banner { font-weight: bold; font-size: 0.9rem; color: #1e3a8a; margin-bottom: 12px; text-transform: uppercase; background: #dbeafe; padding: 6px; border-radius: 4px; text-align: center; }
@@ -225,21 +230,21 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
     <div class="control-bar">
         <div class="nav-links">
             <span>Aviation:</span>
-            <a href="#" class="active" data-metric="mom_mean">PBL Mom Mean</a>
-            <a href="#" data-metric="mom_max">PBL Mom Max</a>
-            <a href="#" data-metric="ceiling">Ceilings</a>
-            <a href="#" data-metric="vis">Visibility</a>
-            <a href="#" data-metric="shear">Wind Shear</a>
+            <a onclick="updateMetric('mom_mean')" class="active" id="nav-mom_mean">PBL Mom Mean</a>
+            <a onclick="updateMetric('mom_max')" id="nav-mom_max">PBL Mom Max</a>
+            <a onclick="updateMetric('ceiling')" id="nav-ceiling">Ceilings</a>
+            <a onclick="updateMetric('vis')" id="nav-vis">Visibility</a>
+            <a onclick="updateMetric('shear')" id="nav-shear">Wind Shear</a>
             | <span>Isotherms & Clouds (kft):</span>
-            <a href="#" data-metric="hght_0c">0°C Height</a>
-            <a href="#" data-metric="hght_10c">-10°C Height</a>
-            <a href="#" data-metric="hght_20c">-20°C Height</a>
-            <a href="#" data-metric="cloud_top">Highest Cloud Top</a>
-            <a href="#" data-metric="cloud_thick">Max Layer Thickness</a>
+            <a onclick="updateMetric('hght_0c')" id="nav-hght_0c">0°C Height</a>
+            <a onclick="updateMetric('hght_10c')" id="nav-hght_10c">-10°C Height</a>
+            <a onclick="updateMetric('hght_20c')" id="nav-hght_20c">-20°C Height</a>
+            <a onclick="updateMetric('cloud_top')" id="nav-cloud_top">Highest Cloud Top</a>
+            <a onclick="updateMetric('cloud_thick')" id="nav-cloud_thick">Max Layer Thickness</a>
         </div>
         <div class="station-selector">
             <label for="stn-dropdown">Station:</label>
-            <select id="stn-dropdown">
+            <select id="stn-dropdown" onchange="activeStn = this.value; renderMatrix();">
                 <option value="kxmr" selected>KXMR (Cape Canaveral)</option>
                 <option value="kdab">KDAB (Daytona Beach)</option>
                 <option value="kmlb">KMLB (Melbourne)</option>
@@ -277,6 +282,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
         let activeStn = "kxmr";
         let activeMetric = "mom_mean";
         let activeRunIndex = 0;
+        
         const metricLabels = {
             "ceiling": "Cloud Ceiling Heights (ft)",
             "vis": "Surface Visibility (sm)",
@@ -289,6 +295,15 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
             "cloud_top": "Highest Detected Cloud Top (kft)",
             "cloud_thick": "Maximum Cloud Layer Thickness (kft)"
         };
+
+        function updateMetric(newMetric) {
+            activeMetric = newMetric;
+            document.querySelectorAll(".nav-links a").forEach(a => a.classList.remove("active"));
+            document.getElementById("nav-" + newMetric).classList.add("active");
+            renderMatrix();
+            renderLegend();
+        }
+
         function renderLegend() {
             const panel = document.getElementById("dynamic-legend-panel");
             const isAviation = ["mom_mean", "mom_max", "ceiling", "vis", "shear"].includes(activeMetric);
@@ -314,6 +329,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                 `;
             }
         }
+        
         function renderRunSelector() {
             const container = document.getElementById("run-selector-container");
             container.innerHTML = "";
@@ -329,10 +345,10 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                 container.appendChild(label);
             });
         }
+        
         function renderMatrix() {
             const currentData = historyRuns[activeRunIndex].data;
             document.getElementById("view-title").textContent = activeStn.toUpperCase() + " -> " + metricLabels[activeMetric];
-            renderLegend();
             const tbody = document.getElementById("matrix-body");
             tbody.innerHTML = "";
             timeRows.forEach(row => {
@@ -424,17 +440,11 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
         }
         function moveHoverPopup(e) { popupCard.style.left = (e.pageX + 15) + "px"; popupCard.style.top = (e.pageY - 40) + "px"; }
         function hideHoverPopup() { popupCard.style.display = "none"; }
-        document.querySelectorAll(".nav-links a").forEach(link => {
-            link.addEventListener("mouseover", function() {
-                document.querySelectorAll(".nav-links a").forEach(a => a.classList.remove("active"));
-                activeMetric = this.getAttribute("data-metric");
-                this.classList.add("active");
-                renderMatrix();
-            });
-        });
-        document.getElementById("stn-dropdown").addEventListener("change", function() { activeStn = this.value; renderMatrix(); });
+        
+        // Initial Startup
         renderRunSelector();
         renderMatrix();
+        renderLegend();
     </script>
 </body>
 </html>
