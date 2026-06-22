@@ -25,8 +25,9 @@ def pressure_to_height_ft(pres_hpa):
 
 def parse_time_series_bufkit(bufkit_text):
     """
-    Parses profiles from a Bufkit file. Dynamically tracks header indices 
-    to prevent column mismatches between wind speed and wind direction.
+    Parses vertical profile sounding chunks out of a raw Bufkit file.
+    Dynamically identifies column index order to completely resolve 
+    wind speed (SKNT) vs wind direction (DRCT) overlapping data bugs.
     """
     hourly_data = {}
     blocks = bufkit_text.split("STID = ")
@@ -48,7 +49,7 @@ def parse_time_series_bufkit(bufkit_text):
         profile_layers = []
         in_profile = False
         
-        # Robust dynamic column mapping index defaults
+        # Hard structural fallback indices
         pres_idx, tmpc_idx, dwpt_idx, sknt_idx = 0, 1, 3, 5
         
         for line in lines:
@@ -62,11 +63,12 @@ def parse_time_series_bufkit(bufkit_text):
                     dwpt_idx = header_parts.index("DWPT")
                     sknt_idx = header_parts.index("SKNT")
                 except ValueError:
-                    pass # Fall back to structural defaults if explicit headers fail
+                    pass 
                 continue
                 
             if in_profile:
-                if "STID" in cleaned or "STNM" in cleaned or not cleaned:
+                # Terminate loop cleanly when leaving the profile stack block
+                if "STID" in cleaned or "STNM" in cleaned or not cleaned or cleaned.isalpha():
                     break
                 parts = cleaned.split()
                 if len(parts) > max(pres_idx, tmpc_idx, dwpt_idx, sknt_idx):
@@ -92,10 +94,10 @@ def parse_time_series_bufkit(bufkit_text):
         if not profile_layers:
             continue
             
-        # Sort layers from surface upward
+        # Organize profile surface upward (Highest pressure down to lowest pressure)
         profile_layers = sorted(profile_layers, key=lambda x: x["pres"], reverse=True)
         
-        # 1. Compute exact isotherm heights using linear interpolation (converted to kft)
+        # Calculate dynamic isotherm heights via linear interpolation (converted to kft)
         def get_height_of_isotherm(target_temp):
             for i in range(len(profile_layers) - 1):
                 t1, t2 = profile_layers[i]["tmpc"], profile_layers[i+1]["tmpc"]
@@ -112,7 +114,7 @@ def parse_time_series_bufkit(bufkit_text):
         hght_10c = get_height_of_isotherm(-10.0)
         hght_20c = get_height_of_isotherm(-20.0)
         
-        # 2. Identify contiguous cloud layers (Dewpoint Depression <= 2.0°C)
+        # Isolate cloud layers using strict Dewpoint Depression <= 2.0C (RH >= 95% proxy)
         cloud_layers = []
         active_cloud = None
         
@@ -130,44 +132,39 @@ def parse_time_series_bufkit(bufkit_text):
         if active_cloud is not None:
             cloud_layers.append(active_cloud)
             
-        # 3. Calculate metrics for cloud properties (Clamp standard atmosphere surface pressures)
         highest_cloud_top = 0.0
         max_layer_thickness = 0.0
-        lowest_ceiling = 24000.0
+        lowest_ceiling = 24000.0  # Clear air standard default
         
         if cloud_layers:
+            # Clamp negative standard atmosphere calculations to absolute zero at the surface
             lowest_ceiling = max(0.0, cloud_layers[0]["base"])
             highest_cloud_top = max(0.0, max([c["top"] for c in cloud_layers])) / 1000.0
             max_layer_thickness = max([max(0.0, c["top"] - c["base"]) for c in cloud_layers]) / 1000.0
 
-        # 4. Extract authentic Boundary Layer Kinematics (Surface to ~850hPa layer winds)
+        # Boundary Layer Kinematics (Sfc to 850hPa core layer)
         pbl_winds = [l["sknt"] for l in profile_layers if l["pres"] >= 850.0]
         if not pbl_winds:
-            pbl_winds = [12.0]
+            pbl_winds = [0.0]
             
         mean_wind = sum(pbl_winds) / len(pbl_winds)
         max_wind = max(pbl_winds)
         
-        # 5. Smart Visibility Heuristic derived from surface boundary layers
+        # Clean visibility heuristic based on true surface moisture trends
         sfc_depr = profile_layers[0]["depr"] if profile_layers else 10.0
         if sfc_depr <= 0.5:
             derived_vis = 0.25  # Dense Fog
         elif sfc_depr <= 1.0:
             derived_vis = 1.0   # Fog
         elif sfc_depr <= 2.0:
-            derived_vis = 3.0   # Mist / Haze
+            derived_vis = 3.0   # Mist
         else:
-            derived_vis = 10.0
-            
-        if mean_wind > 35.0:
-            derived_vis = min(derived_vis, 1.5)
-        elif mean_wind > 25.0:
-            derived_vis = min(derived_vis, 4.0)
-        
+            derived_vis = 10.0  # Unrestricted VFR
+
         hourly_data[valid_hour_key] = {
             "mom_mean": round(mean_wind, 1),
             "mom_max": round(max_wind, 1),
-            "shear": "WS020/25022KT" if max_wind > 28 else None,
+            "shear": "WS020/25022KT" if max_wind > 35 else None,
             "vis": round(derived_vis, 2),
             "ceiling": round(lowest_ceiling),
             "hght_0c": round(hght_0c, 1),
@@ -199,32 +196,14 @@ def query_sounding_stations():
                     parsed_series = parse_time_series_bufkit(response.text)
                     if parsed_series:
                         sounding_data[stn][model] = parsed_series
+                        print(f" Successfully loaded true profile data for {stn.upper()} [{model.upper()}]")
                         continue
-                raise Exception()
-            except:
-                # Emergency dynamic matrix fallback simulation
-                for day in [22, 23]:
-                    for hour in range(0, 24):
-                        v_key = f"{day:02d}/{hour:02d}"
-                        seed = sum(ord(c) for c in stn + model + v_key) % 17
-                        
-                        sim_0c = 14.1 + (seed * 0.1)
-                        sim_top = 0.0 if seed < 6 else (9.5 + seed * 0.9)
-                        sim_thick = 0.0 if seed < 6 else (0.8 + seed * 0.4)
-                        
-                        sounding_data[stn][model][v_key] = {
-                            "mom_mean": round(8.5 + seed * 0.8, 1),
-                            "mom_max": round(12.2 + seed * 1.4, 1),
-                            "shear": "WS020/23528KT" if seed > 13 else None,
-                            "vis": 10.0 if seed < 14 else 1.5,
-                            "ceiling": 24000 if seed < 5 else 1500,
-                            "hght_0c": round(sim_0c, 1),
-                            "hght_5c": round(sim_0c + 2.5, 1),
-                            "hght_10c": round(sim_0c + 5.1, 1),
-                            "hght_20c": round(sim_0c + 10.2, 1),
-                            "cloud_top": round(sim_top, 1),
-                            "cloud_thick": round(sim_thick, 1)
-                        }
+                print(f" Warning: Empty data or status {response.status_code} for {stn.upper()} [{model.upper()}]")
+            except Exception as e:
+                print(f" Connection Error accessing URL for {stn.upper()} [{model.upper()}]: {str(e)}")
+                
+            # Gracefully handle server downtime without injecting raw numeric bugs
+            sounding_data[stn][model] = {}
                         
     return frontend_stations, models, sounding_data
 
@@ -418,23 +397,14 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                     <div class="legend-item" style="background:#ffedd5; color:#7c2d12;"><span>Elevated</span><span>&ge; 15 kt</span></div>
                     <div class="legend-item" style="background:#f97316; color:white; font-weight:bold;"><span>High</span><span>&ge; 25 kt</span></div>
                     <div class="legend-item" style="background:#f43f5e; color:white; font-weight:bold;"><span>Severe</span><span>&ge; 35 kt</span></div>
-                    
-                    <div style="font-weight:bold; font-size:0.75rem; margin-top:12px; margin-bottom:4px; color:#475569;">Low-Level Wind Shear (LLWS)</div>
-                    <div class="legend-item" style="background:#fef08a; color:#713f12;"><span>Marginal Shear</span><span>&ge; 20 kt</span></div>
-                    <div class="legend-item" style="background:#fca5a5; color:#7f1d1d;"><span>Moderate Shear</span><span>&ge; 30 kt</span></div>
-                    <div class="legend-item" style="background:#c084fc; color:#581c87;"><span>High Shear</span><span>&ge; 40 kt</span></div>
                 `;
             } else {
                 panel.innerHTML = `
                     <div class="legend-title">Thermodynamic Risk Thresholds</div>
                     <div style="font-weight:bold; font-size:0.75rem; margin-bottom:4px; color:#475569;">Cloud Top Thermal Boundary Depth</div>
-                    <div class="legend-item" style="background:#ffedd5; color:#7c2d12;"><span>Penetrating 0°C</span><span>Mixed Phase Charging Zone</span></div>
-                    <div class="legend-item" style="background:#f97316; color:white; font-weight:bold;"><span>Penetrating -10°C</span><span>Electrification Trigger Risk</span></div>
+                    <div class="legend-item" style="background:#ffedd5; color:#7c2d12;"><span>Penetrating 0°C</span><span>Mixed Phase Zone</span></div>
+                    <div class="legend-item" style="background:#f97316; color:white; font-weight:bold;"><span>Penetrating -10°C</span><span>Electrification Risk</span></div>
                     <div class="legend-item" style="background:#f43f5e; color:white; font-weight:bold;"><span>Penetrating -20°C</span><span>High Lightning Threat</span></div>
-                    
-                    <div style="font-weight:bold; font-size:0.75rem; margin-top:12px; margin-bottom:4px; color:#475569;">Max Cloud Layer Thickness</div>
-                    <div class="legend-item" style="background:#ffedd5; color:#7c2d12;"><span>Approaching Boundary</span><span>> 3.0 kft</span></div>
-                    <div class="legend-item" style="background:#ef4444; color:white; font-weight:bold;"><span>Thick Cloud Alert</span><span>> 4.5 kft</span></div>
                 `;
             }
         }
@@ -496,7 +466,6 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                         if (value !== undefined && value !== null) {
                             cellDisplay = value;
                             
-                            // Contextual Aviation Color Rules
                             if (activeMetric === "mom_mean" || activeMetric === "mom_max") {
                                 let num = parseFloat(value);
                                 if (num >= 35) cssText = "background-color: #f43f5e; color: #fff; font-weight: bold;";
@@ -504,9 +473,13 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                                 else if (num >= 15) cssText = "background-color: #ffedd5; color: #7c2d12;";
                             } else if (activeMetric === "ceiling") {
                                 let num = parseFloat(value);
-                                if (num < 500) cssText = "background-color: #a855f7; color: white; font-weight: bold;";
-                                else if (num < 1000) cssText = "background-color: #ef4444; color: white; font-weight: bold;";
-                                else if (num <= 3000) cssText = "background-color: #22c55e; color: white; font-weight: bold;";
+                                if (num === 24000) {
+                                    cellDisplay = "CLR";
+                                } else {
+                                    if (num < 500) cssText = "background-color: #a855f7; color: white; font-weight: bold;";
+                                    else if (num < 1000) cssText = "background-color: #ef4444; color: white; font-weight: bold;";
+                                    else if (num <= 3000) cssText = "background-color: #22c55e; color: white; font-weight: bold;";
+                                }
                             } else if (activeMetric === "vis") {
                                 let num = parseFloat(value);
                                 if (num < 1.0) cssText = "background-color: #a855f7; color: white; font-weight: bold;";
@@ -516,7 +489,6 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                                 cssText = "background-color: #fca5a5; color: #7f1d1d; font-weight: bold;";
                             }
                             
-                            // Thermodynamic Color Rules
                             if (activeMetric === "cloud_top") {
                                 let val = parseFloat(value);
                                 if (val > 0) {
@@ -614,7 +586,6 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
             popupCard.style.display = "none";
         }
 
-        // Mouseover Navigation metrics toggling
         document.querySelectorAll(".nav-links a").forEach(link => {
             link.addEventListener("mouseover", function() {
                 document.querySelectorAll(".nav-links a").forEach(a => a.classList.remove("active"));
@@ -624,7 +595,6 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
             });
         });
 
-        // Dropdown location selector event listener
         document.getElementById("stn-dropdown").addEventListener("change", function() {
             activeStn = this.value;
             renderMatrix();
@@ -642,7 +612,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
 
     with open("index.html", "w") as f:
         f.write(processed_html)
-    print("Dashboard compiled successfully.")
+    print("Dashboard matrix compiled successfully.")
 
 
 if __name__ == "__main__":
