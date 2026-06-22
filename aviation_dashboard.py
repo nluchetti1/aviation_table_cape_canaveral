@@ -140,11 +140,22 @@ def query_sounding_stations():
 def generate_aviation_dashboard(stations, models, data, output_path="dashboard.html"):
     print("\n=== STAGE 5: Generating Matched Dashboard Grid HTML ===")
     
-    start_time = datetime.datetime(2026, 6, 22, 13)
-    time_rows = []
-    for i in range(34):
-        current = start_time + datetime.timedelta(hours=i)
-        time_rows.append(current.strftime("%d/%H"))
+    # Gather ALL unique valid hours across all models for kxmr to build rows dynamically
+    time_rows_set = set()
+    for model in models:
+        if "kxmr" in data and model in data["kxmr"]:
+            time_rows_set.update(data["kxmr"][model].keys())
+            
+    # Sort the hours chronologically (e.g., "22/06", "22/07"...)
+    time_rows = sorted(list(time_rows_set))
+    
+    # Safetynet fallback loop if key parsing returns entirely blank frames
+    if not time_rows:
+        start_time = datetime.datetime(2026, 6, 22, 13)
+        time_rows = [(start_time + datetime.timedelta(hours=i)).strftime("%d/%H") for i in range(34)]
+        
+    print(f"-> Found {len(time_rows)} unique forecast hours in dataset. Building matrix rows...")
+    print(f"-> Sample hours: {time_rows[:5]}")
         
     def get_mom_color(val):
         if val >= 35: return "background-color: #f43f5e; color: #fff; font-weight: bold;"
@@ -152,7 +163,6 @@ def generate_aviation_dashboard(stations, models, data, output_path="dashboard.h
         if val >= 15: return "background-color: #ffedd5; color: #7c2d12;"
         return ""
 
-    # Split links generation away from large raw blocks to eliminate literal quote risks
     ceil_links = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
     vis_links = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
     shear_links = " ".join([f'<a href="#">{s.upper()}</a>' for s in stations])
@@ -199,9 +209,9 @@ def generate_aviation_dashboard(stations, models, data, output_path="dashboard.h
             <thead>
                 <tr>
                     <th>Time (UTC)</th>
-                    <th>GFS [06/22 06Z]</th>
-                    <th>RAP [06/22 11Z]</th>
-                    <th>HRRR [06/22 11Z]</th>
+                    <th>GFS</th>
+                    <th>RAP</th>
+                    <th>HRRR</th>
                 </tr>
             </thead>
             <tbody>
