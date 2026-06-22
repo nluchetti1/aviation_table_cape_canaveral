@@ -203,7 +203,6 @@ def process_bufkit(filepath, model_name, mode='cig'):
                     dwpc = float(l1[3])  # C
                     wspd = float(l1[6])  # knots
                     
-                    # Robust thermodynamic calculation bypassing MetPy dependency issues
                     tk = tmpc + 273.15
                     e_vap = 6.112 * np.exp((17.67 * dwpc) / (dwpc + 243.5))
                     w_mix = 0.622 * e_vap / (pres - e_vap)
@@ -211,11 +210,9 @@ def process_bufkit(filepath, model_name, mode='cig'):
                     theta_v = tvk * ((1000.0 / pres) ** 0.286)
                     
                     pbl_winds.append(wspd)
-                    
                     if surface_theta_v is None:
                         surface_theta_v = theta_v
                     
-                    # Core criteria check for top of boundary layer mixed profile
                     if (theta_v - surface_theta_v) > 2.0:
                         break
                 except: continue
