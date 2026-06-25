@@ -128,7 +128,7 @@ def parse_time_series_bufkit(bufkit_text):
         sfc_depr = profile_layers[0]["depr"] if profile_layers else 10.0
         vis = 0.25 if sfc_depr <= 0.5 else (1.0 if sfc_depr <= 1.0 else (3.0 if sfc_depr <= 2.0 else 10.0))
 
-        # Ceiling Calculation - Ignore layers < 100ft (treated as fog/obscuration)
+        # Ceiling Calculation - Ignore layers < 100ft
         valid_ceilings = [c for c in cloud_layers if c["base"] >= 100.0]
         ceiling_val = round(valid_ceilings[0]["base"]) if valid_ceilings else 24000.0
 
@@ -218,9 +218,11 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
         th { background: #2563eb; color: white; padding: 8px; border: 1px solid #cbd5e1; font-size: 0.8rem; text-align: center; position: sticky; top: 0; z-index: 10; }
         td { border: 1px solid #cbd5e1; padding: 6px; text-align: center; font-family: monospace; font-size: 0.85rem; white-space: nowrap; position: relative; }
         .time-col { background: #3b82f6; color: white; font-weight: bold; width: 95px; position: sticky; left: 0; }
-        .side-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; width: 360px; display: block; min-height: 200px; }
+        .side-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; width: 360px; display: block; }
         .legend-title { font-weight: bold; border-bottom: 1px solid #cbd5e1; padding-bottom: 5px; margin-bottom: 10px; text-align: center; font-size: 0.95rem; color: #1e293b; }
         .legend-item { display: flex; justify-content: space-between; margin-bottom: 4px; padding: 5px; border-radius: 3px; font-size: 0.8rem; border: 1px solid #e2e8f0; }
+        .explanation-box { margin-top: 15px; padding-top: 10px; border-top: 1px dashed #cbd5e1; font-size: 0.78rem; line-height: 1.4; color: #475569; }
+        .explanation-box strong { color: #1e293b; }
         #hover-popup-card { position: absolute; z-index: 500; background: #ffffff; color: #1e293b; border: 2px solid #3b82f6; border-radius: 6px; padding: 12px; width: 260px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none; pointer-events: none; font-size: 0.8rem; line-height: 1.4; }
         .popup-header { font-weight: bold; border-bottom: 1px solid #e2e8f0; margin-bottom: 6px; padding-bottom: 4px; color: #2563eb; text-transform: uppercase; }
         .status-banner { font-weight: bold; font-size: 0.9rem; color: #1e3a8a; margin-bottom: 12px; text-transform: uppercase; background: #dbeafe; padding: 6px; border-radius: 4px; text-align: center; }
@@ -230,17 +232,18 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
     <div class="control-bar">
         <div class="nav-links">
             <span>Aviation:</span>
-            <a onclick="updateMetric('mom_mean')" class="active" id="nav-mom_mean">PBL Mom Mean</a>
-            <a onclick="updateMetric('mom_max')" id="nav-mom_max">PBL Mom Max</a>
-            <a onclick="updateMetric('ceiling')" id="nav-ceiling">Ceilings</a>
-            <a onclick="updateMetric('vis')" id="nav-vis">Visibility</a>
-            <a onclick="updateMetric('shear')" id="nav-shear">Wind Shear</a>
+            <a onmouseover="updateMetric('mom_mean')" class="active" id="nav-mom_mean">PBL Mom Mean</a>
+            <a onmouseover="updateMetric('mom_max')" id="nav-mom_max">PBL Mom Max</a>
+            <a onmouseover="updateMetric('ceiling')" id="nav-ceiling">Ceilings</a>
+            <a onmouseover="updateMetric('vis')" id="nav-vis">Visibility</a>
+            <a onmouseover="updateMetric('shear')" id="nav-shear">Wind Shear</a>
             | <span>Isotherms & Clouds (kft):</span>
-            <a onclick="updateMetric('hght_0c')" id="nav-hght_0c">0°C Height</a>
-            <a onclick="updateMetric('hght_10c')" id="nav-hght_10c">-10°C Height</a>
-            <a onclick="updateMetric('hght_20c')" id="nav-hght_20c">-20°C Height</a>
-            <a onclick="updateMetric('cloud_top')" id="nav-cloud_top">Highest Cloud Top</a>
-            <a onclick="updateMetric('cloud_thick')" id="nav-cloud_thick">Max Layer Thickness</a>
+            <a onmouseover="updateMetric('hght_0c')" id="nav-hght_0c">0°C Height</a>
+            <a onmouseover="updateMetric('hght_5c')" id="nav-hght_5c">-5°C Height</a>
+            <a onmouseover="updateMetric('hght_10c')" id="nav-hght_10c">-10°C Height</a>
+            <a onmouseover="updateMetric('hght_20c')" id="nav-hght_20c">-20°C Height</a>
+            <a onmouseover="updateMetric('cloud_top')" id="nav-cloud_top">Highest Cloud Top</a>
+            <a onmouseover="updateMetric('cloud_thick')" id="nav-cloud_thick">Max Layer Thickness</a>
         </div>
         <div class="station-selector">
             <label for="stn-dropdown">Station:</label>
@@ -290,6 +293,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
             "mom_mean": "PBL Momentum Transfer Average Winds (kt)",
             "mom_max": "PBL Mixed-Layer Max Wind Speed (kt)",
             "hght_0c": "0°C Isotherm Height (kft)",
+            "hght_5c": "-5°C Isotherm Height (kft)",
             "hght_10c": "-10°C Isotherm Height (kft)",
             "hght_20c": "-20°C Isotherm Height (kft)",
             "cloud_top": "Highest Detected Cloud Top (kft)",
@@ -297,6 +301,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
         };
 
         function updateMetric(newMetric) {
+            if (activeMetric === newMetric) return;
             activeMetric = newMetric;
             document.querySelectorAll(".nav-links a").forEach(a => a.classList.remove("active"));
             document.getElementById("nav-" + newMetric).classList.add("active");
@@ -314,18 +319,39 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                     <div class="legend-item" style="background:#22c55e; color:white; font-weight:bold;"><span>MVFR</span><span>3,000 - 1,000 ft / 5 - 3 sm</span></div>
                     <div class="legend-item" style="background:#ef4444; color:white; font-weight:bold;"><span>IFR</span><span>< 1,000 ft / < 3 sm</span></div>
                     <div class="legend-item" style="background:#a855f7; color:white; font-weight:bold;"><span>LIFR</span><span>< 500 ft / < 1 sm</span></div>
+                    
                     <div style="font-weight:bold; font-size:0.75rem; margin-top:12px; margin-bottom:4px; color:#475569;">PBL Momentum Transfer</div>
                     <div class="legend-item" style="background:#ffedd5; color:#7c2d12;"><span>Elevated</span><span>&ge; 15 kt</span></div>
                     <div class="legend-item" style="background:#f97316; color:white; font-weight:bold;"><span>High</span><span>&ge; 25 kt</span></div>
                     <div class="legend-item" style="background:#f43f5e; color:white; font-weight:bold;"><span>Severe</span><span>&ge; 35 kt</span></div>
+
+                    <div style="font-weight:bold; font-size:0.75rem; margin-top:12px; margin-bottom:4px; color:#475569;">Low-Level Wind Shear</div>
+                    <div class="legend-item" style="background:#fca5a5; color:#7f1d1d; font-weight:bold;"><span>LLWS Critical Flag</span><span>Winds > 35 kt below 850 hPa</span></div>
+
+                    <div class="explanation-box">
+                        <strong>Variable Reference:</strong><br>
+                        • <strong>PBL Mom Mean:</strong> Average wind speed computed across all calculated layers within the Planetary Boundary Layer (surface down to 850 hPa).<br>
+                        • <strong>PBL Mom Max:</strong> Maximum wind speed vector evaluated within the mixed boundary layer boundary.<br>
+                        • <strong>Ceilings:</strong> Lowest layer with cloud fraction coverage meeting overcast criteria (ignoring surface fog structures < 100 ft).<br>
+                        • <strong>Visibility:</strong> Parameterized surface meteorological visibility downscaled via raw surface dewpoint depression thresholds.<br>
+                        • <strong>Wind Shear:</strong> Automated alphanumeric flag detailing high-altitude wind vector discrepancies.
+                    </div>
                 `;
             } else {
                 panel.innerHTML = `
                     <div class="legend-title">Thermodynamic Risk Thresholds</div>
                     <div style="font-weight:bold; font-size:0.75rem; margin-bottom:4px; color:#475569;">Cloud Top Thermal Boundary Depth</div>
                     <div class="legend-item" style="background:#ffedd5; color:#7c2d12;"><span>Penetrating 0°C</span><span>Mixed Phase Zone</span></div>
+                    <div class="legend-item" style="background:#fed7aa; color:#c2410c; font-weight:bold;"><span>Penetrating -5°C</span><span>Glaciating Phase</span></div>
                     <div class="legend-item" style="background:#f97316; color:white; font-weight:bold;"><span>Penetrating -10°C</span><span>Electrification Risk</span></div>
                     <div class="legend-item" style="background:#f43f5e; color:white; font-weight:bold;"><span>Penetrating -20°C</span><span>High Lightning Threat</span></div>
+
+                    <div class="explanation-box">
+                        <strong>Variable Reference:</strong><br>
+                        • <strong>Isotherm Heights:</strong> Interpolated geopotential height (kft) tracking where ambient profiles cross critical microphysical charging thresholds (0°C to -20°C).<br>
+                        • <strong>Highest Cloud Top:</strong> Cloud layer top ceiling tracking the relative maximum vertical progression of saturated model layers.<br>
+                        • <strong>Max Layer Thickness:</strong> Verifies deep convective layer structural stability by measuring integrated cloud depth profiles.
+                    </div>
                 `;
             }
         }
@@ -351,6 +377,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
             document.getElementById("view-title").textContent = activeStn.toUpperCase() + " -> " + metricLabels[activeMetric];
             const tbody = document.getElementById("matrix-body");
             tbody.innerHTML = "";
+            
             timeRows.forEach(row => {
                 const tr = document.createElement("tr");
                 const timeTd = document.createElement("td");
@@ -392,6 +419,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                                 if (val > 0) {
                                     if (val >= block.hght_20c) cssText = "background-color: #f43f5e; color: white; font-weight: bold;";
                                     else if (val >= block.hght_10c) cssText = "background-color: #f97316; color: white; font-weight: bold;";
+                                    else if (val >= block.hght_5c) cssText = "background-color: #fed7aa; color: #c2410c; font-weight: bold;";
                                     else if (val >= block.hght_0c) cssText = "background-color: #ffedd5; color: #7c2d12;";
                                 }
                             } else if (activeMetric === "cloud_thick") {
@@ -404,12 +432,18 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix):
                     }
                     td.textContent = cellDisplay;
                     if (cssText) td.style.cssText = cssText;
-                    if (popupPayload) { td.setAttribute("data-profile", JSON.stringify(popupPayload)); td.addEventListener("mouseover", showHoverPopup); td.addEventListener("mousemove", moveHoverPopup); td.addEventListener("mouseout", hideHoverPopup); }
+                    if (popupPayload) { 
+                        td.setAttribute("data-profile", JSON.stringify(popupPayload)); 
+                        td.onmouseover = showHoverPopup; 
+                        td.onmousemove = moveHoverPopup; 
+                        td.onmouseout = hideHoverPopup; 
+                    }
                     tr.appendChild(td);
                 });
                 tbody.appendChild(tr);
             });
         }
+        
         const popupCard = document.getElementById("hover-popup-card");
         function showHoverPopup(e) {
             const dataStr = this.getAttribute("data-profile");
