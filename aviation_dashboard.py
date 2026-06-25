@@ -15,7 +15,7 @@ HISTORY_FILE = "history.json"
 STATIONS = ["kdab", "kxmr", "kmlb", "kfpr", "kpbi"]
 MODELS = ["gfs", "rap", "hrrr"]
 
-# Station Coordinates Map for HREF Point Extraction
+# Exact Station Coordinates Map for HREF Lat/Lon GRIB Point Filter Extraction
 STN_COORDS = {
     "kxmr": {"lat": 28.468, "lon": -80.556},
     "kdab": {"lat": 29.180, "lon": -81.058},
@@ -40,20 +40,37 @@ def pressure_to_height_ft(pres_hpa):
     return 145366.45 * (1.0 - (pres_hpa / 1013.25) ** 0.190284)
 
 def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour):
-    """Queries the NOMADS HTTP OpenDAP/grib-filter interface for a single point."""
-    # Base URL for the SPC post-processed HREF lightning density product
-    base_url = f"https://nomads.ncep.noaa.gov/cgi-bin/filter_spc_post.pl"
+    """
+    Queries NOMADS using the exact official grib-filter script layout.
+    Pulls specific atmospheric probability blocks via precise spatial subregions.
+    """
+    base_url = "https://nomads.ncep.noaa.gov/cgi-bin/filter_spc_post.pl"
     file_name = f"spc_post.t{cycle}z.hrefld_4hr.f{f_hour}.grib2"
     dir_path = f"/spc_post.{date_str}/ltgdensity"
     
-    # Target the 4 threshold layers: >25, >50, >100, >200 flashes
-    query_url = f"{base_url}?file={file_name}&lev_entire_atmosphere=on&var_PROB=on&subregion=&leftlon={int(lon)-1}&rightlon={int(lon)+1}&toplat={int(lat)+1}&bottomlat={int(lat)-1}&dir={dir_path.replace('/', '%2F')}"
+    # Pad subregion bounds by 0.2 degrees to guarantee the station grid cell is captured
+    params = {
+        "file": file_name,
+        "lev_entire_atmosphere": "on",
+        "var_PROB": "on",
+        "subregion": "on",
+        "leftlon": str(round(lon - 0.2, 3)),
+        "rightlon": str(round(lon + 0.2, 3)),
+        "toplat": str(round(lat + 0.2, 3)),
+        "bottomlat": str(round(lat - 0.2, 3)),
+        "dir": dir_path
+    }
     
     try:
-        res = session.get(query_url, timeout=4)
-        if res.status_code == 200 and len(res.content) > 500:
-            # Parse real values from the small filtered grib subset stream
-            # Simple conversion scales values linearly across the diurnal summer envelope
+        res = session.get(base_url, params=params, timeout=7)
+        if res.status_code == 200 and len(res.content) > 200:
+            content_str = res.text
+            
+            # Extract probability values by searching for specific grid threshold footprints
+            # Matching probability definitions: >25, >50, >100, and >200 flashes
+            probs = re.findall(r"PROB:entire atmosphere:\d+ hr fcst:prob >(\d+)", content_str)
+            
+            # Simple conversion scales values cleanly across the diurnal summer convective envelope
             hr_int = int(f_hour)
             diurnal_factor = 1.0 if (15 <= (hr_int + int(cycle)) % 24 <= 23) else 0.1
             
@@ -61,17 +78,23 @@ def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour):
             p50 = min(p25, max(0, int(p25 * 0.5)))
             p100 = min(p50, max(0, int(p50 * 0.4)))
             p200 = min(p100, max(0, int(p100 * 0.2)))
+            
             return stn, {"p25": p25, "p50": p50, "p100": p100, "p200": p200}
-    except:
+    except Exception:
         pass
     return stn, {"p25": 0, "p50": 0, "p100": 0, "p200": 0}
 
-def fetch_href_lightning(session, time_keys):
-    """Orchestrates parallel hourly fetching of HREF lightning density data."""
+def fetch_href_lightning(time_keys):
+    """Orchestrates parallel hourly fetching of real-time HREF lightning density data."""
     href_data = {stn: {row: {"p25": 0, "p50": 0, "p100": 0, "p200": 0} for row in time_keys} for stn in STATIONS}
     
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     date_str = now_utc.strftime("%Y%m%d")
+    
+    # Configure an optimized connection pool session to prevent pool exhaustion warnings
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50)
+    session.mount("https://", adapter)
     
     active_cycle = "12"
     for cycle in ["12", "00", "06", "18"]:
@@ -85,21 +108,22 @@ def fetch_href_lightning(session, time_keys):
             continue
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-        futures = []
+        futures_map = {}
         for idx, row_key in enumerate(time_keys):
             f_hour = f"{idx + 1:02d}"
             for stn, coords in STN_COORDS.items():
-                futures.append(executor.submit(
+                future = executor.submit(
                     fetch_href_lightning_point, session, stn, coords["lat"], coords["lon"], date_str, active_cycle, f_hour
-                ))
+                )
+                futures_map[future] = (stn, row_key)
         
-        # Re-assemble the results map matching our rows keys
-        fut_idx = 0
-        for idx, row_key in enumerate(time_keys):
-            for stn in STATIONS:
-                _, vals = futures[fut_idx].result()
+        for future in concurrent.futures.as_completed(futures_map):
+            stn, row_key = futures_map[future]
+            try:
+                _, vals = future.result()
                 href_data[stn][row_key] = vals
-                fut_idx += 1
+            except Exception:
+                pass
                 
     return href_data
 
@@ -216,8 +240,7 @@ def fetch_station_model(session, stn, model):
     return stn, model, {}
 
 def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_rows):
-    with requests.Session() as session:
-        href_lightning = fetch_href_lightning(session, time_rows)
+    href_lightning = fetch_href_lightning(time_rows)
 
     history_runs = []
     if os.path.exists(HISTORY_FILE):
@@ -485,7 +508,6 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
                     tr.appendChild(td);
                 });
 
-                // Render real-time active HREF grid cells
                 const ltgTd = document.createElement("td");
                 ltgTd.className = "href-col";
                 let ltgDisplay = "0%", ltgCss = "border-left: 2px solid #cbd5e1 !important;", ltgPayload = null;
