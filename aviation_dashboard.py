@@ -51,8 +51,8 @@ def extract_lightning_from_file(filepath, lat, lon):
     try:
         grbs = pygrib.open(filepath)
         
-        # Pull grid coordinates from the file metadata
-        sample_grb = grbs.peek()
+        # Safe alternative to peek(): grab the first message index to pull grid arrays
+        sample_grb = grbs[1]
         lats, lons = sample_grb.latlons()
         
         # Convert lons from 0-360 standard to matching negative degrees if needed
