@@ -5,7 +5,8 @@ import re
 import requests
 import concurrent.futures
 import logging
-import pygrib  # Native meteorological GRIB compiler
+import pygrib
+import numpy as np
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,7 +43,7 @@ def pressure_to_height_ft(pres_hpa):
 
 def extract_lightning_from_file(filepath, lat, lon):
     """
-    Opens the downloaded spc_post GRIB2 file using pygrib, finds the closest 
+    Opens the downloaded spc_post GRIB2 file using pygrib, calculates the closest 
     grid point in the 185x129 matrix, and extracts all 4 thresholds.
     """
     threshold_results = {"p25": 0, "p50": 0, "p100": 0, "p200": 0}
@@ -50,37 +51,42 @@ def extract_lightning_from_file(filepath, lat, lon):
     try:
         grbs = pygrib.open(filepath)
         
-        # Pull the first message to extract the coordinate grid arrays safely
+        # Pull grid coordinates from the file metadata
         sample_grb = grbs.peek()
         lats, lons = sample_grb.latlons()
         
+        # Convert lons from 0-360 standard to matching negative degrees if needed
+        if np.any(lons > 180):
+            lons = lons - 360.0
+            
         # Calculate the nearest neighbor pixel index in the 185x129 matrix
-        # Distance formula minimizing calculation across the array
         dist = (lats - lat)**2 + (lons - lon)**2
-        y_idx, x_idx = numpy.unravel_index(dist.argmin(), dist.shape) if 'numpy' in globals() else (0,0)
+        y_idx, x_idx = np.unravel_index(dist.argmin(), dist.shape)
         
-        # If numpy isn't active, fallback to a basic flattened grid search loop
-        if y_idx == 0 and x_idx == 0:
-            flat_idx = dist.argmin()
-            y_idx = flat_idx // lats.shape[1]
-            x_idx = flat_idx % lats.shape[1]
-
-        # Map messages based on probability lower bounds from metadata
+        # Rewind grbs to loop through all messages safely
+        grbs.seek(0)
         for grb in grbs:
-            # Match parameter name from your Panoply breakdown
-            if "Thunderstorm probability" in grb.name:
-                val = int(grb.values[y_idx, x_idx])
-                # Check target threshold parameter attributes
-                thresh = grb.probabilityLowerBound
-                
-                if thresh == 25: threshold_results["p25"] = val
-                elif thresh == 50: threshold_results["p50"] = val
-                elif thresh == 100: threshold_results["p100"] = val
-                elif thresh == 200: threshold_results["p200"] = val
+            var_name = grb.name
+            msg_str = str(grb)
+            
+            # Extract raw percentage value at our targeted pixel coordinate
+            pixel_value = float(grb.values[y_idx, x_idx])
+            if np.isnan(pixel_value):
+                pixel_value = 0.0
+
+            # Match criteria using key strings from your Panoply structural metadata
+            if "above_25" in msg_str or "above_25" in var_name:
+                threshold_results["p25"] = int(pixel_value)
+            elif "above_50" in msg_str or "above_50" in var_name:
+                threshold_results["p50"] = int(pixel_value)
+            elif "above_100" in msg_str or "above_100" in var_name:
+                threshold_results["p100"] = int(pixel_value)
+            elif "above_200" in msg_str or "above_200" in var_name:
+                threshold_results["p200"] = int(pixel_value)
                 
         grbs.close()
     except Exception as e:
-        logging.error(f"Pygrib array processing failed for {filepath}: {e}")
+        logging.error(f"Pygrib extraction failed for {filepath}: {e}")
         
     return threshold_results
 
@@ -94,18 +100,20 @@ def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour):
     file_name = f"spc_post.t{cycle}z.hrefld_4hr.f{f_hour_padded}.grib2"
     url = f"{base_url}/{file_name}"
     
-    local_path = os.path.join(CACHE_DIR, file_name)
+    local_path = os.path.join(CACHE_DIR, f"{stn}_{file_name}")
     
     try:
-        # Stream download directly to file to prevent memory fragmentation
         with session.get(url, timeout=7, stream=True) as r:
             if r.status_code == 200:
                 with open(local_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
                 
-                # Extract values from downloaded file
                 vals = extract_lightning_from_file(local_path, lat, lon)
+                
+                # Cleanup downloaded file to keep workspace pristine
+                if os.path.exists(local_path):
+                    os.remove(local_path)
                 return stn, vals
     except Exception as e:
         logging.debug(f"Failed download or parse for {file_name}: {e}")
@@ -137,9 +145,10 @@ def fetch_href_lightning(time_keys):
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures_map = {}
         for idx, row_key in enumerate(time_keys):
-            # Enforce strict forecast hour limit based on HREF's core bounds (typically maxes at f036 or f048)
+            # Caps processing loop cleanly at 48 hours to avoid runaway timelines
             f_hour_int = idx + 1
-            if f_hour_int > 48: break 
+            if f_hour_int > 48: 
+                break 
             
             f_hour = str(f_hour_int)
             for stn, coords in STN_COORDS.items():
@@ -291,10 +300,10 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     history_runs = history_runs[:5]
     
     with open(HISTORY_FILE, "w") as f: json.dump(history_runs, f, indent=2)
-    logging.info("Dashboard parameters stored safely.")
+    logging.info("Dashboard matrix completely compiled and written to history.json.")
 
 def run_pipeline():
-    logging.info("Starting updated matrix compilation run...")
+    logging.info("Starting complete structural iteration run...")
     purge_workspace()
     sounding_matrix = {stn: {mdl: {} for mdl in MODELS} for stn in STATIONS}
     
