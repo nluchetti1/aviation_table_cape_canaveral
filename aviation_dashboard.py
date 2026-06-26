@@ -2,11 +2,10 @@ import datetime
 import json
 import os
 import re
-import struct
-import math
 import requests
 import concurrent.futures
 import logging
+import pygrib  # Native meteorological GRIB compiler
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,7 +16,7 @@ HISTORY_FILE = "history.json"
 STATIONS = ["kdab", "kxmr", "kmlb", "kfpr", "kpbi"]
 MODELS = ["gfs", "rap", "hrrr"]
 
-# Grid coordinates for targets
+# Fixed coordinates for target locations
 STN_COORDS = {
     "kxmr": {"lat": 28.468, "lon": -80.556},
     "kdab": {"lat": 29.180, "lon": -81.058},
@@ -41,75 +40,75 @@ def pressure_to_height_ft(pres_hpa):
     """Converts barometric pressure to standard atmosphere height in feet."""
     return 145366.45 * (1.0 - (pres_hpa / 1013.25) ** 0.190284)
 
-def parse_full_grib2_grid(binary_data, target_lat, target_lon):
+def extract_lightning_from_file(filepath, lat, lon):
     """
-    Parses the small 21KB spc_post lightning density GRIB2 files.
-    Identifies the 4 distinct threshold layers by splitting the stacked 
-    GRIB messages and extracts the scaled grid point values.
+    Opens the downloaded spc_post GRIB2 file using pygrib, finds the closest 
+    grid point in the 185x129 matrix, and extracts all 4 thresholds.
     """
-    # Find the positions of the 4 stacked GRIB messages in the file
-    msg_offsets = []
-    offset = 0
-    while True:
-        idx = binary_data.find(b"GRIB", offset)
-        if idx == -1: break
-        msg_offsets.append(idx)
-        offset = idx + 4
-    
     threshold_results = {"p25": 0, "p50": 0, "p100": 0, "p200": 0}
-    keys = ["p25", "p50", "p100", "p200"]
     
-    # Grid translation for the FL East Coast inside the subset footprint
-    lat_idx = int((31.0 - target_lat) * 12)  
-    lon_idx = int((target_lon - (-85.0)) * 12)
-    grid_index = max(0, lat_idx * 60 + lon_idx)
+    try:
+        grbs = pygrib.open(filepath)
+        
+        # Pull the first message to extract the coordinate grid arrays safely
+        sample_grb = grbs.peek()
+        lats, lons = sample_grb.latlons()
+        
+        # Calculate the nearest neighbor pixel index in the 185x129 matrix
+        # Distance formula minimizing calculation across the array
+        dist = (lats - lat)**2 + (lons - lon)**2
+        y_idx, x_idx = numpy.unravel_index(dist.argmin(), dist.shape) if 'numpy' in globals() else (0,0)
+        
+        # If numpy isn't active, fallback to a basic flattened grid search loop
+        if y_idx == 0 and x_idx == 0:
+            flat_idx = dist.argmin()
+            y_idx = flat_idx // lats.shape[1]
+            x_idx = flat_idx % lats.shape[1]
 
-    for i, key in enumerate(keys):
-        if i < len(msg_offsets):
-            start = msg_offsets[i]
-            end = msg_offsets[i+1] if i+1 < len(msg_offsets) else len(binary_data)
-            msg = binary_data[start:end]
-            
-            # Locate Section 7 (Data Section)
-            s7_idx = msg.find(b"\x00\x00\x00\x07\x07")
-            if s7_idx != -1:
-                # Extract data payload past section headers
-                data_payload = msg[s7_idx+5:]
+        # Map messages based on probability lower bounds from metadata
+        for grb in grbs:
+            # Match parameter name from your Panoply breakdown
+            if "Thunderstorm probability" in grb.name:
+                val = int(grb.values[y_idx, x_idx])
+                # Check target threshold parameter attributes
+                thresh = grb.probabilityLowerBound
                 
-                # Dynamic index wrap protection
-                byte_pos = grid_index % len(data_payload)
-                raw_byte = data_payload[byte_pos]
+                if thresh == 25: threshold_results["p25"] = val
+                elif thresh == 50: threshold_results["p50"] = val
+                elif thresh == 100: threshold_results["p100"] = val
+                elif thresh == 200: threshold_results["p200"] = val
                 
-                # Scale raw bitstream representations into expected percentage bounds cleanly
-                prob_val = int((raw_byte / 255.0) * 100)
-                threshold_results[key] = max(0, min(100, prob_val))
-    
-    # Enforce physical cascading consistency (p25 >= p50 >= p100 >= p200)
-    threshold_results["p50"] = min(threshold_results["p25"], threshold_results["p50"])
-    threshold_results["p100"] = min(threshold_results["p50"], threshold_results["p100"])
-    threshold_results["p200"] = min(threshold_results["p100"], threshold_results["p200"])
-    
+        grbs.close()
+    except Exception as e:
+        logging.error(f"Pygrib array processing failed for {filepath}: {e}")
+        
     return threshold_results
 
 def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour):
     """
-    Downloads the small spc_post lightning density GRIB2 files directly
-    from the NCEP production inventory directory path.
+    Downloads the small subsetted GRIB2 file to disk and reads 
+    it via our meteorology extraction function.
     """
-    # Direct folder root matching your screenshot
     base_url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/spc_post.{date_str}/ltgdensity"
-    
-    # Build explicit 3-digit padded forecast hours (e.g., f004, f012)
     f_hour_padded = f"{int(f_hour):03d}"
     file_name = f"spc_post.t{cycle}z.hrefld_4hr.f{f_hour_padded}.grib2"
     url = f"{base_url}/{file_name}"
     
+    local_path = os.path.join(CACHE_DIR, file_name)
+    
     try:
-        res = session.get(url, timeout=6)
-        if res.status_code == 200 and len(res.content) > 10000:
-            return stn, parse_full_grib2_grid(res.content, lat, lon)
+        # Stream download directly to file to prevent memory fragmentation
+        with session.get(url, timeout=7, stream=True) as r:
+            if r.status_code == 200:
+                with open(local_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                # Extract values from downloaded file
+                vals = extract_lightning_from_file(local_path, lat, lon)
+                return stn, vals
     except Exception as e:
-        logging.debug(f"Error fetching lightning data for {stn} f{f_hour_padded}: {e}")
+        logging.debug(f"Failed download or parse for {file_name}: {e}")
         
     return stn, {"p25": 0, "p50": 0, "p100": 0, "p200": 0}
 
@@ -123,7 +122,7 @@ def fetch_href_lightning(time_keys):
     adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50)
     session.mount("https://", adapter)
     
-    # Cycle discovery fallback loop
+    # Discovery loop for identifying active run initialization cycle
     active_cycle = "00"
     for cycle in ["00", "12", "06", "18"]:
         test_url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/spc_post.{date_str}/ltgdensity/spc_post.t{cycle}z.hrefld_4hr.f004.grib2"
@@ -135,10 +134,14 @@ def fetch_href_lightning(time_keys):
         except:
             continue
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures_map = {}
         for idx, row_key in enumerate(time_keys):
-            f_hour = f"{idx + 1}"  # Extracted as base counter integer
+            # Enforce strict forecast hour limit based on HREF's core bounds (typically maxes at f036 or f048)
+            f_hour_int = idx + 1
+            if f_hour_int > 48: break 
+            
+            f_hour = str(f_hour_int)
             for stn, coords in STN_COORDS.items():
                 future = executor.submit(
                     fetch_href_lightning_point, session, stn, coords["lat"], coords["lon"], date_str, active_cycle, f_hour
@@ -288,16 +291,10 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     history_runs = history_runs[:5]
     
     with open(HISTORY_FILE, "w") as f: json.dump(history_runs, f, indent=2)
-
-    # Use the same HTML engine structure provided previously
-    with open("index.html", "r") as check_file:
-         # Internal mapping substitution logic
-         pass
-
-    logging.info("Dashboard matrix compiled successfully.")
+    logging.info("Dashboard parameters stored safely.")
 
 def run_pipeline():
-    logging.info("Starting pipeline run...")
+    logging.info("Starting updated matrix compilation run...")
     purge_workspace()
     sounding_matrix = {stn: {mdl: {} for mdl in MODELS} for stn in STATIONS}
     
