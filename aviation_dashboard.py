@@ -26,6 +26,14 @@ STN_COORDS = {
     "kpbi": {"lat": 26.683, "lon": -80.095}
 }
 
+# Known fixed message ordering within each HREFLD GRIB2 file.
+# Confirmed by CDL metadata variable ordering:
+#   msg 1 = above_25, msg 2 = above_50, msg 3 = above_100, msg 4 = above_200
+# This positional map is used as the primary strategy; key-based introspection
+# is attempted first per message and overrides the positional value if it succeeds.
+MSG_INDEX_THRESHOLDS = {1: "p25", 2: "p50", 3: "p100", 4: "p200"}
+THRESHOLD_MAP = {25: "p25", 50: "p50", 100: "p100", 200: "p200"}
+
 
 def purge_workspace(cache_dir=CACHE_DIR):
     if not os.path.exists(cache_dir):
@@ -44,14 +52,51 @@ def pressure_to_height_ft(pres_hpa):
     return 145366.45 * (1.0 - (pres_hpa / 1013.25) ** 0.190284)
 
 
+def _get_probability_upper_limit(grb):
+    """
+    Attempts to extract (probabilityType, upperLimitValue) from a pygrib message
+    using three strategies in order of reliability:
+
+      1. scaledValueOfUpperLimit / scaleFactorOfUpperLimit  — raw PDT 4.9 keys,
+         most universally available across eccodes versions.
+      2. probabilityUpperLimit convenience alias  — available in newer builds.
+      3. Returns (None, None) if both fail, signalling the caller to use the
+         positional fallback instead.
+
+    probabilityType == 1 means "above upper limit" per GRIB2 Code Table 4.9.
+    """
+    # Strategy 1: raw scaled keys (most compatible)
+    try:
+        ptype = int(grb.probabilityType)
+        scale_val = float(grb.scaledValueOfUpperLimit)
+        scale_fac = int(grb.scaleFactorOfUpperLimit)
+        upper = scale_val / (10 ** scale_fac) if scale_fac != 0 else scale_val
+        return ptype, upper
+    except Exception:
+        pass
+
+    # Strategy 2: convenience alias key
+    try:
+        ptype = int(grb.probabilityType)
+        upper = float(grb.probabilityUpperLimit)
+        return ptype, upper
+    except Exception:
+        pass
+
+    return None, None
+
+
 def extract_lightning_from_file(filepath, lat, lon):
     """
-    Opens the downloaded spc_post GRIB2 file using pygrib, calculates the closest
-    grid point in the 185x129 matrix, and extracts all 4 thresholds.
+    Opens a downloaded SPC Post HREFLD GRIB2 file, finds the nearest Lambert
+    Conformal grid point to (lat, lon), and returns all 4 lightning strike
+    probability thresholds: p25, p50, p100, p200.
 
-    FIX: Match on actual GRIB2 probability metadata (probabilityType /
-    probabilityUpperLimit) instead of unreliable string matching on grb.name
-    or str(grb), which never contained the threshold strings.
+    Matching strategy (per message):
+      - Try key-based probability metadata first (_get_probability_upper_limit).
+      - Fall back to known fixed message-index ordering if keys are unavailable.
+        The CDL metadata confirms consistent ordering across all files:
+        msg 1=above_25, msg 2=above_50, msg 3=above_100, msg 4=above_200.
     """
     threshold_results = {"p25": 0, "p50": 0, "p100": 0, "p200": 0}
 
@@ -66,51 +111,34 @@ def extract_lightning_from_file(filepath, lat, lon):
         if np.any(lons > 180):
             lons = lons - 360.0
 
-        # Nearest-neighbour index in the 185x129 Lambert grid
+        # Nearest-neighbour index in the 185x129 Lambert Conformal grid
         dist = (lats - lat) ** 2 + (lons - lon) ** 2
         y_idx, x_idx = np.unravel_index(dist.argmin(), dist.shape)
 
         grbs.seek(0)
-        for grb in grbs:
+        for msg_idx, grb in enumerate(grbs, start=1):
             pixel_value = float(grb.values[y_idx, x_idx])
             if np.isnan(pixel_value):
                 pixel_value = 0.0
-
-            # --- PRIMARY FIX ---
-            # The threshold is encoded in GRIB2 probability keys, not in the
-            # human-readable name string.  probabilityType == 1 means
-            # "above upper limit" (GRIB2 Code Table 4.9).
-            try:
-                prob_type = int(grb.probabilityType)
-                upper = float(grb.probabilityUpperLimit)
-            except AttributeError:
-                # eccodes/pygrib version doesn't expose these as attributes;
-                # fall back to reading raw key values via the eccodes API.
-                try:
-                    import eccodes
-                    handle = grb._gh  # underlying eccodes handle
-                    prob_type = eccodes.codes_get(handle, "probabilityType")
-                    upper = eccodes.codes_get(handle, "upperLimit")
-                except Exception as inner_e:
-                    logging.debug(f"Could not read probability keys: {inner_e}")
-                    continue
-
-            # Only process "above upper limit" probability messages
-            if prob_type != 1:
-                continue
-
             val = int(round(pixel_value))
 
-            if upper == 200:
-                threshold_results["p200"] = val
-            elif upper == 100:
-                threshold_results["p100"] = val
-            elif upper == 50:
-                threshold_results["p50"] = val
-            elif upper == 25:
-                threshold_results["p25"] = val
-            else:
-                logging.debug(f"Unrecognised upper limit value: {upper}")
+            # --- Primary: key-based matching ---
+            ptype, upper = _get_probability_upper_limit(grb)
+            if ptype is not None and upper is not None:
+                if ptype == 1:
+                    key = THRESHOLD_MAP.get(int(round(upper)))
+                    if key:
+                        threshold_results[key] = val
+                        logging.debug(f"Key match: msg {msg_idx} upper={upper} -> {key}={val}%")
+                    else:
+                        logging.debug(f"Unrecognised upper limit value: {upper}")
+                continue
+
+            # --- Fallback: positional ordering ---
+            key = MSG_INDEX_THRESHOLDS.get(msg_idx)
+            if key:
+                threshold_results[key] = val
+                logging.debug(f"Positional fallback: msg {msg_idx} -> {key}={val}%")
 
         grbs.close()
 
@@ -122,7 +150,9 @@ def extract_lightning_from_file(filepath, lat, lon):
 
 def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour):
     """
-    Downloads the GRIB2 file to disk and reads it via extract_lightning_from_file.
+    Downloads one HREFLD GRIB2 file for the given forecast hour and extracts
+    the lightning probability values at the nearest grid point to (lat, lon).
+    Cleans up the local file after extraction.
     """
     base_url = (
         f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/"
@@ -131,7 +161,6 @@ def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour):
     f_hour_padded = f"{int(f_hour):03d}"
     file_name = f"spc_post.t{cycle}z.hrefld_4hr.f{f_hour_padded}.grib2"
     url = f"{base_url}/{file_name}"
-
     local_path = os.path.join(CACHE_DIR, f"{stn}_{file_name}")
 
     try:
@@ -140,9 +169,7 @@ def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour):
                 with open(local_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
-
                 vals = extract_lightning_from_file(local_path, lat, lon)
-
                 if os.path.exists(local_path):
                     os.remove(local_path)
                 return stn, vals
@@ -155,6 +182,16 @@ def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour):
 
 
 def fetch_href_lightning(time_keys):
+    """
+    Fetches HREFLD lightning probability data for all stations across all
+    valid-time rows in time_keys.
+
+    Cycle discovery checks in descending order (18Z -> 12Z -> 06Z -> 00Z)
+    so the most recently initialised run is always preferred.
+
+    Forecast hours are derived from the valid-time string ("DD/HH") relative
+    to the active cycle init time, avoiding the idx+1 offset bug.
+    """
     href_data = {
         stn: {row: {"p25": 0, "p50": 0, "p100": 0, "p200": 0} for row in time_keys}
         for stn in STATIONS
@@ -167,7 +204,7 @@ def fetch_href_lightning(time_keys):
     adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50)
     session.mount("https://", adapter)
 
-    # --- FIX: check cycles in descending order so the most recent run wins ---
+    # Descending cycle order so the freshest available run is picked first
     active_cycle = "00"
     for cycle in ["18", "12", "06", "00"]:
         test_url = (
@@ -183,8 +220,7 @@ def fetch_href_lightning(time_keys):
         except Exception:
             continue
 
-    # --- FIX: compute forecast hours from valid times relative to cycle init ---
-    # This avoids the idx+1 offset that breaks when BUFKit and HREFLD cycles differ.
+    # Anchor forecast-hour calculations to the active cycle's init time
     cycle_init_utc = now_utc.replace(
         hour=int(active_cycle), minute=0, second=0, microsecond=0
     )
@@ -192,13 +228,13 @@ def fetch_href_lightning(time_keys):
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures_map = {}
         for row_key in time_keys:
-            # Derive forecast hour from the row's valid time string ("DD/HH")
+            # Derive forecast hour from valid-time string "DD/HH"
             try:
                 d_part, h_part = map(int, row_key.split("/"))
                 valid_dt = now_utc.replace(
                     day=d_part, hour=h_part, minute=0, second=0, microsecond=0
                 )
-                # Handle month-roll (e.g. row day < today's day means next month)
+                # Handle month boundary: if valid day < today's day, it's next month
                 if valid_dt < cycle_init_utc:
                     valid_dt += datetime.timedelta(days=30)
                 f_hour_int = int((valid_dt - cycle_init_utc).total_seconds() / 3600)
@@ -228,6 +264,10 @@ def fetch_href_lightning(time_keys):
 
 
 def parse_time_series_bufkit(bufkit_text):
+    """
+    Parses a BUFKit sounding text file and returns a dict keyed by
+    valid-time string "DD/HH" containing derived meteorological parameters.
+    """
     hourly_data = {}
     blocks = bufkit_text.split("STID = ")
 
