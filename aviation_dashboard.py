@@ -94,7 +94,7 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
                     threshold_results[pos_key] = val
 
             if val > 0:
-                logging.info(f"  [HIT] {stn.upper()} scored {val}% for {msg_str.split(':')[0]}")
+                logging.debug(f"  [HIT] {stn.upper()} scored {val}% for {msg_str.split(':')[0]}")
 
         grbs.close()
     except Exception as e:
@@ -144,7 +144,7 @@ def fetch_href_lightning(time_keys):
     active_cycle = None
     active_date_str = None
 
-    # CRITICAL FIX: HREF Lightning density files ONLY exist for 00Z and 12Z cycles
+    # HREF Lightning density files ONLY initialize for 00Z and 12Z cycles
     for days_back in [0, 1]:
         check_date = now_utc - datetime.timedelta(days=days_back)
         date_str = check_date.strftime("%Y%m%d")
@@ -207,21 +207,26 @@ def fetch_href_lightning(time_keys):
             except Exception:
                 pass
 
-    # Console Audit Block for GitHub Runner visibility
+    # Streamlined runner-safe Audit Log
     logging.info("=============================================")
     logging.info("         HREF LIGHTNING AUDIT LOG            ")
     logging.info("=============================================")
     total_signals = 0
     for stn in STATIONS:
         stn_hits = 0
+        max_p25 = 0
         for r_key, thresh_vals in href_data[stn].items():
             if any(v > 0 for v in thresh_vals.values()):
                 stn_hits += 1
                 total_signals += 1
-                logging.info(f"  {stn.upper()} [{r_key}] -> {thresh_vals}")
-        if stn_hits == 0:
+                max_p25 = max(max_p25, thresh_vals["p25"])
+        
+        if stn_hits > 0:
+            logging.info(f"  {stn.upper()} -> Processed {stn_hits} intervals with active lightning signals (Max p25: {max_p25}%)")
+        else:
             logging.info(f"  {stn.upper()} -> All 48 forecast intervals returned flat 0%")
-    logging.info(f"Audit Complete: Processed {total_signals} total non-zero forecast cells.")
+            
+    logging.info(f"Audit Complete: Cleanly tracked {total_signals} total non-zero cell vectors.")
     logging.info("=============================================")
 
     return href_data
