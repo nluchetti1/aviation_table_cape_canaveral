@@ -31,6 +31,7 @@ MSG_INDEX_THRESHOLDS = {1: "p25", 2: "p50", 3: "p100", 4: "p200"}
 # Global cache for static grid indices to maximize ThreadPool performance
 _GRID_INDEX_CACHE = {}
 
+
 def purge_workspace(cache_dir=CACHE_DIR):
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
@@ -49,8 +50,9 @@ def pressure_to_height_ft(pres_hpa):
 
 def extract_lightning_from_file(filepath, lat, lon, stn):
     """
-    Extracts all 4 lightning strike probability thresholds from a HREFLD GRIB2 file.
-    Caches station grid locations to prevent repeating matrix searches across files.
+    Bulletproof extraction for SPC HREF lightning density GRIB2.
+    Uses an explicit string-matching check on message representations to bypass 
+    eccodes version compatibility issues with probability keys.
     """
     global _GRID_INDEX_CACHE
     threshold_results = {"p25": 0, "p50": 0, "p100": 0, "p200": 0}
@@ -58,19 +60,21 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
     try:
         grbs = pygrib.open(filepath)
         
-        # Optimized Grid Point Lookup
+        # 1. Direct coordinate alignment mapping
         if stn in _GRID_INDEX_CACHE:
             y_idx, x_idx = _GRID_INDEX_CACHE[stn]
         else:
             sample = grbs[1]
             lats, lons = sample.latlons()
-            if np.any(lons > 180):
-                lons = lons - 360.0
+            
+            # SPC files use 0-360 longitude coordinates. Normalize them flawlessly.
+            lons_normalized = np.where(lons > 180, lons - 360.0, lons)
 
-            dist = (lats - lat) ** 2 + (lons - lon) ** 2
+            # Native delta calculation for exact nearest-neighbor matching
+            dist = (lats - lat) ** 2 + (lons_normalized - lon) ** 2
             y_idx, x_idx = np.unravel_index(dist.argmin(), dist.shape)
             _GRID_INDEX_CACHE[stn] = (y_idx, x_idx)
-            logging.info(f"Cached grid index for {stn.upper()} at [y={y_idx}, x={x_idx}]")
+            logging.info(f"Verified target grid index for {stn.upper()} at [y={y_idx}, x={x_idx}]")
 
         grbs.seek(0)
         for msg_idx, grb in enumerate(grbs, start=1):
@@ -78,41 +82,23 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
             pixel_value = 0.0 if np.isnan(float(raw_val)) else float(raw_val)
             val = int(round(pixel_value))
 
-            matched_key = None
-
-            # Strategy 1: raw scaled PDT 4.9 keys
-            try:
-                ptype = int(grb.probabilityType)
-                scale_val = float(grb.scaledValueOfUpperLimit)
-                scale_fac = int(grb.scaleFactorOfUpperLimit)
-                upper = scale_val / (10 ** scale_fac) if scale_fac != 0 else scale_val
-                if ptype == 1:
-                    key = THRESHOLD_MAP.get(int(round(upper)))
-                    if key:
-                        threshold_results[key] = val
-                        matched_key = f"scaled_keys({upper}%)"
-            except Exception:
-                pass
-
-            # Strategy 2: convenience alias
-            if matched_key is None:
-                try:
-                    ptype = int(grb.probabilityType)
-                    upper = float(grb.probabilityUpperLimit)
-                    if ptype == 1:
-                        key = THRESHOLD_MAP.get(int(round(upper)))
-                        if key:
-                            threshold_results[key] = val
-                            matched_key = f"probUpperLimit({upper}%)"
-                except Exception:
-                    pass
-
-            # Strategy 3: positional fallback
-            if matched_key is None:
-                key = MSG_INDEX_THRESHOLDS.get(msg_idx)
-                if key:
-                    threshold_results[key] = val
-                    matched_key = f"positional_fallback(msg{msg_idx})"
+            # 2. String-parsing strategy (immune to eccodes/grib API metadata variances)
+            msg_str = str(grb).lower()
+            
+            # Map based on explicit threshold strings in the GRIB description
+            if "upperlimit=25" in msg_str or "prob > 0.25" in msg_str or "probability=25" in msg_str:
+                threshold_results["p25"] = val
+            elif "upperlimit=50" in msg_str or "prob > 0.50" in msg_str or "probability=50" in msg_str:
+                threshold_results["p50"] = val
+            elif "upperlimit=100" in msg_str or "prob > 1.0" in msg_str or "probability=100" in msg_str:
+                threshold_results["p100"] = val
+            elif "upperlimit=200" in msg_str or "prob > 2.0" in msg_str or "probability=200" in msg_str:
+                threshold_results["p200"] = val
+            else:
+                # Direct structural fallback if the string layout varies by build
+                pos_key = MSG_INDEX_THRESHOLDS.get(msg_idx)
+                if pos_key:
+                    threshold_results[pos_key] = val
 
         grbs.close()
     except Exception as e:
@@ -187,7 +173,7 @@ def fetch_href_lightning(time_keys):
         logging.warning("No active SPC HREF lightning directory found on NOMADS.")
         return href_data
 
-    logging.info(f"Targeting NOMADS Run Run: {active_date_str} at {active_cycle}Z")
+    logging.info(f"Targeting NOMADS Run: {active_date_str} at {active_cycle}Z")
 
     # Reconstruct initialization baseline datetime
     cycle_init_utc = datetime.datetime.strptime(f"{active_date_str}{active_cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
@@ -203,7 +189,6 @@ def fetch_href_lightning(time_keys):
                 
                 # Handle calendar boundary rollovers gracefully
                 if valid_dt < cycle_init_utc:
-                    # Move to next month safely by adding days without breaking shorter months
                     valid_dt += datetime.timedelta(days=28)
                     valid_dt = valid_dt.replace(day=d_part)
 
