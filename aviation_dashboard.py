@@ -50,9 +50,8 @@ def pressure_to_height_ft(pres_hpa):
 
 def extract_lightning_from_file(filepath, lat, lon, stn):
     """
-    Bulletproof extraction for SPC HREF lightning density GRIB2.
-    Uses an explicit string-matching check on message representations to bypass 
-    eccodes version compatibility issues with probability keys.
+    Extracts 4 lightning strike probability thresholds from SPC HREF GRIB2.
+    Uses string representation tokens to bypass version incompatibilities with eccodes.
     """
     global _GRID_INDEX_CACHE
     threshold_results = {"p25": 0, "p50": 0, "p100": 0, "p200": 0}
@@ -60,21 +59,18 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
     try:
         grbs = pygrib.open(filepath)
         
-        # 1. Direct coordinate alignment mapping
+        # Grid Point Index Optimization
         if stn in _GRID_INDEX_CACHE:
             y_idx, x_idx = _GRID_INDEX_CACHE[stn]
         else:
             sample = grbs[1]
             lats, lons = sample.latlons()
-            
-            # SPC files use 0-360 longitude coordinates. Normalize them flawlessly.
             lons_normalized = np.where(lons > 180, lons - 360.0, lons)
 
-            # Native delta calculation for exact nearest-neighbor matching
             dist = (lats - lat) ** 2 + (lons_normalized - lon) ** 2
             y_idx, x_idx = np.unravel_index(dist.argmin(), dist.shape)
             _GRID_INDEX_CACHE[stn] = (y_idx, x_idx)
-            logging.info(f"Verified target grid index for {stn.upper()} at [y={y_idx}, x={x_idx}]")
+            logging.info(f"Verified grid index for {stn.upper()} at [y={y_idx}, x={x_idx}]")
 
         grbs.seek(0)
         for msg_idx, grb in enumerate(grbs, start=1):
@@ -82,10 +78,8 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
             pixel_value = 0.0 if np.isnan(float(raw_val)) else float(raw_val)
             val = int(round(pixel_value))
 
-            # 2. String-parsing strategy (immune to eccodes/grib API metadata variances)
             msg_str = str(grb).lower()
             
-            # Map based on explicit threshold strings in the GRIB description
             if "upperlimit=25" in msg_str or "prob > 0.25" in msg_str or "probability=25" in msg_str:
                 threshold_results["p25"] = val
             elif "upperlimit=50" in msg_str or "prob > 0.50" in msg_str or "probability=50" in msg_str:
@@ -95,14 +89,12 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
             elif "upperlimit=200" in msg_str or "prob > 2.0" in msg_str or "probability=200" in msg_str:
                 threshold_results["p200"] = val
             else:
-                # Direct structural fallback if the string layout varies by build
                 pos_key = MSG_INDEX_THRESHOLDS.get(msg_idx)
                 if pos_key:
                     threshold_results[pos_key] = val
 
-            # Check for active hits real-time
             if val > 0:
-                logging.info(f"  [HIT] {stn.upper()} found {val}% probability for {msg_str.split(':')[0]}")
+                logging.info(f"  [HIT] {stn.upper()} scored {val}% for {msg_str.split(':')[0]}")
 
         grbs.close()
     except Exception as e:
@@ -130,7 +122,7 @@ def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour_i
                     os.remove(local_path)
                 return stn, vals
     except Exception as e:
-        logging.debug(f"Failed download or parse for {file_name}: {e}")
+        logging.debug(f"Download break for {file_name}: {e}")
 
     if os.path.exists(local_path):
         try: os.remove(local_path)
@@ -152,11 +144,12 @@ def fetch_href_lightning(time_keys):
     active_cycle = None
     active_date_str = None
 
+    # CRITICAL FIX: HREF Lightning density files ONLY exist for 00Z and 12Z cycles
     for days_back in [0, 1]:
         check_date = now_utc - datetime.timedelta(days=days_back)
         date_str = check_date.strftime("%Y%m%d")
         
-        for cycle in ["18", "12", "06", "00"]:
+        for cycle in ["12", "00"]:
             test_url = (
                 f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/"
                 f"spc_post.{date_str}/ltgdensity/spc_post.t{cycle}z.hrefld_4hr.f004.grib2"
@@ -172,10 +165,10 @@ def fetch_href_lightning(time_keys):
             break
 
     if not active_cycle:
-        logging.warning("No active SPC HREF lightning directory found on NOMADS.")
+        logging.warning("No active 00Z or 12Z SPC HREF lightning directories found on NOMADS.")
         return href_data
 
-    logging.info(f"Targeting NOMADS Run: {active_date_str} at {active_cycle}Z")
+    logging.info(f"Targeting Valid NOMADS Initialization Run: {active_date_str} at {active_cycle}Z")
 
     cycle_init_utc = datetime.datetime.strptime(f"{active_date_str}{active_cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
 
@@ -194,6 +187,7 @@ def fetch_href_lightning(time_keys):
             except Exception:
                 continue
 
+            # Core HREF limit configuration
             if f_hour_int < 1 or f_hour_int > 48:
                 continue
 
@@ -213,7 +207,7 @@ def fetch_href_lightning(time_keys):
             except Exception:
                 pass
 
-    # GitHub Actions Audit Log block
+    # Console Audit Block for GitHub Runner visibility
     logging.info("=============================================")
     logging.info("         HREF LIGHTNING AUDIT LOG            ")
     logging.info("=============================================")
@@ -226,8 +220,8 @@ def fetch_href_lightning(time_keys):
                 total_signals += 1
                 logging.info(f"  {stn.upper()} [{r_key}] -> {thresh_vals}")
         if stn_hits == 0:
-            logging.info(f"  {stn.upper()} -> All 48 hours are flat 0%")
-    logging.info(f"Audit Complete: Detected {total_signals} total non-zero forecast cells.")
+            logging.info(f"  {stn.upper()} -> All 48 forecast intervals returned flat 0%")
+    logging.info(f"Audit Complete: Processed {total_signals} total non-zero forecast cells.")
     logging.info("=============================================")
 
     return href_data
