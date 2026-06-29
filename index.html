@@ -116,7 +116,7 @@
             if (ceil < 500 || vis < 1) return { label: `LIFR (${ceil} ft)`, cls: "cell-lifr" };
             if (ceil < 1000 || vis < 3) return { label: `IFR (${ceil} ft)`, cls: "cell-ifr" };
             if (ceil <= 3000 || vis <= 5) return { label: `MVFR (${ceil} ft)`, cls: "cell-mvfr" };
-            return { label: "VFR (Clear/Unrestricted)", cls: "cell-vfr" };
+            return { label: "VFR", cls: "cell-vfr" };
         }
 
         function buildMatrix() {
@@ -132,18 +132,15 @@
             subRow.innerHTML = "";
             body.innerHTML = "";
 
-            // Dynamic header generation for target models
             const models = ["gfs", "rap", "hrrr"];
             models.forEach(m => {
                 topRow.innerHTML += `<th colspan="3" class="model-hdr">${m.toUpperCase()} Bufkit Diagnostic Profiles</th>`;
                 subRow.innerHTML += `<th>Aviation Profile</th><th>Mom. Winds</th><th>Isotherms / Clouds</th>`;
             });
             
-            // --- FIXED ALIGNED HEADER CELL BLOCK ---
-            topRow.innerHTML += `<th class="model-hdr" style="background:#0f172a; color:#fff;">HREF Probability</th>`;
-            subRow.innerHTML += `<th style="background:#334155; color:#fff;">Lightning 4-Hr Density</th>`;
+            // Reverted header cells completely back to original setup
+            topRow.innerHTML += `<th rowspan="2" class="model-hdr" style="background:#0f172a; color:#fff; vertical-align: middle;">HREF Probability<br><span style="font-size:0.7rem; font-weight:normal;">4-Hr Lightning Density</span></th>`;
 
-            // Compile global continuous time track across models
             let allTimes = new Set();
             models.forEach(m => {
                 const stnLower = stn.toLowerCase();
@@ -167,7 +164,6 @@
                         return;
                     }
 
-                    // 1. Aviation Profile Cell
                     let avObj = evaluateFlightRules(mData.ceiling, mData.vis);
                     let avClass = avObj.cls;
                     if (mData.shear) avClass += " cell-shear-alert";
@@ -175,24 +171,21 @@
                     let cell1Id = `pop_${stn}_${m}_${rowKey.replace('/','_')}_av`;
                     tr.innerHTML += `<td id="${cell1Id}" class="hover-cell ${avClass}">${avObj.label}</td>`;
 
-                    // 2. Momentum Wind Cell
                     let wClass = (mData.mom_max >= 25 || mData.mom_mean >= 15) ? "cell-wind-alert" : "cell-vfr";
                     let cell2Id = `pop_${stn}_${m}_${rowKey.replace('/','_')}_wind`;
                     tr.innerHTML += `<td id="${cell2Id}" class="hover-cell ${wClass}">Mean: ${mData.mom_mean} kt<br>Max: ${mData.mom_max} kt</td>`;
 
-                    // 3. Isotherm Levels Cell
                     let cell3Id = `pop_${stn}_${m}_${rowKey.replace('/','_')}_thermo`;
                     tr.innerHTML += `<td id="${cell3Id}" class="hover-cell cell-vfr">0°C: ${mData.hght_0c} kft<br>Top: ${mData.cloud_top} kft</td>`;
 
-                    // Attach hover interactions safely
                     setTimeout(() => {
-                        setupCellHover(cell1Id, { type: "av", model: m.toUpperCase(), ceil: mData.ceiling, visibility: mData.vis, w_shear: mData.shear });
+                        setupCellHover(cell1Id, { type: "av", model: m.toUpperCase(), ceil: mData.ceiling, visibility: mData.vis, w_shear: mData.shear, w_mean: mData.mom_mean, w_max: mData.mom_max });
                         setupCellHover(cell2Id, { type: "wind", model: m.toUpperCase(), w_mean: mData.mom_mean, w_max: mData.mom_max });
                         setupCellHover(cell3Id, { type: "thermo", model: m.toUpperCase(), h0: mData.hght_0c, h5: mData.hght_5c, h10: mData.hght_10c, h20: mData.hght_20c, ctop: mData.cloud_top, cthick: mData.cloud_thick });
                     }, 0);
                 });
 
-                // --- HREF LIGHTNING MATRIX BLOCK ---
+                // Fixed data key case disconnect
                 let ltgObj = (runData.href_lightning && runData.href_lightning[stnLower]) ? runData.href_lightning[stnLower][rowKey] : null;
 
                 let p25 = 0, p50 = 0, p100 = 0, p200 = 0;
@@ -246,29 +239,31 @@
             } else {
                 popupCard.innerHTML = data.type === "av" ? `
                     <div class="popup-header">${data.model} Profile Details</div>
-                    • Lowest Ceiling Layer: <strong>${data.ceil >= 23000 ? "Clear (unrestricted)" : data.ceil + " ft"}</strong><br>
-                    • Horizontal Visibility: <strong>${data.visibility} sm</strong><br>
-                    • Microscale Wind Shear: <strong>${data.w_shear ? data.w_shear : "None detected"}</strong>
+                    • Mean Boundary Layer Wind: <strong>${data.w_mean} kt</strong><br>
+                    • Max Column Velocity: <strong>${data.w_max} kt</strong><br>
+                    • Lowest Ceiling: <strong>${data.ceil >= 23000 ? "Clear" : data.ceil + " ft"}</strong><br>
+                    • Visibility: <strong>${data.visibility} sm</strong><br>
+                    • Wind Shear: <strong>${data.w_shear ? data.w_shear : "None Detected"}</strong>
                 ` : data.type === "wind" ? `
                     <div class="popup-header">${data.model} Boundary Layer Winds</div>
                     • Mean Profile Wind Speed: <strong>${data.w_mean} kt</strong><br>
                     • Max Profile Column Velocity: <strong>${data.w_max} kt</strong>
                 ` : `
-                    <div class="popup-header">${data.model} Isotherm Profiles</div>
-                    • 0°C Level height: <strong>${data.h0} kft</strong><br>
-                    • -5°C (Charging zone base): <strong>${data.h5} kft</strong><br>
-                    • -10°C level height: <strong>${data.h10} kft</strong><br>
-                    • -20°C level height: <strong>${data.h20} kft</strong>
-                    <div style="margin-top:6px; border-top:1px solid #475569; padding-top:4px;">
-                        • Profile Maximum Cloud Top: <strong>${data.ctop} kft</strong><br>
-                        • Aggregated Cloud Layer Thickness: <strong>${data.cthick} kft</strong>
+                    <div class="popup-header">${data.model} Thermodynamic Heights</div>
+                    <strong>Freezing & Charging Isotherms:</strong><br>
+                    • 0°C Level: <strong>${data.h0} kft</strong><br>
+                    • -5°C Level: <strong>${data.h5} kft</strong><br>
+                    • -10°C Level: <strong>${data.h10} kft</strong><br>
+                    • -20°C Level: <strong>${data.h20} kft</strong>
+                    <div style="margin-top:6px; border-top:1px solid #e2e8f0; padding-top:4px;">
+                        • Highest Cloud Top: <strong>${data.ctop} kft</strong><br>
+                        • Max Layer Thickness: <strong>${data.cthick} kft</strong>
                     </div>
                 `;
             }
             popupCard.style.display = "block";
-            moveHoverPopup(e);
         }
-
+        
         function moveHoverPopup(e) { 
             popupCard.style.left = (e.pageX + 15) + "px"; 
             popupCard.style.top = (e.pageY - 40) + "px"; 
