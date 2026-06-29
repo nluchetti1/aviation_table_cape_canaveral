@@ -100,6 +100,10 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
                 if pos_key:
                     threshold_results[pos_key] = val
 
+            # Check for active hits real-time
+            if val > 0:
+                logging.info(f"  [HIT] {stn.upper()} found {val}% probability for {msg_str.split(':')[0]}")
+
         grbs.close()
     except Exception as e:
         logging.error(f"Pygrib extraction failed for {stn.upper()}: {e}")
@@ -148,12 +152,10 @@ def fetch_href_lightning(time_keys):
     active_cycle = None
     active_date_str = None
 
-    # Multi-day lookback strategy to solve the 00Z-03Z NOMADS data-gap roll
     for days_back in [0, 1]:
         check_date = now_utc - datetime.timedelta(days=days_back)
         date_str = check_date.strftime("%Y%m%d")
         
-        # Test cycles newest to oldest
         for cycle in ["18", "12", "06", "00"]:
             test_url = (
                 f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/"
@@ -175,7 +177,6 @@ def fetch_href_lightning(time_keys):
 
     logging.info(f"Targeting NOMADS Run: {active_date_str} at {active_cycle}Z")
 
-    # Reconstruct initialization baseline datetime
     cycle_init_utc = datetime.datetime.strptime(f"{active_date_str}{active_cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -183,11 +184,8 @@ def fetch_href_lightning(time_keys):
         for row_key in time_keys:
             try:
                 d_part, h_part = map(int, row_key.split("/"))
-                
-                # Build target forecast time anchored around initialization month/year
                 valid_dt = cycle_init_utc.replace(day=d_part, hour=h_part, minute=0, second=0, microsecond=0)
                 
-                # Handle calendar boundary rollovers gracefully
                 if valid_dt < cycle_init_utc:
                     valid_dt += datetime.timedelta(days=28)
                     valid_dt = valid_dt.replace(day=d_part)
@@ -196,7 +194,6 @@ def fetch_href_lightning(time_keys):
             except Exception:
                 continue
 
-            # HREF spans out to F048 hours
             if f_hour_int < 1 or f_hour_int > 48:
                 continue
 
@@ -215,6 +212,23 @@ def fetch_href_lightning(time_keys):
                 href_data[stn][row_key] = vals
             except Exception:
                 pass
+
+    # GitHub Actions Audit Log block
+    logging.info("=============================================")
+    logging.info("         HREF LIGHTNING AUDIT LOG            ")
+    logging.info("=============================================")
+    total_signals = 0
+    for stn in STATIONS:
+        stn_hits = 0
+        for r_key, thresh_vals in href_data[stn].items():
+            if any(v > 0 for v in thresh_vals.values()):
+                stn_hits += 1
+                total_signals += 1
+                logging.info(f"  {stn.upper()} [{r_key}] -> {thresh_vals}")
+        if stn_hits == 0:
+            logging.info(f"  {stn.upper()} -> All 48 hours are flat 0%")
+    logging.info(f"Audit Complete: Detected {total_signals} total non-zero forecast cells.")
+    logging.info("=============================================")
 
     return href_data
 
