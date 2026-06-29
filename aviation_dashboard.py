@@ -17,7 +17,6 @@ HISTORY_FILE = "history.json"
 STATIONS = ["kdab", "kxmr", "kmlb", "kfpr", "kpbi"]
 MODELS = ["gfs", "rap", "hrrr"]
 
-# Fixed coordinates for target locations
 STN_COORDS = {
     "kxmr": {"lat": 28.468, "lon": -80.556},
     "kdab": {"lat": 29.180, "lon": -81.058},
@@ -26,13 +25,9 @@ STN_COORDS = {
     "kpbi": {"lat": 26.683, "lon": -80.095}
 }
 
-# Known fixed message ordering within each HREFLD GRIB2 file.
-# Confirmed by CDL metadata variable ordering:
-#   msg 1 = above_25, msg 2 = above_50, msg 3 = above_100, msg 4 = above_200
-# This positional map is used as the primary strategy; key-based introspection
-# is attempted first per message and overrides the positional value if it succeeds.
-MSG_INDEX_THRESHOLDS = {1: "p25", 2: "p50", 3: "p100", 4: "p200"}
 THRESHOLD_MAP = {25: "p25", 50: "p50", 100: "p100", 200: "p200"}
+# Confirmed fixed ordering from CDL metadata variable declaration order
+MSG_INDEX_THRESHOLDS = {1: "p25", 2: "p50", 3: "p100", 4: "p200"}
 
 
 def purge_workspace(cache_dir=CACHE_DIR):
@@ -48,112 +43,157 @@ def purge_workspace(cache_dir=CACHE_DIR):
 
 
 def pressure_to_height_ft(pres_hpa):
-    """Converts barometric pressure to standard atmosphere height in feet."""
     return 145366.45 * (1.0 - (pres_hpa / 1013.25) ** 0.190284)
 
 
-def _get_probability_upper_limit(grb):
+def diagnose_grib_file(filepath):
     """
-    Attempts to extract (probabilityType, upperLimitValue) from a pygrib message
-    using three strategies in order of reliability:
-
-      1. scaledValueOfUpperLimit / scaleFactorOfUpperLimit  — raw PDT 4.9 keys,
-         most universally available across eccodes versions.
-      2. probabilityUpperLimit convenience alias  — available in newer builds.
-      3. Returns (None, None) if both fail, signalling the caller to use the
-         positional fallback instead.
-
-    probabilityType == 1 means "above upper limit" per GRIB2 Code Table 4.9.
+    Opens the GRIB file and prints everything pygrib can see about each message.
+    Run this once to understand what keys your eccodes version exposes.
+    Only called on the first file downloaded per run.
     """
-    # Strategy 1: raw scaled keys (most compatible)
+    logging.info(f"=== GRIB DIAGNOSTIC: {filepath} ===")
     try:
-        ptype = int(grb.probabilityType)
-        scale_val = float(grb.scaledValueOfUpperLimit)
-        scale_fac = int(grb.scaleFactorOfUpperLimit)
-        upper = scale_val / (10 ** scale_fac) if scale_fac != 0 else scale_val
-        return ptype, upper
-    except Exception:
-        pass
+        grbs = pygrib.open(filepath)
+        grbs.seek(0)
+        for i, grb in enumerate(grbs, start=1):
+            logging.info(f"  --- Message {i} ---")
+            logging.info(f"    str(grb)       : {str(grb)}")
+            logging.info(f"    grb.name       : {grb.name}")
+            logging.info(f"    grb.shortName  : {grb.shortName}")
+            logging.info(f"    grb.typeOfLevel: {grb.typeOfLevel}")
+            logging.info(f"    grb.discipline : {grb.discipline}")
+            logging.info(f"    grb.parameterCategory: {grb.parameterCategory}")
+            logging.info(f"    grb.parameterNumber  : {grb.parameterNumber}")
 
-    # Strategy 2: convenience alias key
-    try:
-        ptype = int(grb.probabilityType)
-        upper = float(grb.probabilityUpperLimit)
-        return ptype, upper
-    except Exception:
-        pass
+            # Try every probability-related key name we know about
+            for key in [
+                "probabilityType",
+                "probabilityUpperLimit",
+                "probabilityLowerLimit",
+                "scaledValueOfUpperLimit",
+                "scaleFactorOfUpperLimit",
+                "scaledValueOfLowerLimit",
+                "scaleFactorOfLowerLimit",
+                "upperLimit",
+                "lowerLimit",
+            ]:
+                try:
+                    val = getattr(grb, key)
+                    logging.info(f"    {key}: {val}")
+                except Exception:
+                    logging.info(f"    {key}: <not available>")
 
-    return None, None
+            # Print the full list of keys pygrib exposes for this message
+            try:
+                keys = grb.keys()
+                prob_keys = [k for k in keys if "prob" in k.lower() or "limit" in k.lower()]
+                logging.info(f"    Probability/limit keys available: {prob_keys}")
+            except Exception as e:
+                logging.info(f"    Could not list keys: {e}")
+
+        grbs.close()
+    except Exception as e:
+        logging.error(f"Diagnostic failed: {e}")
+    logging.info("=== END DIAGNOSTIC ===")
 
 
-def extract_lightning_from_file(filepath, lat, lon):
+def extract_lightning_from_file(filepath, lat, lon, run_diagnostic=False):
     """
-    Opens a downloaded SPC Post HREFLD GRIB2 file, finds the nearest Lambert
-    Conformal grid point to (lat, lon), and returns all 4 lightning strike
-    probability thresholds: p25, p50, p100, p200.
+    Extracts all 4 lightning strike probability thresholds from a HREFLD GRIB2 file.
 
-    Matching strategy (per message):
-      - Try key-based probability metadata first (_get_probability_upper_limit).
-      - Fall back to known fixed message-index ordering if keys are unavailable.
-        The CDL metadata confirms consistent ordering across all files:
-        msg 1=above_25, msg 2=above_50, msg 3=above_100, msg 4=above_200.
+    Strategy per message (in order):
+      1. scaledValueOfUpperLimit / scaleFactorOfUpperLimit  (raw PDT 4.9, most compatible)
+      2. probabilityUpperLimit convenience alias            (newer eccodes builds)
+      3. Positional fallback by message index               (always succeeds)
+         Order confirmed by CDL metadata: msg1=p25, msg2=p50, msg3=p100, msg4=p200
     """
     threshold_results = {"p25": 0, "p50": 0, "p100": 0, "p200": 0}
+
+    if run_diagnostic:
+        diagnose_grib_file(filepath)
 
     try:
         grbs = pygrib.open(filepath)
 
-        # Build lat/lon grid from first message
+        # Build lat/lon grid and find nearest grid point
         sample = grbs[1]
         lats, lons = sample.latlons()
-
-        # Normalise longitudes to -180..+180 if the grid uses 0-360
         if np.any(lons > 180):
             lons = lons - 360.0
 
-        # Nearest-neighbour index in the 185x129 Lambert Conformal grid
         dist = (lats - lat) ** 2 + (lons - lon) ** 2
         y_idx, x_idx = np.unravel_index(dist.argmin(), dist.shape)
+        nearest_lat = lats[y_idx, x_idx]
+        nearest_lon = lons[y_idx, x_idx]
+        logging.info(
+            f"  Grid lookup for ({lat:.3f},{lon:.3f}) -> "
+            f"nearest point ({nearest_lat:.3f},{nearest_lon:.3f}) "
+            f"at grid index [y={y_idx}, x={x_idx}]"
+        )
 
         grbs.seek(0)
         for msg_idx, grb in enumerate(grbs, start=1):
-            pixel_value = float(grb.values[y_idx, x_idx])
-            if np.isnan(pixel_value):
-                pixel_value = 0.0
+            raw_val = grb.values[y_idx, x_idx]
+            pixel_value = 0.0 if np.isnan(float(raw_val)) else float(raw_val)
             val = int(round(pixel_value))
 
-            # --- Primary: key-based matching ---
-            ptype, upper = _get_probability_upper_limit(grb)
-            if ptype is not None and upper is not None:
+            matched_key = None
+
+            # Strategy 1: raw scaled PDT 4.9 keys
+            try:
+                ptype = int(grb.probabilityType)
+                scale_val = float(grb.scaledValueOfUpperLimit)
+                scale_fac = int(grb.scaleFactorOfUpperLimit)
+                upper = scale_val / (10 ** scale_fac) if scale_fac != 0 else scale_val
                 if ptype == 1:
                     key = THRESHOLD_MAP.get(int(round(upper)))
                     if key:
                         threshold_results[key] = val
-                        logging.debug(f"Key match: msg {msg_idx} upper={upper} -> {key}={val}%")
-                    else:
-                        logging.debug(f"Unrecognised upper limit value: {upper}")
-                continue
+                        matched_key = f"scaled_keys(upper={upper})->{key}"
+            except Exception:
+                pass
 
-            # --- Fallback: positional ordering ---
-            key = MSG_INDEX_THRESHOLDS.get(msg_idx)
-            if key:
-                threshold_results[key] = val
-                logging.debug(f"Positional fallback: msg {msg_idx} -> {key}={val}%")
+            # Strategy 2: convenience alias
+            if matched_key is None:
+                try:
+                    ptype = int(grb.probabilityType)
+                    upper = float(grb.probabilityUpperLimit)
+                    if ptype == 1:
+                        key = THRESHOLD_MAP.get(int(round(upper)))
+                        if key:
+                            threshold_results[key] = val
+                            matched_key = f"probabilityUpperLimit(upper={upper})->{key}"
+                except Exception:
+                    pass
+
+            # Strategy 3: positional fallback
+            if matched_key is None:
+                key = MSG_INDEX_THRESHOLDS.get(msg_idx)
+                if key:
+                    threshold_results[key] = val
+                    matched_key = f"positional_fallback(msg{msg_idx})->{key}"
+
+            logging.info(
+                f"  msg {msg_idx}: raw={raw_val:.2f} val={val}%  match={matched_key}"
+            )
 
         grbs.close()
 
     except Exception as e:
         logging.error(f"Pygrib extraction failed for {filepath}: {e}")
 
+    logging.info(f"  => threshold_results: {threshold_results}")
     return threshold_results
 
 
+# Tracks whether the diagnostic has been run yet this pipeline run
+_diagnostic_done = False
+
+
 def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour):
-    """
-    Downloads one HREFLD GRIB2 file for the given forecast hour and extracts
-    the lightning probability values at the nearest grid point to (lat, lon).
-    Cleans up the local file after extraction.
-    """
+    global _diagnostic_done
+
     base_url = (
         f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/"
         f"spc_post.{date_str}/ltgdensity"
@@ -169,7 +209,21 @@ def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour):
                 with open(local_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
-                vals = extract_lightning_from_file(local_path, lat, lon)
+
+                file_size = os.path.getsize(local_path)
+                logging.info(
+                    f"Downloaded {file_name} for {stn} "
+                    f"({file_size} bytes) -> extracting at ({lat},{lon})"
+                )
+
+                # Run full key diagnostic on the very first file only
+                run_diag = False
+                if not _diagnostic_done:
+                    _diagnostic_done = True
+                    run_diag = True
+
+                vals = extract_lightning_from_file(local_path, lat, lon, run_diagnostic=run_diag)
+
                 if os.path.exists(local_path):
                     os.remove(local_path)
                 return stn, vals
@@ -182,16 +236,9 @@ def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour):
 
 
 def fetch_href_lightning(time_keys):
-    """
-    Fetches HREFLD lightning probability data for all stations across all
-    valid-time rows in time_keys.
+    global _diagnostic_done
+    _diagnostic_done = False  # Reset at start of each pipeline run
 
-    Cycle discovery checks in descending order (18Z -> 12Z -> 06Z -> 00Z)
-    so the most recently initialised run is always preferred.
-
-    Forecast hours are derived from the valid-time string ("DD/HH") relative
-    to the active cycle init time, avoiding the idx+1 offset bug.
-    """
     href_data = {
         stn: {row: {"p25": 0, "p50": 0, "p100": 0, "p200": 0} for row in time_keys}
         for stn in STATIONS
@@ -204,7 +251,7 @@ def fetch_href_lightning(time_keys):
     adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50)
     session.mount("https://", adapter)
 
-    # Descending cycle order so the freshest available run is picked first
+    # Check cycles newest-first so the most recent initialised run wins
     active_cycle = "00"
     for cycle in ["18", "12", "06", "00"]:
         test_url = (
@@ -215,12 +262,11 @@ def fetch_href_lightning(time_keys):
         try:
             if session.head(test_url, timeout=3).status_code == 200:
                 active_cycle = cycle
-                logging.info(f"Connected to live SPC Post inventory for cycle: {active_cycle}Z")
+                logging.info(f"Active cycle: {active_cycle}Z")
                 break
         except Exception:
             continue
 
-    # Anchor forecast-hour calculations to the active cycle's init time
     cycle_init_utc = now_utc.replace(
         hour=int(active_cycle), minute=0, second=0, microsecond=0
     )
@@ -228,13 +274,11 @@ def fetch_href_lightning(time_keys):
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures_map = {}
         for row_key in time_keys:
-            # Derive forecast hour from valid-time string "DD/HH"
             try:
                 d_part, h_part = map(int, row_key.split("/"))
                 valid_dt = now_utc.replace(
                     day=d_part, hour=h_part, minute=0, second=0, microsecond=0
                 )
-                # Handle month boundary: if valid day < today's day, it's next month
                 if valid_dt < cycle_init_utc:
                     valid_dt += datetime.timedelta(days=30)
                 f_hour_int = int((valid_dt - cycle_init_utc).total_seconds() / 3600)
@@ -260,14 +304,22 @@ def fetch_href_lightning(time_keys):
             except Exception:
                 pass
 
+    # Print a summary table of all extracted values
+    logging.info("=== HREF LIGHTNING EXTRACTION SUMMARY ===")
+    for stn in STATIONS:
+        non_zero = {
+            k: v for k, v in href_data[stn].items()
+            if any(v[t] > 0 for t in ["p25", "p50", "p100", "p200"])
+        }
+        logging.info(f"  {stn}: {len(non_zero)} time slots with non-zero lightning probability")
+        for time_key, vals in sorted(non_zero.items())[:5]:  # show first 5 non-zero
+            logging.info(f"    {time_key} -> {vals}")
+    logging.info("==========================================")
+
     return href_data
 
 
 def parse_time_series_bufkit(bufkit_text):
-    """
-    Parses a BUFKit sounding text file and returns a dict keyed by
-    valid-time string "DD/HH" containing derived meteorological parameters.
-    """
     hourly_data = {}
     blocks = bufkit_text.split("STID = ")
 
@@ -354,11 +406,7 @@ def parse_time_series_bufkit(bufkit_text):
         for layer in profile_layers:
             if layer["depr"] <= 2.0:
                 if active_cloud is None:
-                    active_cloud = {
-                        "base": layer["hght"],
-                        "top": layer["hght"],
-                        "min_temp": layer["tmpc"],
-                    }
+                    active_cloud = {"base": layer["hght"], "top": layer["hght"], "min_temp": layer["tmpc"]}
                 else:
                     active_cloud["top"] = layer["hght"]
                     active_cloud["min_temp"] = min(active_cloud["min_temp"], layer["tmpc"])
@@ -388,13 +436,9 @@ def parse_time_series_bufkit(bufkit_text):
             "hght_5c": round(get_height_of_isotherm(-5.0), 1),
             "hght_10c": round(get_height_of_isotherm(-10.0), 1),
             "hght_20c": round(get_height_of_isotherm(-20.0), 1),
-            "cloud_top": round(
-                max([c["top"] for c in cloud_layers], default=0.0) / 1000.0, 1
-            ),
+            "cloud_top": round(max([c["top"] for c in cloud_layers], default=0.0) / 1000.0, 1),
             "cloud_thick": round(
-                max([max(0.0, c["top"] - c["base"]) for c in cloud_layers], default=0.0)
-                / 1000.0,
-                1,
+                max([max(0.0, c["top"] - c["base"]) for c in cloud_layers], default=0.0) / 1000.0, 1
             ),
         }
     return hourly_data
@@ -427,9 +471,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         except Exception:
             history_runs = []
 
-    current_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
-        "%Y-%m-%d %H:%M UTC"
-    )
+    current_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     current_entry = {
         "timestamp": current_timestamp,
         "data": current_sounding_matrix,
@@ -485,3 +527,4 @@ def run_pipeline():
 
 if __name__ == "__main__":
     run_pipeline()
+
