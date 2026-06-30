@@ -30,15 +30,19 @@
         .legend-item { display: flex; justify-content: space-between; margin-bottom: 4px; padding: 6px; border-radius: 3px; font-size: 0.8rem; border: 1px solid #e2e8f0; font-weight: bold; }
         .explanation-box { margin-top: 15px; padding-top: 10px; border-top: 1px dashed #cbd5e1; font-size: 0.78rem; line-height: 1.4; color: #475569; }
         
-        /* Restored Original Threshold States */
-        .cell-vfr { background-color: #f0fdf4; color: #166534; }
+        /* Threshold States */
+        .cell-vfr { background-color: transparent; color: #1e293b; font-weight: normal; }
         .cell-mvfr { background-color: #eff6ff; color: #1e40af; }
         .cell-ifr { background-color: #fef2f2; color: #991b1b; font-weight: bold; }
         .cell-lifr { background-color: #ffa6a6; color: #7f0000; font-weight: bold; }
         .cell-alert { background-color: #fef2f2; color: #dc2626; font-weight: bold; border: 1px solid #dc2626; }
-        .cell-shear { background-color: #fae8ff; color: #86198f; font-weight: bold; }
         
-        /* Restored Original Heatmap probabilities */
+        /* 0-6 km Bulk Shear Color Hierarchy */
+        .cell-shear-25 { background-color: #fae8ff; color: #a21caf; font-weight: bold; }
+        .cell-shear-30 { background-color: #f5d0fe; color: #86198f; font-weight: bold; }
+        .cell-shear-40 { background-color: #701a75; color: #ffffff; font-weight: bold; }
+        
+        /* HREF Lightning / Isotherm Probability Heatmap */
         .ltg-none { background-color: #ffffff; color: #cbd5e1; }
         .ltg-vlow { background-color: #fef9c3; color: #713f12; }
         .ltg-low { background-color: #fef9c3; color: #854d0e; }
@@ -65,7 +69,7 @@
             <a onmouseover="updateMetric('mom_max')" id="nav-mom_max">PBL Mom Max</a>
             <a onmouseover="updateMetric('ceiling')" id="nav-ceiling">Ceilings</a>
             <a onmouseover="updateMetric('vis')" id="nav-vis">Visibility</a>
-            <a onmouseover="updateMetric('shear')" id="nav-shear">Wind Shear</a>
+            <a onmouseover="updateMetric('shear')" id="nav-shear">0-6 km Shear</a>
             | <span>Launch Variables (kft):</span>
             <a onmouseover="updateMetric('hght_0c')" id="nav-hght_0c">0°C Height</a>
             <a onmouseover="updateMetric('hght_5c')" id="nav-hght_5c">-5°C Height</a>
@@ -155,20 +159,19 @@
             renderMatrix();
         }
 
-        // Exact original evaluation threshold color maps
-        function getCellProperties(metric, val) {
-            if (val === null || val === undefined) return { txt: "-", cls: "" };
+        function getCellProperties(metric, val, profile) {
+            if (val === null || val === undefined) return { txt: "-", cls: "cell-vfr" };
             let txt = typeof val === "number" ? val.toFixed(1) : val;
 
             if (metric === 'mom_mean') {
-                if (val >= 25) return { txt: txt + " kt", cls: "cell-alert" };
-                if (val >= 15) return { txt: txt + " kt", cls: "cell-mvfr" };
-                return { txt: txt + " kt", cls: "cell-vfr" };
+                if (val >= 20) return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-alert" };
+                if (val >= 15) return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-mvfr" };
+                return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-vfr" };
             }
             if (metric === 'mom_max') {
-                if (val >= 35) return { txt: txt + " kt", cls: "cell-alert" };
-                if (val >= 25) return { txt: txt + " kt", cls: "cell-ifr" };
-                return { txt: txt + " kt", cls: "cell-vfr" };
+                if (val >= 30) return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-alert" };
+                if (val >= 20) return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-ifr" };
+                return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-vfr" };
             }
             if (metric === 'ceiling') {
                 if (val >= 23000) return { txt: "CLR", cls: "cell-vfr" };
@@ -184,10 +187,36 @@
                 return { txt: txt + " sm", cls: "cell-vfr" };
             }
             if (metric === 'shear') {
-                return (val && val !== "None") ? { txt: "WSHEAR", cls: "cell-shear" } : { txt: "None", cls: "cell-vfr" };
+                let numVal = parseFloat(val);
+                if (isNaN(numVal)) return { txt: val, cls: "cell-vfr" };
+                let displayTxt = numVal.toFixed(0) + " kt";
+                if (numVal >= 40) return { txt: displayTxt, cls: "cell-shear-40" };
+                if (numVal >= 30) return { txt: displayTxt, cls: "cell-shear-30" };
+                if (numVal >= 25) return { txt: displayTxt, cls: "cell-shear-25" };
+                return { txt: displayTxt, cls: "cell-vfr" };
             }
-            // Launch variables display flat uncolored values natively
-            return { txt: txt + " kft", cls: "" };
+
+            // Cloud Top evaluation against thermodynamic levels
+            if (metric === 'cloud_top') {
+                if (val === 0) return { txt: txt + " kft", cls: "cell-vfr" };
+                if (profile && profile.hght_20c && val >= profile.hght_20c) return { txt: txt + " kft", cls: "cell-ifr" }; // Glaciated
+                if (profile && profile.hght_10c && val >= profile.hght_10c) return { txt: txt + " kft", cls: "ltg-med" }; // Mixed Phase
+                if (profile && profile.hght_0c && val >= profile.hght_0c) return { txt: txt + " kft", cls: "ltg-low" };   // Reaching Freezing
+                return { txt: txt + " kft", cls: "cell-vfr" };
+            }
+
+            // Isotherm Level evaluation (color cell if cloud top pushes through it)
+            if (['hght_0c', 'hght_5c', 'hght_10c', 'hght_20c'].includes(metric)) {
+                let cls = "cell-vfr";
+                if (profile && profile.cloud_top && profile.cloud_top >= val && val > 0) {
+                    if (metric === 'hght_20c' || metric === 'hght_5c') cls = "cell-ifr"; 
+                    else if (metric === 'hght_10c') cls = "ltg-med";
+                    else if (metric === 'hght_0c') cls = "ltg-low";
+                }
+                return { txt: txt + " kft", cls: cls };
+            }
+            
+            return { txt: txt + " kft", cls: "cell-vfr" };
         }
 
         function renderMatrix() {
@@ -204,7 +233,6 @@
 
             const isLaunchMode = launchMetrics.includes(activeMetric);
 
-            // Reconstruct Table Columns based on context mode
             if (isLaunchMode) {
                 headerRow.innerHTML = `
                     <th style="width: 95px;">Time (UTC)</th>
@@ -232,7 +260,6 @@
                 if (mData) Object.keys(mData).forEach(t => timeSet.add(t));
             });
 
-            // Month boundary chronological sorting loop
             let sortedTimes = Array.from(timeSet).sort((a, b) => {
                 const [dayA, hourA] = a.split('/').map(Number);
                 const [dayB, hourB] = b.split('/').map(Number);
@@ -259,7 +286,7 @@
                     }
 
                     let val = profile[activeMetric];
-                    let props = getCellProperties(activeMetric, val);
+                    let props = getCellProperties(activeMetric, val, profile);
                     let cellId = `c_${lowerStn}_${m}_${timeKey.replace('/','_')}`;
                     
                     tr.innerHTML += `<td id="${cellId}" class="${props.cls}" style="cursor:help;">${props.txt}</td>`;
@@ -274,14 +301,13 @@
                     }, 0);
                 });
 
-                // Append Standalone HREF interactive cell strictly in Launch mode
                 if (isLaunchMode) {
                     let ltgRoot = cycle.href_lightning || cycle.data.href_lightning || cycle.data.href || {};
                     let ltgStation = ltgRoot[lowerStn] || ltgRoot[upperStn] || {};
                     let ltgData = ltgStation[timeKey] || null;
                     
                     let p25 = ltgData ? (ltgData.p25 || 0) : 0;
-                    if (p25 <= 1.0 && p25 > 0) p25 = Math.round(p25 * 100); // safety catch for decimal rates
+                    if (p25 <= 1.0 && p25 > 0) p25 = Math.round(p25 * 100);
 
                     let ltgCls = "ltg-none";
                     if (p25 > 0) {
@@ -314,31 +340,48 @@
             if (aviationMetrics.includes(activeMetric)) {
                 panel.innerHTML = `
                     <div class="legend-title">Matrix Threshold Criteria</div>
-                    <div class="legend-section-title">Aviation Rules</div>
-                    <div class="legend-item cell-vfr"><span>VFR Status</span><span>&gt; 3000 ft / 5 sm</span></div>
-                    <div class="legend-item cell-mvfr"><span>MVFR Alert</span><span>1000-3000 ft</span></div>
-                    <div class="legend-item cell-ifr"><span>IFR Restriction</span><span>500-1000 ft</span></div>
-                    <div class="legend-item cell-lifr"><span>LIFR Critical</span><span>&lt; 500 ft</span></div>
-                    <div class="legend-item cell-alert"><span>High Wind Threshold</span><span>Dangerous Max/Mean</span></div>
-                    <div class="legend-item cell-shear"><span>Wind Shear Alert</span><span>Turbulence Profile</span></div>
+                    
+                    <div class="legend-section-title">Aviation Flight Categories</div>
+                    <div class="legend-item" style="background:#ffffff; color:#1e293b; border:1px solid #cbd5e1;"><span>VFR Status</span><span>Nominal / Uncolored</span></div>
+                    <div class="legend-item cell-mvfr"><span>MVFR Alert</span><span>1000-3000 ft / 3-5 sm</span></div>
+                    <div class="legend-item cell-ifr"><span>IFR Restriction</span><span>500-1000 ft / 1-3 sm</span></div>
+                    <div class="legend-item cell-lifr"><span>LIFR Critical</span><span>&lt; 500 ft / &lt; 1 sm</span></div>
+                    
+                    <div class="legend-section-title">Planetary Boundary Layer Wind</div>
+                    <div class="legend-item cell-alert"><span>Elevated Winds</span><span>&gt; 20 kt Kinematics</span></div>
+                    
+                    <div class="legend-section-title">0-6 km Bulk Shear</div>
+                    <div class="legend-item cell-shear-25"><span>Elevated Shear</span><span>≥ 25 kt Magnitude</span></div>
+                    <div class="legend-item cell-shear-30"><span>Moderate Shear</span><span>≥ 30 kt Magnitude</span></div>
+                    <div class="legend-item cell-shear-40"><span>Strong Shear</span><span>≥ 40 kt Magnitude</span></div>
+                    
                     <div class="explanation-box">
                         <strong>Aviation Parameter Definitions:</strong><br><br>
-                        • <strong>PBL Mom Mean:</strong> Average momentum transfer evaluated through the Planetary Boundary Layer (surface to 850 hPa).<br><br>
+                        • <strong>PBL Mom Mean:</strong> Average momentum transfer evaluated through the Planetary Boundary Layer.<br><br>
                         • <strong>PBL Mom Max:</strong> Peak wind speed evaluated within the mixed boundary layer structure.<br><br>
-                        • <strong>Ceilings:</strong> Lowest saturated layer meeting broken/overcast criteria (&gt;50% cloud covers).<br><br>
-                        • <strong>Visibility:</strong> Horizontal surface visibility visibility constraints expressed in statute miles.
+                        • <strong>Ceilings:</strong> Lowest saturated layer meeting broken/overcast criteria (&gt;50% cloud cover).<br><br>
+                        • <strong>Visibility:</strong> Horizontal surface restrictions expressed in statute miles.<br><br>
+                        • <strong>0-6 km Bulk Shear:</strong> Deep-layer vertical speed/directional shear used to gauge convective organization potential and localized turbulence profiles.
                     </div>
                 `;
             } else {
                 panel.innerHTML = `
                     <div class="legend-title">Matrix Threshold Criteria</div>
+                    
                     <div class="legend-section-title">HREF Probability (Exceedance)</div>
                     <div class="legend-item ltg-vlow"><span>Very Low Prob</span><span>&gt; 0% Strikes</span></div>
                     <div class="legend-item ltg-low"><span>Low Probability</span><span>&gt; 5% Strikes</span></div>
                     <div class="legend-item ltg-med"><span>Medium Probability</span><span>&gt; 15% Strikes</span></div>
                     <div class="legend-item ltg-high"><span>High Probability</span><span>&gt; 30% Strikes</span></div>
+                    
+                    <div class="legend-section-title">Isotherm Glaciation Intersects</div>
+                    <div class="legend-item ltg-low"><span>0°C Breach</span><span>Cloud Top ≥ 0°C</span></div>
+                    <div class="legend-item ltg-med"><span>-10°C Breach</span><span>Cloud Top ≥ -10°C</span></div>
+                    <div class="legend-item cell-ifr"><span>-20°C Breach</span><span>Cloud Top ≥ -20°C</span></div>
+
                     <div class="explanation-box">
                         <strong>Launch Commit Criteria (LCC) Guides:</strong><br><br>
+                        • <strong>HREF Lightning Density:</strong> Machine-learning calibrated probability utilizing a 4-hour rolling mean of ensemble proxy metrics (e.g., updraft helicity, graupel flux) to forecast grid-based strike exceedances.<br><br>
                         • <strong>Isotherm Profiles:</strong> Evaluating heights (kft) of key charging zones (0°C to -20°C). Crucial for assessing triboelectric charging and natural triggering mechanisms.<br><br>
                         • <strong>Highest Cloud Top:</strong> Monitored relative to environmental temperature barriers to ensure rocket flight paths do not interface with active cloud layer glaciation fields.<br><br>
                         • <strong>Max Layer Thickness:</strong> Tracks depths of continuous cloud decks to ensure compliant launch corridor margins.
@@ -350,13 +393,15 @@
         function showPopup(e, model, p) {
             const isAviation = aviationMetrics.includes(activeMetric);
             if (isAviation) {
+                let shearVal = parseFloat(p.shear);
+                let shearTxt = !isNaN(shearVal) ? shearVal.toFixed(0) + ' kt' : p.shear;
                 popupCard.innerHTML = `
                     <div class="popup-header">${model.toUpperCase()} Aviation Diagnostics</div>
                     • Ceilings: <strong>${p.ceiling >= 23000 ? 'Clear' : p.ceiling + ' ft'}</strong><br>
                     • Visibility: <strong>${p.vis} sm</strong><br>
                     • Mean Boundary Wind: <strong>${p.mom_mean} kt</strong><br>
                     • Max Wind Speed: <strong>${p.mom_max} kt</strong><br>
-                    • Wind Shear: <strong>${(p.shear && p.shear !== "None") ? 'Low-Level Alert' : 'None'}</strong>
+                    • 0-6 km Bulk Shear: <strong>${shearTxt}</strong>
                 `;
             } else {
                 popupCard.innerHTML = `
