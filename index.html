@@ -10,46 +10,32 @@
         .nav-links span { font-weight: bold; margin-right: 5px; color: #334155; }
         .nav-links a { margin: 0 3px; text-decoration: none; color: #2563eb; padding: 2px 5px; border-radius: 3px; transition: all 0.1s ease; cursor: pointer; }
         .nav-links a.active { color: #ffffff; background: #2563eb; font-weight: bold; }
-        .station-selector { display: flex; align-items: center; gap: 6px; font-size: 0.85rem; font-weight: bold; background: white; padding: 4px 8px; border-radius: 4px; border: 1px solid #cbd5e1; }
+        .station-selector { display: flex; align-items: center; gap: 6px; font-size: 0.9rem; font-weight: bold; background: white; padding: 4px 8px; border-radius: 4px; border: 1px solid #cbd5e1; }
         .station-selector select { font-size: 0.85rem; font-weight: bold; color: #1e3a8a; padding: 2px 4px; cursor: pointer; border: 1px solid #cbd5e1; border-radius: 3px; }
         .dprog-bar { background: #f1f5f9; border: 1px solid #cbd5e1; padding: 8px; border-radius: 4px; margin-bottom: 12px; display: flex; align-items: center; gap: 10px; }
         .dprog-title { font-weight: bold; color: #475569; font-size: 0.82rem; text-transform: uppercase; }
-        .dprog-btn { margin: 0 3px; text-decoration: none; color: #2563eb; padding: 2px 5px; border-radius: 3px; cursor: pointer; font-size: 0.8rem; }
-        .dprog-btn.active { color: white; background: #475569; font-weight: bold; }
         .main-layout { display: flex; gap: 20px; align-items: flex-start; position: relative; }
         .table-container { max-height: 72vh; overflow-y: auto; border: 1px solid #cbd5e1; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        table { border-collapse: collapse; background: white; width: 690px; table-layout: fixed; }
+        table { border-collapse: collapse; background: white; width: 580px; table-layout: fixed; }
         th { background: #2563eb; color: white; padding: 8px; border: 1px solid #cbd5e1; font-size: 0.8rem; text-align: center; position: sticky; top: 0; z-index: 10; }
         td { border: 1px solid #cbd5e1; padding: 6px; text-align: center; font-family: monospace; font-size: 0.85rem; white-space: nowrap; position: relative; }
         .time-col { background: #3b82f6; color: white; font-weight: bold; width: 95px; position: sticky; left: 0; }
-        .href-col { background: #ffffff; color: #0f172a; border-left: 2px solid #cbd5e1 !important; font-weight: bold; }
         .side-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; width: 360px; display: block; }
         .legend-title { font-weight: bold; border-bottom: 1px solid #cbd5e1; padding-bottom: 5px; margin-bottom: 10px; text-align: center; font-size: 0.95rem; color: #1e293b; }
-        .legend-section-title { font-weight: bold; font-size: 0.8rem; margin: 12px 0 4px 0; color: #475569; text-transform: uppercase; letter-spacing: 0.05em; }
         .legend-item { display: flex; justify-content: space-between; margin-bottom: 4px; padding: 5px; border-radius: 3px; font-size: 0.8rem; border: 1px solid #e2e8f0; }
-        
-        /* Color Threshold States */
-        .cell-vfr { background-color: #f0fdf4; color: #166534; }
-        .cell-mvfr { background-color: #eff6ff; color: #1e40af; }
-        .cell-ifr { background-color: #fef2f2; color: #991b1b; font-weight: bold; }
-        .cell-lifr { background-color: #ffa6a6; color: #7f0000; font-weight: bold; }
-        .cell-alert { background-color: #fef2f2; color: #dc2626; font-weight: bold; border: 1px solid #dc2626; }
-        .cell-shear { background-color: #fae8ff; color: #86198f; font-weight: bold; }
-        
-        /* Heatmap probabilities */
-        .ltg-none { background-color: #ffffff; color: #cbd5e1; }
-        .ltg-vlow { background-color: #fef9c3; color: #713f12; }
-        .ltg-low { background-color: #fef08a; color: #854d0e; }
-        .ltg-med { background-color: #fed7aa; color: #9a3412; font-weight: bold; }
-        .ltg-high { background-color: #fca5a5; color: #991b1b; font-weight: bold; }
-
-        #hover-popup-card { position: absolute; z-index: 500; background: #ffffff; color: #1e293b; border: 2px solid #3b82f6; border-radius: 6px; padding: 12px; width: 280px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none; pointer-events: none; font-size: 0.8rem; line-height: 1.4; }
+        .explanation-box { margin-top: 15px; padding-top: 10px; border-top: 1px dashed #cbd5e1; font-size: 0.78rem; line-height: 1.4; color: #475569; }
+        .explanation-box strong { color: #1e293b; }
+        #hover-popup-card { position: absolute; z-index: 500; background: #ffffff; color: #1e293b; border: 2px solid #3b82f6; border-radius: 6px; padding: 12px; width: 310px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none; pointer-events: none; font-size: 0.8rem; line-height: 1.4; }
         .popup-header { font-weight: bold; border-bottom: 1px solid #e2e8f0; margin-bottom: 6px; padding-bottom: 4px; color: #2563eb; text-transform: uppercase; }
         .status-banner { font-weight: bold; font-size: 0.9rem; color: #1e3a8a; margin-bottom: 12px; text-transform: uppercase; background: #dbeafe; padding: 6px; border-radius: 4px; text-align: center; }
+        
+        /* HREF Popup Table Grid */
+        .href-popup-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.75rem; text-align: center; }
+        .href-popup-table th { background: #475569; color: white; padding: 3px; border: 1px solid #cbd5e1; font-size: 0.72rem; position: static; }
+        .href-popup-table td { padding: 4px; border: 1px solid #cbd5e1; font-family: monospace; background: #f8fafc; color: #0f172a; }
     </style>
 </head>
 <body>
-
     <div class="control-bar">
         <div class="nav-links">
             <span>Aviation:</span>
@@ -58,7 +44,7 @@
             <a onmouseover="updateMetric('ceiling')" id="nav-ceiling">Ceilings</a>
             <a onmouseover="updateMetric('vis')" id="nav-vis">Visibility</a>
             <a onmouseover="updateMetric('shear')" id="nav-shear">Wind Shear</a>
-            | <span>Launch Variables (kft):</span>
+            | <span>Isotherms & Clouds (kft):</span>
             <a onmouseover="updateMetric('hght_0c')" id="nav-hght_0c">0°C Height</a>
             <a onmouseover="updateMetric('hght_5c')" id="nav-hght_5c">-5°C Height</a>
             <a onmouseover="updateMetric('hght_10c')" id="nav-hght_10c">-10°C Height</a>
@@ -77,14 +63,11 @@
             </select>
         </div>
     </div>
-
     <div class="dprog-bar">
         <span class="dprog-title">dprog/dt Timeline:</span>
         <div id="run-selector-container"></div>
     </div>
-
     <div class="status-banner" id="view-title">Loading Matrix Engine...</div>
-
     <div class="main-layout">
         <div id="hover-popup-card"></div>
         <div class="table-container">
@@ -95,248 +78,300 @@
                         <th>GFS</th>
                         <th>RAP</th>
                         <th>HRRR</th>
-                        <th style="width: 110px; background:#475569; color:white; border-left: 2px solid #cbd5e1 !important;">HREF LTG</th>
                     </tr>
                 </thead>
                 <tbody id="matrix-body"></tbody>
             </table>
         </div>
-        
-        <div class="side-panel">
-            <div class="legend-title">Matrix Threshold Criteria</div>
-            
-            <div class="legend-section-title">Aviation Rules</div>
-            <div class="legend-item cell-vfr"><span>VFR Status</span><span>&gt; 3000 ft / 5 sm</span></div>
-            <div class="legend-item cell-mvfr"><span>MVFR Alert</span><span>1000-3000 ft</span></div>
-            <div class="legend-item cell-ifr"><span>IFR Restriction</span><span>500-1000 ft</span></div>
-            <div class="legend-item cell-lifr"><span>LIFR Critical</span><span>&lt; 500 ft</span></div>
-            <div class="legend-item cell-alert"><span>High Wind Threshold</span><span>Dangerous Max/Mean</span></div>
-            <div class="legend-item cell-shear"><span>Wind Shear Alert</span><span>Turbulence Profile</span></div>
-            
-            <div class="legend-section-title">HREF Probability (Exceedance)</div>
-            <div class="legend-item ltg-vlow"><span>Very Low Prob</span><span>&gt; 0% Strikes</span></div>
-            <div class="legend-item ltg-low"><span>Low Probability</span><span>&gt; 5% Strikes</span></div>
-            <div class="legend-item ltg-med"><span>Medium Probability</span><span>&gt; 15% Strikes</span></div>
-            <div class="legend-item ltg-high"><span>High Probability</span><span>&gt; 30% Strikes</span></div>
-        </div>
+        <div class="side-panel" id="dynamic-legend-panel"></div>
     </div>
-
     <script>
         let historyRuns = [];
         let activeRunIdx = 0;
-        let activeMetric = 'mom_mean';
-        let activeStn = 'kxmr';
-        const popupCard = document.getElementById("hover-popup-card");
+        let activeStn = "kxmr";
+        let activeMetric = "mom_mean";
 
-        async function initDashboard() {
-            try {
-                const r = await fetch("history.json?t=" + new Date().getTime());
-                historyRuns = await r.json();
-                buildTimelineNav();
-                loadRunIndex(0);
-            } catch(e) {
-                document.getElementById("view-title").innerText = "Error loading history.json pipeline";
-                console.error(e);
-            }
-        }
+        const aviationMetrics = ['mom_mean', 'mom_max', 'ceiling', 'vis', 'shear'];
+        const launchMetrics = ['hght_0c', 'hght_5c', 'hght_10c', 'hght_20c', 'cloud_top', 'cloud_thick'];
 
-        function buildTimelineNav() {
+        fetch('history.json')
+            .then(res => res.json())
+            .then(data => {
+                historyRuns = data;
+                activeRunIdx = data.length - 1; 
+                initTimelineControls();
+                renderMatrix();
+            }).catch(e => console.error("Error standardizing dashboard json mapping:", e));
+
+        function initTimelineControls() {
             const container = document.getElementById("run-selector-container");
             container.innerHTML = "";
             historyRuns.forEach((run, idx) => {
-                const btn = document.createElement("a");
-                btn.className = `dprog-btn ${idx === activeRunIdx ? 'active' : ''}`;
-                btn.innerText = run.timestamp;
-                btn.onclick = () => loadRunIndex(idx);
+                const btn = document.createElement("button");
+                btn.innerText = run.timestamp.replace(" UTC", "");
+                btn.style.cssText = "padding:3px 6px; margin:0 3px; font-size:0.78rem; border:1px solid #cbd5e1; border-radius:3px; background:white; cursor:pointer;";
+                if(idx === activeRunIdx) {
+                    btn.style.background = "#475569";
+                    btn.style.color = "white";
+                    btn.style.fontWeight = "bold";
+                }
+                btn.onclick = () => { activeRunIdx = idx; initTimelineControls(); renderMatrix(); };
                 container.appendChild(btn);
             });
         }
 
-        function loadRunIndex(idx) {
-            activeRunIdx = idx;
-            buildTimelineNav();
-            renderMatrix();
-        }
-
-        function updateMetric(metricKey) {
-            activeMetric = metricKey;
-            document.querySelectorAll(".nav-links a").forEach(el => el.classList.remove("active"));
-            const targetNav = document.getElementById(`nav-${metricKey}`);
+        function updateMetric(metric) {
+            activeMetric = metric;
+            document.querySelectorAll(".nav-links a").forEach(a => a.classList.remove("active"));
+            const targetNav = document.getElementById("nav-" + metric);
             if (targetNav) targetNav.classList.add("active");
             renderMatrix();
         }
 
-        function getCellProperties(metric, val) {
-            if (val === null || val === undefined) return { txt: "-", cls: "" };
-            let txt = typeof val === "number" ? val.toFixed(1) : val;
-
-            if (metric === 'mom_mean') {
-                if (val >= 25) return { txt: txt + " kt", cls: "cell-alert" };
-                if (val >= 15) return { txt: txt + " kt", cls: "cell-mvfr" };
-                return { txt: txt + " kt", cls: "cell-vfr" };
-            }
-            if (metric === 'mom_max') {
-                if (val >= 35) return { txt: txt + " kt", cls: "cell-alert" };
-                if (val >= 25) return { txt: txt + " kt", cls: "cell-ifr" };
-                return { txt: txt + " kt", cls: "cell-vfr" };
+        function getThresholdStyles(metric, val) {
+            if (val === null || val === undefined) return { bg: "#f1f5f9", text: "#94a3b8", label: "-" };
+            
+            if (metric === 'mom_mean' || metric === 'mom_max') {
+                if (val >= 20) return { bg: "#fee2e2", text: "#991b1b", label: val.toFixed(1) + " kt" };
+                if (val >= 15) return { bg: "#fef3c7", text: "#92400e", label: val.toFixed(1) + " kt" };
+                return { bg: "#dcfce7", text: "#166534", label: val.toFixed(1) + " kt" };
             }
             if (metric === 'ceiling') {
-                if (val >= 23000) return { txt: "CLR", cls: "cell-vfr" };
-                if (val < 500) return { txt: Math.round(val) + " ft", cls: "cell-lifr" };
-                if (val < 1000) return { txt: Math.round(val) + " ft", cls: "cell-ifr" };
-                if (val <= 3000) return { txt: Math.round(val) + " ft", cls: "cell-mvfr" };
-                return { txt: Math.round(val) + " ft", cls: "cell-vfr" };
+                if (val < 1000) return { bg: "#fee2e2", text: "#991b1b", label: Math.round(val) + " ft" };
+                if (val < 3000) return { bg: "#fef3c7", text: "#92400e", label: Math.round(val) + " ft" };
+                return { bg: "#dcfce7", text: "#166534", label: val >= 23000 ? "Clear" : Math.round(val) + " ft" };
             }
             if (metric === 'vis') {
-                if (val < 1) return { txt: txt + " sm", cls: "cell-lifr" };
-                if (val < 3) return { txt: txt + " sm", cls: "cell-ifr" };
-                if (val <= 5) return { txt: txt + " sm", cls: "cell-mvfr" };
-                return { txt: txt + " sm", cls: "cell-vfr" };
+                if (val < 3) return { bg: "#fee2e2", text: "#991b1b", label: val.toFixed(1) + " sm" };
+                if (val < 5) return { bg: "#fef3c7", text: "#92400e", label: val.toFixed(1) + " sm" };
+                return { bg: "#dcfce7", text: "#166534", label: val.toFixed(1) + " sm" };
             }
             if (metric === 'shear') {
-                return val ? { txt: "WSHEAR", cls: "cell-shear" } : { txt: "None", cls: "cell-vfr" };
+                if (val && val !== "None" && val !== "None Detected") return { bg: "#fee2e2", text: "#991b1b", label: "WS" };
+                return { bg: "#dcfce7", text: "#166534", label: "None" };
             }
-            return { txt: txt + " kft", cls: "cell-vfr" };
+            return { bg: "#f8fafc", text: "#1e293b", label: val.toFixed(1) + " kft" };
         }
 
         function renderMatrix() {
             if (!historyRuns.length) return;
-            const cycle = historyRuns[activeRunIdx];
-            const stn = activeStn.toLowerCase();
-            const body = document.getElementById("matrix-body");
+            const currentRun = historyRuns[activeRunIdx];
+            const lowerStn = activeStn.toLowerCase();
+            const upperStn = activeStn.toUpperCase();
+            const stationData = currentRun.data[lowerStn] || currentRun.data[upperStn] || {};
             
-            document.getElementById("view-title").innerText = `${activeMetric.replace('_',' ').toUpperCase()} Matrix | Target: ${stn.toUpperCase()}`;
-            body.innerHTML = "";
+            const titleBox = document.getElementById("view-title");
+            titleBox.innerText = `${activeStn.toUpperCase()} Grid Strategy • Initialization: ${currentRun.timestamp}`;
+
+            renderLegendPanel();
 
             const models = ["gfs", "rap", "hrrr"];
-            let timeSet = new Set();
-
-            // Case-insensitive lookup for initialization
+            const allHours = new Set();
             models.forEach(m => {
-                let stnData = cycle.data[stn] || cycle.data[stn.toUpperCase()];
-                if (stnData) {
-                    let modelData = stnData[m] || stnData[m.toUpperCase()];
-                    if (modelData) {
-                        Object.keys(modelData).forEach(t => timeSet.add(t));
-                    }
-                }
+                let mData = stationData[m] || stationData[m.toUpperCase()];
+                if (mData) Object.keys(mData).forEach(h => allHours.add(h));
             });
-
-            let sortedTimes = Array.from(timeSet).sort((a, b) => {
-                const [dayA, hourA] = a.split('/').map(Number);
-                const [dayB, hourB] = b.split('/').map(Number);
-                
-                let finalDayA = dayA;
-                let finalDayB = dayB;
-                
-                if (Math.abs(dayA - dayB) > 15) {
-                    if (dayA < dayB) finalDayA += 32;
+            
+            // Month boundary chronological timeline sort
+            const sortedHours = Array.from(allHours).sort((a, b) => {
+                const [dA, hA] = a.split('/').map(Number);
+                const [dB, hB] = b.split('/').map(Number);
+                let finalDayA = dA, finalDayB = dB;
+                if (Math.abs(dA - dB) > 15) {
+                    if (dA < dB) finalDayA += 32;
                     else finalDayB += 32;
                 }
-
                 if (finalDayA !== finalDayB) return finalDayA - finalDayB;
-                return hourA - hourB;
+                return hA - hB;
             });
 
-            sortedTimes.forEach(timeKey => {
+            const tbody = document.getElementById("matrix-body");
+            tbody.innerHTML = "";
+
+            sortedHours.forEach(hr => {
                 const tr = document.createElement("tr");
-                tr.innerHTML = `<td class="time-col">${timeKey}Z</td>`;
+                
+                const tdTime = document.createElement("td");
+                tdTime.className = "time-col";
+                tdTime.innerText = hr + "Z";
+                tr.appendChild(tdTime);
 
                 models.forEach(m => {
-                    let stnData = cycle.data[stn] || cycle.data[stn.toUpperCase()];
-                    let modelData = stnData ? (stnData[m] || stnData[m.toUpperCase()]) : null;
-                    const profile = modelData ? modelData[timeKey] : null;
-
-                    if (!profile) {
-                        tr.innerHTML += `<td>-</td>`;
-                        return;
-                    }
-
-                    let val = profile[activeMetric];
-                    let props = getCellProperties(activeMetric, val);
-                    let cellId = `c_${stn}_${m}_${timeKey.replace('/','_')}`;
+                    const td = document.createElement("td");
+                    let mData = stationData[m] || stationData[m.toUpperCase()];
+                    const modelData = mData ? mData[hr] : null;
+                    const val = modelData ? modelData[activeMetric] : null;
                     
-                    tr.innerHTML += `<td id="${cellId}" class="${props.cls}" style="cursor:help;">${props.txt}</td>`;
+                    const styling = getThresholdStyles(activeMetric, val);
+                    td.style.backgroundColor = styling.bg;
+                    td.style.color = styling.text;
+                    td.style.cursor = modelData ? "help" : "default";
+                    td.innerText = styling.label;
 
-                    setTimeout(() => {
-                        const cellEl = document.getElementById(cellId);
-                        if(cellEl) {
-                            cellEl.onmouseenter = (e) => showPopup(e, m, profile);
-                            cellEl.onmousemove = movePopup;
-                            cellEl.onmouseleave = hidePopup;
-                        }
-                    }, 0);
+                    if (modelData) {
+                        // Extract corresponding timeline flash tracks out from the root level structure safely
+                        let lightningRoot = currentRun.href_lightning || currentRun.data.href_lightning || currentRun.data.href || {};
+                        let ltgStation = lightningRoot[lowerStn] || lightningRoot[upperStn] || {};
+                        let hrLtg = ltgStation[hr] || null;
+
+                        td.onmouseenter = (e) => showHoverPopup(e, {
+                            model: m.toUpperCase(),
+                            hour: hr,
+                            metric: activeMetric,
+                            value: val,
+                            w_mean: modelData.mom_mean,
+                            w_max: modelData.mom_max,
+                            ceil: modelData.ceiling,
+                            visibility: modelData.vis,
+                            w_shear: modelData.shear,
+                            h0: modelData.hght_0c,
+                            h5: modelData.hght_5c,
+                            h10: modelData.hght_10c,
+                            h20: modelData.hght_20c,
+                            ctop: modelData.cloud_top,
+                            cthick: modelData.cloud_thick,
+                            href: hrLtg
+                        });
+                        td.onmousemove = moveHoverPopup;
+                        td.onmouseleave = hideHoverPopup;
+                    }
+                    tr.appendChild(td);
                 });
 
-                let ltgData = (cycle.href_lightning && (cycle.href_lightning[stn] || cycle.href_lightning[stn.toUpperCase()])) ? (cycle.href_lightning[stn] || cycle.href_lightning[stn.toUpperCase()])[timeKey] : null;
-                let p25 = ltgData ? (ltgData.p25 || 0) : 0;
-                
-                let ltgCls = "ltg-none";
-                if (p25 > 0) {
-                    if (p25 >= 30) ltgCls = "ltg-high";
-                    else if (p25 >= 15) ltgCls = "ltg-med";
-                    else if (p25 >= 5) ltgCls = "ltg-low";
-                    else ltgCls = "ltg-vlow";
-                }
-
-                let hrefCellId = `c_${stn}_href_${timeKey.replace('/','_')}`;
-                tr.innerHTML += `<td id="${hrefCellId}" class="href-col ${ltgCls}" style="cursor:help; border-left: 2px solid #cbd5e1 !important;">${p25}%</td>`;
-
-                setTimeout(() => {
-                    const hrefEl = document.getElementById(hrefCellId);
-                    if(hrefEl) {
-                        hrefEl.onmouseenter = (e) => showLtgPopup(e, ltgData);
-                        hrefEl.onmousemove = movePopup;
-                        hrefEl.onmouseleave = hidePopup;
-                    }
-                }, 0);
-
-                body.appendChild(tr);
+                tbody.appendChild(tr);
             });
         }
 
-        function showPopup(e, model, p) {
-            popupCard.innerHTML = `
-                <div class="popup-header">${model.toUpperCase()} Profile Diagnostics</div>
-                • Ceilings: <strong>${p.ceiling >= 23000 ? 'Clear' : p.ceiling + ' ft'}</strong><br>
-                • Visibility: <strong>${p.vis} sm</strong><br>
-                • Mean Boundary Wind: <strong>${p.mom_mean} kt</strong><br>
-                • Max Wind Speed: <strong>${p.mom_max} kt</strong><br>
-                • Wind Shear: <strong>${p.shear ? 'Low-Level Alert' : 'None'}</strong><br>
-                <div style="margin-top:6px; border-top:1px solid #cbd5e1; padding-top:4px; font-size:0.75rem;">
-                    0°C Height: ${p.hght_0c} kft | -10°C Height: ${p.hght_10c} kft<br>
-                    Cloud Top: ${p.cloud_top} kft | Thickness: ${p.cloud_thick} kft
-                </div>
-            `;
-            popupCard.style.display = "block";
-            movePopup(e);
-        }
-
-        function showLtgPopup(e, ltg) {
-            if (!ltg) {
-                popupCard.innerHTML = `<div class="popup-header">HREF Probability</div>No Strike Data Generated.`;
+        function renderLegendPanel() {
+            const panel = document.getElementById("dynamic-legend-panel");
+            if (aviationMetrics.includes(activeMetric)) {
+                panel.innerHTML = `
+                    <div class="legend-title">Aviation Matrix Thresholds</div>
+                    <div class="legend-item" style="background:#fee2e2; color:#991b1b; font-weight:bold;">
+                        <span>IFR / Extreme Risk</span>
+                        <span>Red Alert Threshold</span>
+                    </div>
+                    <div class="legend-item" style="background:#fef3c7; color:#92400e; font-weight:bold;">
+                        <span>MVFR / Moderate Alert</span>
+                        <span>Cautionary Profile</span>
+                    </div>
+                    <div class="legend-item" style="background:#dcfce7; color:#166534; font-weight:bold;">
+                        <span>VFR / Normal Ops</span>
+                        <span>Nominal Environment</span>
+                    </div>
+                    <div class="explanation-box">
+                        <strong>Aviation Parameter Definitions:</strong><br><br>
+                        • <strong>PBL Mom Mean:</strong> Average momentum transfer evaluated through the Planetary Boundary Layer (surface to 850 hPa).<br><br>
+                        • <strong>PBL Mom Max:</strong> Peak wind speed evaluated within the mixed boundary layer structure.<br><br>
+                        • <strong>Ceilings:</strong> Lowest saturated layer meeting broken/overcast criteria (&gt;50% cloud cover).<br><br>
+                        • <strong>Visibility:</strong> Horizontal surface visibility visibility constraints expressed in statute miles.
+                    </div>
+                `;
             } else {
-                popupCard.innerHTML = `
-                    <div class="popup-header">HREF Lightning Density</div>
-                    <strong>Exceedance Strike Thresholds:</strong><br>
-                    • Probability of ≥ 25 strikes: <strong>${ltg.p25 || 0}%</strong><br>
-                    • Probability of ≥ 50 strikes: <strong>${ltg.p50 || 0}%</strong><br>
-                    • Probability of ≥ 100 strikes: <strong>${ltg.p100 || 0}%</strong><br>
-                    • Probability of ≥ 200 strikes: <strong>${ltg.p200 || 0}%</strong>
+                panel.innerHTML = `
+                    <div class="legend-title">Thermodynamic & ML Risks</div>
+                    <div style="font-weight:bold; font-size:0.75rem; margin-bottom:4px; color:#475569; text-align:center;">Cloud Top Thermal Boundary Depth</div>
+                    <div class="legend-item" style="background:#ffedd5; color:#7c2d12; font-weight:bold;">
+                        <span>Penetrating 0°C</span>
+                        <span>Mixed Phase Zone</span>
+                    </div>
+                    <div class="legend-item" style="background:#fed7aa; color:#c2410c; font-weight:bold;">
+                        <span>Penetrating -5°C</span>
+                        <span>Glaciating Phase</span>
+                    </div>
+                    <div class="legend-item" style="background:#fdba74; color:#7c2d12; font-weight:bold;">
+                        <span>Penetrating -10°C</span>
+                        <span>Charge Separation Trigger</span>
+                    </div>
+                    <div class="legend-item" style="background:#f97316; color:#ffffff; font-weight:bold;">
+                        <span>Penetrating -20°C</span>
+                        <span>High Lightning Risk</span>
+                    </div>
+                    <div class="explanation-box">
+                        <strong>Launch Commit Criteria (LCC) Guides:</strong><br><br>
+                        • <strong>Isotherm Profiles:</strong> Evaluating heights (kft) of key charging zones (0°C to -20°C). Crucial for assessing triboelectric charging and natural triggering mechanisms.<br><br>
+                        • <strong>Highest Cloud Top:</strong> Monitored relative to environmental temperature barriers to ensure rocket flight paths do not interface with active cloud layer glaciation fields.<br><br>
+                        • <strong>Max Layer Thickness:</strong> Tracks depths of continuous cloud decks to ensure compliant launch corridor margins.
+                    </div>
                 `;
             }
+        }
+
+        const popupCard = document.getElementById("hover-popup-card");
+
+        function showHoverPopup(e, data) {
+            const isAviation = aviationMetrics.includes(data.metric);
+            let htmlContent = '';
+            
+            if (isAviation) {
+                // Completely streamlined context for Aviation variables
+                htmlContent = `
+                    <div class="popup-header">${data.model} Aviation Diagnostics</div>
+                    <strong>Flight Conditions Metrics:</strong><br>
+                    • PBL Wind Mean: <strong>${data.w_mean !== null ? data.w_mean.toFixed(1) + ' kt' : '-'}</strong><br>
+                    • PBL Wind Max: <strong>${data.w_max !== null ? data.w_max.toFixed(1) + ' kt' : '-'}</strong><br>
+                    • Lowest Ceiling: <strong>${data.ceil === null ? '-' : (data.ceil >= 23000 ? "Clear" : Math.round(data.ceil) + " ft")}</strong><br>
+                    • Visibility: <strong>${data.visibility !== null ? data.visibility.toFixed(1) + ' sm' : '-'}</strong><br>
+                    • Wind Shear: <strong>${data.w_shear && data.w_shear !== 'None' ? data.w_shear : "None Detected"}</strong>
+                `;
+            } else {
+                // Completely streamlined context for Launch variables + 4 Column grid
+                htmlContent = `
+                    <div class="popup-header">${data.model} Thermodynamic Heights</div>
+                    <strong>Freezing & Charging Isotherms:</strong><br>
+                    • 0°C Level: <strong>${data.h0 !== null ? data.h0.toFixed(1) + ' kft' : '-'}</strong><br>
+                    • -5°C Level: <strong>${data.h5 !== null ? data.h5.toFixed(1) + ' kft' : '-'}</strong><br>
+                    • -10°C Level: <strong>${data.h10 !== null ? data.h10.toFixed(1) + ' kft' : '-'}</strong><br>
+                    • -20°C Level: <strong>${data.h20 !== null ? data.h20.toFixed(1) + ' kft' : '-'}</strong>
+                    <div style="margin-top:6px; border-top:1px solid #e2e8f0; padding-top:4px;">
+                        • Highest Cloud Top: <strong>${data.ctop !== null ? data.ctop.toFixed(1) + ' kft' : '-'}</strong><br>
+                        • Max Layer Thickness: <strong>${data.cthick !== null ? data.cthick.toFixed(1) + ' kft' : '-'}</strong>
+                    </div>
+                    <div style="margin-top:8px; border-top:2px dashed #cbd5e1; padding-top:6px;">
+                        <span style="font-weight:bold; color:#475569; font-size:0.75rem; text-transform:uppercase;">HREF Lightning Probabilities:</span>
+                `;
+                
+                if (data.href) {
+                    // Check if percentages are raw ints or fractions from backend arrays
+                    let formatPct = (v) => v !== undefined ? (v <= 1.0 && v > 0 ? Math.round(v * 100) : v) + '%' : '0%';
+                    htmlContent += `
+                        <table class="href-popup-table">
+                            <thead>
+                                <tr>
+                                    <th>≥25 fl</th>
+                                    <th>≥50 fl</th>
+                                    <th>≥100 fl</th>
+                                    <th>≥200 fl</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>${formatPct(data.href.p25)}</td>
+                                    <td>${formatPct(data.href.p50)}</td>
+                                    <td>${formatPct(data.href.p100)}</td>
+                                    <td>${formatPct(data.href.p200)}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    `;
+                } else {
+                    htmlContent += `<br><span style="color:#94a3b8; font-style:italic; font-size:0.72rem;">No HREF probabilistic grid data available</span>`;
+                }
+                htmlContent += `</div>`;
+            }
+
+            popupCard.innerHTML = htmlContent;
             popupCard.style.display = "block";
-            movePopup(e);
         }
 
-        function movePopup(e) {
-            popupCard.style.left = (e.pageX + 15) + "px";
-            popupCard.style.top = (e.pageY - 40) + "px";
+        function moveHoverPopup(e) { 
+            popupCard.style.left = (e.pageX + 15) + "px"; 
+            popupCard.style.top = (e.pageY - 40) + "px"; 
         }
-
-        function hidePopup() { popupCard.style.display = "none"; }
-
-        window.onload = initDashboard;
+        
+        function hideHoverPopup() { 
+            popupCard.style.display = "none"; 
+        }
     </script>
 </body>
 </html>
