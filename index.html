@@ -153,6 +153,7 @@
         let historyRuns = [];
         let activeRunIdx = 0;
         let hrefMapsLatest = null;
+        let hrefBlankMap = null;
         let activeMetric = 'mom_mean';
         let activeStn = 'kxmr';
         const popupCard = document.getElementById("hover-popup-card");
@@ -170,6 +171,7 @@
                 const payload = await r.json();
                 historyRuns = payload.runs || payload; // tolerate legacy flat-array format
                 hrefMapsLatest = (payload.href_maps_latest && payload.href_maps_latest.href_maps) || null;
+                hrefBlankMap = (payload.href_maps_latest && payload.href_maps_latest.blank_map) || null;
                 buildTimelineNav();
                 loadRunIndex(0); // index 0 is always the most recent run
             } catch(e) {
@@ -455,7 +457,7 @@
 
             const grid = document.getElementById("href-slider-grid");
             grid.innerHTML = thresholds.map(([key, label, pct]) => {
-                const src = mapsData ? mapsData[key] : null;
+                const src = (mapsData && mapsData[key]) ? mapsData[key] : hrefBlankMap;
                 const body = src
                     ? `<img src="${src}" alt="${label} spatial plot" />`
                     : `<div class="href-slider-cell-empty">No spatial data<br>for this hour</div>`;
@@ -614,15 +616,12 @@
             `;
 
             let mapHtml;
-            if (maps && (maps.p25 || maps.p50 || maps.p100 || maps.p200)) {
-                const thresholds = [['p25', '≥25 fl'], ['p50', '≥50 fl'], ['p100', '≥100 fl'], ['p200', '≥200 fl']];
-                mapHtml = `<div class="ltg-map-grid">` + thresholds.map(([key, label]) => {
-                    if (!maps[key]) return `<div class="ltg-map-cell ltg-map-empty">${label}<br>No Data</div>`;
-                    return `<div class="ltg-map-cell"><img src="${maps[key]}" alt="${label} spatial plot" /></div>`;
-                }).join('') + `</div>`;
-            } else {
-                mapHtml = `<div class="ltg-map-empty-full">No spatial domain data available for ${timeKey || 'this'}Z.</div>`;
-            }
+            const thresholds = [['p25', '≥25 fl'], ['p50', '≥50 fl'], ['p100', '≥100 fl'], ['p200', '≥200 fl']];
+            mapHtml = `<div class="ltg-map-grid">` + thresholds.map(([key, label]) => {
+                const src = (maps && maps[key]) ? maps[key] : hrefBlankMap;
+                if (!src) return `<div class="ltg-map-cell ltg-map-empty">${label}<br>No Data</div>`;
+                return `<div class="ltg-map-cell"><img src="${src}" alt="${label} spatial plot" /></div>`;
+            }).join('') + `</div>`;
 
             popupCard.classList.add("popup-wide");
             popupCard.innerHTML = `
