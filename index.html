@@ -36,6 +36,11 @@
         .cell-ifr { background-color: #fef2f2; color: #991b1b; font-weight: bold; }
         .cell-lifr { background-color: #ffa6a6; color: #7f0000; font-weight: bold; }
         .cell-alert { background-color: #fef2f2; color: #dc2626; font-weight: bold; border: 1px solid #dc2626; }
+
+        /* Max Momentum Layer Wind Color Hierarchy (distinct from ceiling/vis IFR tiers) */
+        .cell-mom-20 { background-color: #ffedd5; color: #9a3412; font-weight: bold; }
+        .cell-mom-30 { background-color: #fdba74; color: #7c2d12; font-weight: bold; }
+        .cell-mom-40 { background-color: #c2410c; color: #ffffff; font-weight: bold; }
         
         /* 0-6 km Bulk Shear Color Hierarchy */
         .cell-shear-25 { background-color: #fae8ff; color: #a21caf; font-weight: bold; }
@@ -50,6 +55,12 @@
         .ltg-high { background-color: #fca5a5; color: #991b1b; }
 
         #hover-popup-card { position: absolute; z-index: 500; background: #ffffff; color: #1e293b; border: 2px solid #3b82f6; border-radius: 6px; padding: 12px; width: 310px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none; pointer-events: none; font-size: 0.8rem; line-height: 1.4; }
+        #hover-popup-card.popup-wide { width: 540px; }
+        .ltg-map-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
+        .ltg-map-cell { border: 1px solid #e2e8f0; border-radius: 4px; overflow: hidden; background: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 80px; }
+        .ltg-map-cell img { width: 100%; height: auto; display: block; }
+        .ltg-map-empty { color: #94a3b8; font-size: 0.7rem; text-align: center; font-weight: bold; }
+        .ltg-map-empty-full { margin-top: 10px; padding: 14px; text-align: center; color: #94a3b8; font-size: 0.75rem; border: 1px dashed #cbd5e1; border-radius: 4px; }
         .popup-header { font-weight: bold; border-bottom: 1px solid #e2e8f0; margin-bottom: 6px; padding-bottom: 4px; color: #2563eb; text-transform: uppercase; }
         .status-banner { font-weight: bold; font-size: 0.9rem; color: #1e3a8a; margin-bottom: 12px; text-transform: uppercase; background: #dbeafe; padding: 6px; border-radius: 4px; text-align: center; }
         
@@ -58,6 +69,18 @@
         .href-popup-table td { padding: 5px; border: 1px solid #cbd5e1; font-weight: bold; background: #f8fafc; color: #0f172a; }
         .dprog-btn { margin: 0 3px; text-decoration: none; color: #2563eb; padding: 2px 5px; border-radius: 3px; cursor: pointer; font-size: 0.8rem; border: 1px solid #cbd5e1; background: white; }
         .dprog-btn.active { color: white; background: #475569; font-weight: bold; }
+
+        .href-slider-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 14px; margin-bottom: 12px; }
+        .href-slider-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .href-slider-title { font-weight: bold; color: #1e293b; font-size: 0.9rem; }
+        .href-slider-time { font-weight: bold; color: #2563eb; background: #dbeafe; padding: 3px 10px; border-radius: 4px; font-size: 0.85rem; }
+        #href-slider-input { width: 100%; margin: 6px 0 10px 0; cursor: pointer; }
+        .href-slider-controls { display: flex; justify-content: center; gap: 8px; margin-bottom: 12px; }
+        .href-slider-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+        .href-slider-cell { border: 1px solid #cbd5e1; border-radius: 4px; background: white; overflow: hidden; text-align: center; padding-bottom: 6px; }
+        .href-slider-cell img { width: 100%; height: auto; display: block; }
+        .href-slider-cell-label { font-size: 0.75rem; font-weight: bold; color: #475569; padding: 6px 0 2px 0; }
+        .href-slider-cell-empty { padding: 40px 10px; color: #94a3b8; font-size: 0.8rem; }
     </style>
 </head>
 <body>
@@ -77,6 +100,7 @@
             <a onmouseover="updateMetric('hght_20c')" id="nav-hght_20c">-20°C Height</a>
             <a onmouseover="updateMetric('cloud_top')" id="nav-cloud_top">Highest Cloud Top</a>
             <a onmouseover="updateMetric('cloud_thick')" id="nav-cloud_thick">Max Layer Thickness</a>
+            <a onmouseover="updateMetric('href_density')" id="nav-href_density">HREF Density Map</a>
         </div>
         <div class="station-selector">
             <label for="stn-dropdown">Station:</label>
@@ -96,6 +120,20 @@
     </div>
 
     <div class="status-banner" id="view-title">Loading Matrix Engine...</div>
+
+    <div class="href-slider-panel" id="href-slider-panel" style="display:none;">
+        <div class="href-slider-header">
+            <span class="href-slider-title">HREF Lightning Density — Florida Domain</span>
+            <span class="href-slider-time" id="href-slider-time">--/--Z</span>
+        </div>
+        <input type="range" id="href-slider-input" min="0" max="0" value="0" step="1" oninput="updateHrefSliderFrame(this.value)">
+        <div class="href-slider-controls">
+            <button class="dprog-btn" onclick="stepHrefSlider(-1)">&laquo; Prev Hour</button>
+            <button class="dprog-btn" onclick="toggleHrefPlay()" id="href-play-btn">&#9654; Play</button>
+            <button class="dprog-btn" onclick="stepHrefSlider(1)">Next Hour &raquo;</button>
+        </div>
+        <div class="href-slider-grid" id="href-slider-grid"></div>
+    </div>
 
     <div class="main-layout">
         <div id="hover-popup-card"></div>
@@ -119,7 +157,11 @@
         const popupCard = document.getElementById("hover-popup-card");
 
         const aviationMetrics = ['mom_mean', 'mom_max', 'ceiling', 'vis', 'shear'];
-        const launchMetrics = ['hght_0c', 'hght_5c', 'hght_10c', 'hght_20c', 'cloud_top', 'cloud_thick'];
+        const launchMetrics = ['hght_0c', 'hght_5c', 'hght_10c', 'hght_20c', 'cloud_top', 'cloud_thick', 'href_density'];
+
+        let hrefSliderTimes = [];
+        let hrefSliderIdx = 0;
+        let hrefPlayTimer = null;
 
         async function initDashboard() {
             try {
@@ -169,8 +211,9 @@
                 return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-vfr" };
             }
             if (metric === 'mom_max') {
-                if (val >= 30) return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-alert" };
-                if (val >= 20) return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-ifr" };
+                if (val >= 40) return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-mom-40" };
+                if (val >= 30) return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-mom-30" };
+                if (val >= 20) return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-mom-20" };
                 return { txt: typeof val === "number" ? val.toFixed(0) + " kt" : val, cls: "cell-vfr" };
             }
             if (metric === 'ceiling') {
@@ -194,6 +237,20 @@
                 if (numVal >= 30) return { txt: displayTxt, cls: "cell-shear-30" };
                 if (numVal >= 25) return { txt: displayTxt, cls: "cell-shear-25" };
                 return { txt: displayTxt, cls: "cell-vfr" };
+            }
+
+            if (metric === 'href_density') {
+                let p25 = val;
+                if (p25 === undefined || p25 === null) return { txt: "0%", cls: "ltg-none" };
+                if (p25 <= 1.0 && p25 > 0) p25 = Math.round(p25 * 100);
+                let cls = "ltg-none";
+                if (p25 > 0) {
+                    if (p25 >= 30) cls = "ltg-high";
+                    else if (p25 >= 15) cls = "ltg-med";
+                    else if (p25 >= 5) cls = "ltg-low";
+                    else cls = "ltg-vlow";
+                }
+                return { txt: Math.round(p25) + "%", cls: cls };
             }
 
             // Cloud Top evaluation against thermodynamic levels
@@ -272,13 +329,50 @@
                 return hourA - hourB;
             });
 
+            const sliderPanel = document.getElementById("href-slider-panel");
+            if (activeMetric === 'href_density') {
+                sliderPanel.style.display = "block";
+                hrefSliderTimes = sortedTimes;
+                if (hrefSliderIdx >= hrefSliderTimes.length) hrefSliderIdx = 0;
+                const sliderInput = document.getElementById("href-slider-input");
+                sliderInput.max = Math.max(0, hrefSliderTimes.length - 1);
+                sliderInput.value = hrefSliderIdx;
+                renderHrefSliderFrame(hrefSliderIdx);
+            } else {
+                sliderPanel.style.display = "none";
+                stopHrefPlay();
+            }
+
             sortedTimes.forEach(timeKey => {
                 const tr = document.createElement("tr");
                 tr.innerHTML = `<td class="time-col">${timeKey}Z</td>`;
 
+                let ltgRoot = cycle.href_lightning || cycle.data.href_lightning || cycle.data.href || {};
+                let ltgStation = ltgRoot[lowerStn] || ltgRoot[upperStn] || {};
+                let ltgData = ltgStation[timeKey] || null;
+                let mapsRoot = cycle.href_maps || {};
+                let mapsData = mapsRoot[timeKey] || null;
+
                 models.forEach(m => {
                     let mData = stationData[m] || stationData[m.toUpperCase()];
                     const profile = mData ? mData[timeKey] : null;
+
+                    if (activeMetric === 'href_density') {
+                        let val = ltgData ? ltgData.p25 : 0;
+                        let props = getCellProperties('href_density', val, null);
+                        let cellId = `c_${lowerStn}_${m}_${timeKey.replace('/','_')}`;
+                        tr.innerHTML += `<td id="${cellId}" class="${props.cls}" style="cursor:help;">${props.txt}</td>`;
+
+                        setTimeout(() => {
+                            const cellEl = document.getElementById(cellId);
+                            if (cellEl) {
+                                cellEl.onmouseenter = (e) => showLtgMapPopup(e, ltgData, mapsData, timeKey);
+                                cellEl.onmousemove = movePopup;
+                                cellEl.onmouseleave = hidePopup;
+                            }
+                        }, 0);
+                        return;
+                    }
 
                     if (!profile) {
                         tr.innerHTML += `<td>-</td>`;
@@ -302,10 +396,6 @@
                 });
 
                 if (isLaunchMode) {
-                    let ltgRoot = cycle.href_lightning || cycle.data.href_lightning || cycle.data.href || {};
-                    let ltgStation = ltgRoot[lowerStn] || ltgRoot[upperStn] || {};
-                    let ltgData = ltgStation[timeKey] || null;
-                    
                     let p25 = ltgData ? (ltgData.p25 || 0) : 0;
                     if (p25 <= 1.0 && p25 > 0) p25 = Math.round(p25 * 100);
 
@@ -323,7 +413,7 @@
                     setTimeout(() => {
                         const hrefEl = document.getElementById(hrefCellId);
                         if(hrefEl) {
-                            hrefEl.onmouseenter = (e) => showLtgPopup(e, ltgData);
+                            hrefEl.onmouseenter = (e) => showLtgMapPopup(e, ltgData, mapsData, timeKey);
                             hrefEl.onmousemove = movePopup;
                             hrefEl.onmouseleave = hidePopup;
                         }
@@ -332,6 +422,74 @@
 
                 body.appendChild(tr);
             });
+        }
+
+        function renderHrefSliderFrame(idx) {
+            if (!hrefSliderTimes.length) return;
+            idx = Math.max(0, Math.min(idx, hrefSliderTimes.length - 1));
+            hrefSliderIdx = idx;
+            const timeKey = hrefSliderTimes[idx];
+
+            const cycle = historyRuns[activeRunIdx];
+            const lowerStn = activeStn.toLowerCase();
+            const upperStn = activeStn.toUpperCase();
+            let ltgRoot = cycle.href_lightning || cycle.data.href_lightning || cycle.data.href || {};
+            let ltgStation = ltgRoot[lowerStn] || ltgRoot[upperStn] || {};
+            let ltgData = ltgStation[timeKey] || null;
+            let mapsData = (cycle.href_maps || {})[timeKey] || null;
+
+            document.getElementById("href-slider-time").innerText = `${timeKey}Z`;
+            document.getElementById("href-slider-input").value = idx;
+
+            let formatPct = (v) => v !== undefined ? (v <= 1.0 && v > 0 ? Math.round(v * 100) : v) + '%' : '0%';
+            const thresholds = [
+                ['p25', '≥ 25 Flashes', ltgData ? formatPct(ltgData.p25) : '0%'],
+                ['p50', '≥ 50 Flashes', ltgData ? formatPct(ltgData.p50) : '0%'],
+                ['p100', '≥ 100 Flashes', ltgData ? formatPct(ltgData.p100) : '0%'],
+                ['p200', '≥ 200 Flashes', ltgData ? formatPct(ltgData.p200) : '0%'],
+            ];
+
+            const grid = document.getElementById("href-slider-grid");
+            grid.innerHTML = thresholds.map(([key, label, pct]) => {
+                const src = mapsData ? mapsData[key] : null;
+                const body = src
+                    ? `<img src="${src}" alt="${label} spatial plot" />`
+                    : `<div class="href-slider-cell-empty">No spatial data<br>for this hour</div>`;
+                return `<div class="href-slider-cell">${body}<div class="href-slider-cell-label">${label} &mdash; ${pct}</div></div>`;
+            }).join('');
+        }
+
+        function updateHrefSliderFrame(idx) {
+            renderHrefSliderFrame(parseInt(idx, 10));
+        }
+
+        function stepHrefSlider(delta) {
+            renderHrefSliderFrame(hrefSliderIdx + delta);
+        }
+
+        function toggleHrefPlay() {
+            const btn = document.getElementById("href-play-btn");
+            if (hrefPlayTimer) {
+                stopHrefPlay();
+                return;
+            }
+            btn.innerHTML = "&#10074;&#10074; Pause";
+            hrefPlayTimer = setInterval(() => {
+                if (hrefSliderIdx >= hrefSliderTimes.length - 1) {
+                    stopHrefPlay();
+                    return;
+                }
+                renderHrefSliderFrame(hrefSliderIdx + 1);
+            }, 1200);
+        }
+
+        function stopHrefPlay() {
+            if (hrefPlayTimer) {
+                clearInterval(hrefPlayTimer);
+                hrefPlayTimer = null;
+            }
+            const btn = document.getElementById("href-play-btn");
+            if (btn) btn.innerHTML = "&#9654; Play";
         }
 
         function renderLegendPanel() {
@@ -347,8 +505,14 @@
                     <div class="legend-item cell-ifr"><span>IFR Restriction</span><span>500-1000 ft / 1-3 sm</span></div>
                     <div class="legend-item cell-lifr"><span>LIFR Critical</span><span>&lt; 500 ft / &lt; 1 sm</span></div>
                     
-                    <div class="legend-section-title">Planetary Boundary Layer Wind</div>
+                    <div class="legend-section-title">Planetary Boundary Layer Wind (Mean)</div>
                     <div class="legend-item cell-alert"><span>Elevated Winds</span><span>&gt; 20 kt Kinematics</span></div>
+
+                    <div class="legend-section-title">Max Momentum Layer Wind (Peak)</div>
+                    <div class="legend-item cell-mom-20"><span>Elevated Peak</span><span>≥ 20 kt</span></div>
+                    <div class="legend-item cell-mom-30"><span>Strong Peak</span><span>≥ 30 kt</span></div>
+                    <div class="legend-item cell-mom-40"><span>Severe Peak</span><span>≥ 40 kt</span></div>
+
                     
                     <div class="legend-section-title">0-6 km Bulk Shear</div>
                     <div class="legend-item cell-shear-25"><span>Elevated Shear</span><span>≥ 25 kt Magnitude</span></div>
@@ -358,7 +522,7 @@
                     <div class="explanation-box">
                         <strong>Aviation Parameter Definitions:</strong><br><br>
                         • <strong>PBL Mom Mean:</strong> Average momentum transfer evaluated through the Planetary Boundary Layer.<br><br>
-                        • <strong>PBL Mom Max:</strong> Peak wind speed evaluated within the mixed boundary layer structure.<br><br>
+                        • <strong>PBL Mom Max:</strong> Peak wind speed evaluated within the mixed boundary layer structure (own amber/orange tiering, distinct from ceiling/visibility colors).<br><br>
                         • <strong>Ceilings:</strong> Lowest saturated layer meeting broken/overcast criteria (&gt;50% cloud cover).<br><br>
                         • <strong>Visibility:</strong> Horizontal surface restrictions expressed in statute miles.<br><br>
                         • <strong>0-6 km Bulk Shear:</strong> Deep-layer vertical speed/directional shear used to gauge convective organization potential and localized turbulence profiles.
@@ -384,13 +548,15 @@
                         • <strong>HREF Lightning Density:</strong> Machine-learning calibrated probability utilizing a 4-hour rolling mean of ensemble proxy metrics (e.g., updraft helicity, graupel flux) to forecast grid-based strike exceedances.<br><br>
                         • <strong>Isotherm Profiles:</strong> Evaluating heights (kft) of key charging zones (0°C to -20°C). Crucial for assessing triboelectric charging and natural triggering mechanisms.<br><br>
                         • <strong>Highest Cloud Top:</strong> Monitored relative to environmental temperature barriers to ensure rocket flight paths do not interface with active cloud layer glaciation fields.<br><br>
-                        • <strong>Max Layer Thickness:</strong> Tracks depths of continuous cloud decks to ensure compliant launch corridor margins.
+                        • <strong>Max Layer Thickness:</strong> Tracks depths of continuous cloud decks to ensure compliant launch corridor margins.<br><br>
+                        • <strong>HREF Density Map:</strong> Hover any cell (or the HREF LTG column) to view live Florida-domain spatial plots of the HREF ensemble flash-density field for all four exceedance thresholds (≥25/50/100/200 flashes).
                     </div>
                 `;
             }
         }
 
         function showPopup(e, model, p) {
+            popupCard.classList.remove("popup-wide");
             const isAviation = aviationMetrics.includes(activeMetric);
             if (isAviation) {
                 let shearVal = parseFloat(p.shear);
@@ -418,11 +584,10 @@
             movePopup(e);
         }
 
-        function showLtgPopup(e, ltg) {
+        function showLtgMapPopup(e, ltg, maps, timeKey) {
             let formatPct = (v) => v !== undefined ? (v <= 1.0 && v > 0 ? Math.round(v * 100) : v) + '%' : '0%';
-            
-            popupCard.innerHTML = `
-                <div class="popup-header">HREF Lightning Density</div>
+
+            let tableHtml = `
                 <strong>Exceedance Strike Thresholds:</strong><br>
                 <table class="href-popup-table">
                     <thead>
@@ -442,6 +607,24 @@
                         </tr>
                     </tbody>
                 </table>
+            `;
+
+            let mapHtml;
+            if (maps && (maps.p25 || maps.p50 || maps.p100 || maps.p200)) {
+                const thresholds = [['p25', '≥25 fl'], ['p50', '≥50 fl'], ['p100', '≥100 fl'], ['p200', '≥200 fl']];
+                mapHtml = `<div class="ltg-map-grid">` + thresholds.map(([key, label]) => {
+                    if (!maps[key]) return `<div class="ltg-map-cell ltg-map-empty">${label}<br>No Data</div>`;
+                    return `<div class="ltg-map-cell"><img src="${maps[key]}" alt="${label} spatial plot" /></div>`;
+                }).join('') + `</div>`;
+            } else {
+                mapHtml = `<div class="ltg-map-empty-full">No spatial domain data available for ${timeKey || 'this'}Z.</div>`;
+            }
+
+            popupCard.classList.add("popup-wide");
+            popupCard.innerHTML = `
+                <div class="popup-header">HREF Lightning Density — FL Domain</div>
+                ${tableHtml}
+                ${mapHtml}
             `;
             popupCard.style.display = "block";
             movePopup(e);
