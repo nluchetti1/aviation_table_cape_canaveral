@@ -56,17 +56,16 @@ def purge_workspace(cache_dir=CACHE_DIR):
     return cache_dir
 
 
-def prune_stale_maps(history_runs, maps_dir=MAPS_DIR):
-    """Deletes spatial-map PNGs on disk that are no longer referenced by any of the
-    retained history_runs (keeps the maps/ folder from growing unbounded run-over-run)."""
+def prune_stale_maps(current_href_maps, maps_dir=MAPS_DIR):
+    """Deletes spatial-map PNGs on disk that aren't part of the current run's href_maps
+    (the maps/ folder only ever needs to hold the latest run's images)."""
     if not os.path.exists(maps_dir):
         return
 
     referenced = set()
-    for run in history_runs:
-        for row_maps in (run.get("href_maps") or {}).values():
-            for rel_path in (row_maps or {}).values():
-                referenced.add(os.path.basename(rel_path))
+    for row_maps in (current_href_maps or {}).values():
+        for rel_path in (row_maps or {}).values():
+            referenced.add(os.path.basename(rel_path))
 
     for f in os.listdir(maps_dir):
         if f not in referenced:
@@ -622,7 +621,9 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r") as f:
-                history_runs = json.load(f)
+                existing = json.load(f)
+            # Tolerate the legacy flat-array history.json format from before href_maps_latest existed.
+            history_runs = existing.get("runs", []) if isinstance(existing, dict) else existing
         except Exception:
             history_runs = []
 
@@ -630,17 +631,29 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     current_entry = {
         "timestamp": current_timestamp,
         "data": current_sounding_matrix,
+        # HREF lightning point/percentage data DOES participate in dprog/dt history.
         "href_lightning": href_lightning,
-        "href_maps": href_maps,
     }
 
     if not history_runs or history_runs[0]["timestamp"] != current_timestamp:
         history_runs.insert(0, current_entry)
     history_runs = history_runs[:5]
 
+    # The HREF spatial PNG maps are NOT part of dprog/dt history — they always reflect
+    # only the latest run and get fully overwritten (and pruned) each pipeline pass.
+    href_maps_latest = {
+        "timestamp": current_timestamp,
+        "href_maps": href_maps,
+    }
+
+    payload = {
+        "runs": history_runs,
+        "href_maps_latest": href_maps_latest,
+    }
+
     with open(HISTORY_FILE, "w") as f:
-        json.dump(history_runs, f, indent=2)
-    prune_stale_maps(history_runs)
+        json.dump(payload, f, indent=2)
+    prune_stale_maps(href_maps)
     logging.info("Dashboard matrix completely compiled and written to history.json.")
 
 
