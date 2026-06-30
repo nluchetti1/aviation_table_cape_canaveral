@@ -34,8 +34,8 @@ STN_COORDS = {
 THRESHOLD_MAP = {25: "p25", 50: "p50", 100: "p100", 200: "p200"}
 MSG_INDEX_THRESHOLDS = {1: "p25", 2: "p50", 3: "p100", 4: "p200"}
 
-# Bounding box used for the HREF lightning density spatial plots (covers peninsular FL)
-FL_DOMAIN = {"lat_min": 24.3, "lat_max": 31.2, "lon_min": -87.7, "lon_max": -79.5}
+# Bounding box — zoomed into the Space Coast launch corridor rather than all of FL
+FL_DOMAIN = {"lat_min": 25.5, "lat_max": 30.5, "lon_min": -83.5, "lon_max": -79.5}
 
 # Spatial plot PNGs are written here (relative path, served alongside index.html)
 MAPS_DIR = "./maps"
@@ -164,7 +164,7 @@ def generate_blank_basemap():
             scale="10m", facecolor="none"
         )
 
-        fig = plt.figure(figsize=(4.0, 4.2), dpi=100)
+        fig = plt.figure(figsize=(5.5, 5.8), dpi=120)
         ax = fig.add_subplot(1, 1, 1, projection=proj)
         ax.set_extent(
             [FL_DOMAIN["lon_min"], FL_DOMAIN["lon_max"], FL_DOMAIN["lat_min"], FL_DOMAIN["lat_max"]],
@@ -180,12 +180,18 @@ def generate_blank_basemap():
 
         for stn_id, coords in STN_COORDS.items():
             ax.plot(
-                coords["lon"], coords["lat"], marker="^", markersize=5,
-                color="#2563eb", markeredgecolor="white", markeredgewidth=0.6,
-                transform=proj, zorder=4
+                coords["lon"], coords["lat"], marker="^", markersize=6,
+                color="#2563eb", markeredgecolor="white", markeredgewidth=0.8,
+                transform=proj, zorder=5
+            )
+            ax.text(
+                coords["lon"] + 0.06, coords["lat"] + 0.05,
+                stn_id.upper(), fontsize=6, fontweight="bold", color="#1e3a5f",
+                transform=proj, zorder=6,
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.6, edgecolor="none")
             )
 
-        gl = ax.gridlines(draw_labels=False, linewidth=0.4, color="#94a3b8", alpha=0.5, linestyle="--")
+        ax.gridlines(draw_labels=False, linewidth=0.4, color="#94a3b8", alpha=0.5, linestyle="--")
         ax.set_title("No Active Signal", fontsize=9, fontweight="bold", color="#94a3b8")
 
         out_path = os.path.join(MAPS_DIR, "blank_basemap.png")
@@ -262,7 +268,7 @@ def generate_spatial_threshold_maps(filepath, file_prefix):
                 if vals.max() <= 1.0:
                     vals = vals * 100.0
 
-                fig = plt.figure(figsize=(4.0, 4.2), dpi=100)
+                fig = plt.figure(figsize=(5.5, 5.8), dpi=120)
                 ax = fig.add_subplot(1, 1, 1, projection=proj)
                 ax.set_extent(
                     [FL_DOMAIN["lon_min"], FL_DOMAIN["lon_max"], FL_DOMAIN["lat_min"], FL_DOMAIN["lat_max"]],
@@ -283,15 +289,21 @@ def generate_spatial_threshold_maps(filepath, file_prefix):
                     shading="auto", transform=proj, zorder=2, alpha=0.85
                 )
 
-                # Station markers for orientation
+                # Station markers + labels for quick orientation
                 for stn_id, coords in STN_COORDS.items():
                     ax.plot(
-                        coords["lon"], coords["lat"], marker="^", markersize=5,
-                        color="#2563eb", markeredgecolor="white", markeredgewidth=0.6,
-                        transform=proj, zorder=4
+                        coords["lon"], coords["lat"], marker="^", markersize=6,
+                        color="#2563eb", markeredgecolor="white", markeredgewidth=0.8,
+                        transform=proj, zorder=5
+                    )
+                    ax.text(
+                        coords["lon"] + 0.06, coords["lat"] + 0.05,
+                        stn_id.upper(), fontsize=6, fontweight="bold", color="#1e3a5f",
+                        transform=proj, zorder=6,
+                        bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.6, edgecolor="none")
                     )
 
-                gl = ax.gridlines(draw_labels=False, linewidth=0.4, color="#94a3b8", alpha=0.5, linestyle="--")
+                ax.gridlines(draw_labels=False, linewidth=0.4, color="#94a3b8", alpha=0.5, linestyle="--")
 
                 ax.set_title(f"HREF ≥ {thresh_key[1:]} Flash Density", fontsize=9, fontweight="bold", color="#1e293b")
                 cbar = fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.03)
@@ -408,29 +420,35 @@ def fetch_href_lightning(time_keys):
 
     cycle_init_utc = datetime.datetime.strptime(f"{active_date_str}{active_cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    # Build the full 1-48h valid-time list directly from the cycle init, independent of
+    # the sounding matrix time keys (which only cover what the models happen to provide).
+    # This guarantees HREF data always spans the full 48h window including tomorrow's
+    # diurnal maximum, not just whatever hours the soundings happened to cover.
+    all_href_time_keys = {}  # row_key -> f_hour_int
+    for f_hour_int in range(1, 49):
+        valid_dt = cycle_init_utc + datetime.timedelta(hours=f_hour_int)
+        row_key = f"{valid_dt.day}/{valid_dt.hour:02d}"
+        all_href_time_keys[row_key] = f_hour_int
+
+    # Also include any sounding-matrix time keys that fall inside the HREF window but
+    # may use a slightly different day/hour representation (e.g. near month boundaries).
+    for row_key in time_keys:
+        try:
+            d_part, h_part = map(int, row_key.split("/"))
+            valid_dt = cycle_init_utc.replace(day=d_part, hour=h_part, minute=0, second=0, microsecond=0)
+            if valid_dt < cycle_init_utc:
+                valid_dt += datetime.timedelta(days=28)
+                valid_dt = valid_dt.replace(day=d_part)
+            f_hour_int = int(round((valid_dt - cycle_init_utc).total_seconds() / 3600))
+            if 1 <= f_hour_int <= 48:
+                all_href_time_keys[row_key] = f_hour_int
+        except Exception:
+            continue
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
         futures_map = {}
         map_futures_map = {}
-        row_to_fhour = {}
-        for row_key in time_keys:
-            try:
-                d_part, h_part = map(int, row_key.split("/"))
-                valid_dt = cycle_init_utc.replace(day=d_part, hour=h_part, minute=0, second=0, microsecond=0)
-                
-                if valid_dt < cycle_init_utc:
-                    valid_dt += datetime.timedelta(days=28)
-                    valid_dt = valid_dt.replace(day=d_part)
-
-                f_hour_int = int(round((valid_dt - cycle_init_utc).total_seconds() / 3600))
-            except Exception:
-                continue
-
-            # Core HREF limit configuration
-            if f_hour_int < 1 or f_hour_int > 48:
-                continue
-
-            row_to_fhour[row_key] = f_hour_int
-
+        for row_key, f_hour_int in all_href_time_keys.items():
             for stn, coords in STN_COORDS.items():
                 future = executor.submit(
                     fetch_href_lightning_point,
