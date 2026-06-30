@@ -7,3 +7,4 @@ jinja2
 metpy
 dask
 pygrib
+cartopy
