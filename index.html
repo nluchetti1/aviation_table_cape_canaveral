@@ -76,7 +76,7 @@
         .href-slider-time { font-weight: bold; color: #2563eb; background: #dbeafe; padding: 3px 10px; border-radius: 4px; font-size: 0.85rem; }
         #href-slider-input { width: 100%; margin: 6px 0 10px 0; cursor: pointer; }
         .href-slider-controls { display: flex; justify-content: center; gap: 8px; margin-bottom: 12px; }
-        .href-slider-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 12px; max-width: 720px; margin: 0 auto; }
+        .href-slider-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 12px; max-width: 900px; margin: 0 auto; }
         .href-slider-cell { border: 1px solid #cbd5e1; border-radius: 4px; background: white; overflow: hidden; text-align: center; padding-bottom: 6px; }
         .href-slider-cell img { width: 100%; height: auto; display: block; }
         .href-slider-cell-label { font-size: 0.75rem; font-weight: bold; color: #475569; padding: 6px 0 2px 0; }
@@ -336,16 +336,31 @@
             });
 
             const sliderPanel = document.getElementById("href-slider-panel");
+            const mainLayout = document.querySelector(".main-layout");
             if (activeMetric === 'href_density') {
                 sliderPanel.style.display = "block";
-                hrefSliderTimes = sortedTimes;
+                mainLayout.style.display = "none";
+                // Build time list from HREF lightning data (not sounding times) so we
+                // get the full 48-hour range even when models don't extend that far.
+                const ltgRoot = (historyRuns[activeRunIdx] && historyRuns[activeRunIdx].href_lightning) || {};
+                const ltgAnyStn = ltgRoot[lowerStn] || ltgRoot[upperStn] || ltgRoot[Object.keys(ltgRoot)[0]] || {};
+                let hrefTimeSet = new Set([...Object.keys(ltgAnyStn), ...Array.from(timeSet)]);
+                hrefSliderTimes = Array.from(hrefTimeSet).sort((a, b) => {
+                    const [dayA, hourA] = a.split('/').map(Number);
+                    const [dayB, hourB] = b.split('/').map(Number);
+                    let fda = dayA, fdb = dayB;
+                    if (Math.abs(dayA - dayB) > 15) { if (dayA < dayB) fda += 32; else fdb += 32; }
+                    return fda !== fdb ? fda - fdb : hourA - hourB;
+                });
                 if (hrefSliderIdx >= hrefSliderTimes.length) hrefSliderIdx = 0;
                 const sliderInput = document.getElementById("href-slider-input");
                 sliderInput.max = Math.max(0, hrefSliderTimes.length - 1);
                 sliderInput.value = hrefSliderIdx;
                 renderHrefSliderFrame(hrefSliderIdx);
+                return; // skip table rendering entirely
             } else {
                 sliderPanel.style.display = "none";
+                mainLayout.style.display = "flex";
                 stopHrefPlay();
             }
 
