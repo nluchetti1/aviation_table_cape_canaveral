@@ -56,13 +56,16 @@ def purge_workspace(cache_dir=CACHE_DIR):
     return cache_dir
 
 
-def prune_stale_maps(current_href_maps, maps_dir=MAPS_DIR):
+def prune_stale_maps(current_href_maps, blank_basemap_path=None, maps_dir=MAPS_DIR):
     """Deletes spatial-map PNGs on disk that aren't part of the current run's href_maps
-    (the maps/ folder only ever needs to hold the latest run's images)."""
+    (the maps/ folder only ever needs to hold the latest run's images, plus the
+    always-present blank basemap fallback)."""
     if not os.path.exists(maps_dir):
         return
 
     referenced = set()
+    if blank_basemap_path:
+        referenced.add(os.path.basename(blank_basemap_path))
     for row_maps in (current_href_maps or {}).values():
         for rel_path in (row_maps or {}).values():
             referenced.add(os.path.basename(rel_path))
@@ -141,6 +144,58 @@ def _fig_to_png_file(fig, filename):
     plt.close(fig)
     # Relative path for use directly as an <img src="..."> in index.html
     return f"maps/{filename}"
+
+
+def generate_blank_basemap():
+    """
+    Renders a single 'no data available' Florida basemap (coastlines, counties, state
+    borders, station markers, no overlay) used as a fallback whenever a given forecast
+    hour/threshold has no spatial map yet (download failure, hour outside the HREF
+    0-48h window, etc). Overwritten each run; lives at maps/blank_basemap.png.
+    """
+    try:
+        proj = ccrs.PlateCarree()
+        states_provinces = cfeature.NaturalEarthFeature(
+            category="cultural", name="admin_1_states_provinces_lines",
+            scale="50m", facecolor="none"
+        )
+        counties = cfeature.NaturalEarthFeature(
+            category="cultural", name="admin_2_counties",
+            scale="10m", facecolor="none"
+        )
+
+        fig = plt.figure(figsize=(4.0, 4.2), dpi=100)
+        ax = fig.add_subplot(1, 1, 1, projection=proj)
+        ax.set_extent(
+            [FL_DOMAIN["lon_min"], FL_DOMAIN["lon_max"], FL_DOMAIN["lat_min"], FL_DOMAIN["lat_max"]],
+            crs=proj
+        )
+
+        ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="#dbeafe", zorder=0)
+        ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#f1f5f9", zorder=0)
+        ax.add_feature(counties, edgecolor="#cbd5e1", linewidth=0.35, zorder=1)
+        ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="#1e293b", linewidth=0.9, zorder=3)
+        ax.add_feature(states_provinces, edgecolor="#475569", linewidth=0.8, zorder=3)
+        ax.add_feature(cfeature.BORDERS.with_scale("50m"), edgecolor="#1e293b", linewidth=0.8, zorder=3)
+
+        for stn_id, coords in STN_COORDS.items():
+            ax.plot(
+                coords["lon"], coords["lat"], marker="^", markersize=5,
+                color="#2563eb", markeredgecolor="white", markeredgewidth=0.6,
+                transform=proj, zorder=4
+            )
+
+        gl = ax.gridlines(draw_labels=False, linewidth=0.4, color="#94a3b8", alpha=0.5, linestyle="--")
+        ax.set_title("No Active Signal", fontsize=9, fontweight="bold", color="#94a3b8")
+
+        out_path = os.path.join(MAPS_DIR, "blank_basemap.png")
+        os.makedirs(MAPS_DIR, exist_ok=True)
+        fig.savefig(out_path, format="png", dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        return "maps/blank_basemap.png"
+    except Exception as e:
+        logging.error(f"Blank basemap generation failed: {e}")
+        return None
 
 
 def generate_spatial_threshold_maps(filepath, file_prefix):
@@ -641,9 +696,11 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
 
     # The HREF spatial PNG maps are NOT part of dprog/dt history — they always reflect
     # only the latest run and get fully overwritten (and pruned) each pipeline pass.
+    blank_basemap_path = generate_blank_basemap()
     href_maps_latest = {
         "timestamp": current_timestamp,
         "href_maps": href_maps,
+        "blank_map": blank_basemap_path,
     }
 
     payload = {
@@ -653,7 +710,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
 
     with open(HISTORY_FILE, "w") as f:
         json.dump(payload, f, indent=2)
-    prune_stale_maps(href_maps)
+    prune_stale_maps(href_maps, blank_basemap_path)
     logging.info("Dashboard matrix completely compiled and written to history.json.")
 
 
