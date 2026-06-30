@@ -76,11 +76,11 @@
         .href-slider-time { font-weight: bold; color: #2563eb; background: #dbeafe; padding: 3px 10px; border-radius: 4px; font-size: 0.85rem; }
         #href-slider-input { width: 100%; margin: 6px 0 10px 0; cursor: pointer; }
         .href-slider-controls { display: flex; justify-content: center; gap: 8px; margin-bottom: 12px; }
-        .href-slider-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+        .href-slider-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 12px; max-width: 720px; margin: 0 auto; }
         .href-slider-cell { border: 1px solid #cbd5e1; border-radius: 4px; background: white; overflow: hidden; text-align: center; padding-bottom: 6px; }
         .href-slider-cell img { width: 100%; height: auto; display: block; }
         .href-slider-cell-label { font-size: 0.75rem; font-weight: bold; color: #475569; padding: 6px 0 2px 0; }
-        .href-slider-cell-empty { padding: 40px 10px; color: #94a3b8; font-size: 0.8rem; }
+        .href-slider-cell-empty { padding: 70px 10px; color: #94a3b8; font-size: 0.85rem; }
     </style>
 </head>
 <body>
@@ -152,6 +152,7 @@
     <script>
         let historyRuns = [];
         let activeRunIdx = 0;
+        let hrefMapsLatest = null;
         let activeMetric = 'mom_mean';
         let activeStn = 'kxmr';
         const popupCard = document.getElementById("hover-popup-card");
@@ -166,9 +167,11 @@
         async function initDashboard() {
             try {
                 const r = await fetch("history.json?t=" + new Date().getTime());
-                historyRuns = await r.json();
+                const payload = await r.json();
+                historyRuns = payload.runs || payload; // tolerate legacy flat-array format
+                hrefMapsLatest = (payload.href_maps_latest && payload.href_maps_latest.href_maps) || null;
                 buildTimelineNav();
-                loadRunIndex(historyRuns.length - 1);
+                loadRunIndex(0); // index 0 is always the most recent run
             } catch(e) {
                 document.getElementById("view-title").innerText = "Error loading history.json pipeline";
                 console.error(e);
@@ -181,7 +184,8 @@
             historyRuns.forEach((run, idx) => {
                 const btn = document.createElement("button");
                 btn.className = `dprog-btn ${idx === activeRunIdx ? 'active' : ''}`;
-                btn.innerText = run.timestamp.replace(" UTC", "");
+                btn.innerText = idx === 0 ? "Current Run" : `Run -${idx}`;
+                btn.title = run.timestamp;
                 btn.onclick = () => loadRunIndex(idx);
                 container.appendChild(btn);
             });
@@ -347,10 +351,10 @@
                 const tr = document.createElement("tr");
                 tr.innerHTML = `<td class="time-col">${timeKey}Z</td>`;
 
-                let ltgRoot = cycle.href_lightning || cycle.data.href_lightning || cycle.data.href || {};
+                let ltgRoot = cycle.href_lightning || {};
                 let ltgStation = ltgRoot[lowerStn] || ltgRoot[upperStn] || {};
                 let ltgData = ltgStation[timeKey] || null;
-                let mapsRoot = cycle.href_maps || {};
+                let mapsRoot = hrefMapsLatest || {};
                 let mapsData = mapsRoot[timeKey] || null;
 
                 models.forEach(m => {
@@ -433,10 +437,10 @@
             const cycle = historyRuns[activeRunIdx];
             const lowerStn = activeStn.toLowerCase();
             const upperStn = activeStn.toUpperCase();
-            let ltgRoot = cycle.href_lightning || cycle.data.href_lightning || cycle.data.href || {};
+            let ltgRoot = cycle.href_lightning || {};
             let ltgStation = ltgRoot[lowerStn] || ltgRoot[upperStn] || {};
             let ltgData = ltgStation[timeKey] || null;
-            let mapsData = (cycle.href_maps || {})[timeKey] || null;
+            let mapsData = (hrefMapsLatest || {})[timeKey] || null;
 
             document.getElementById("href-slider-time").innerText = `${timeKey}Z`;
             document.getElementById("href-slider-input").value = idx;
