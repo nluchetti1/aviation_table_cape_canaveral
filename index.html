@@ -10,276 +10,330 @@
         .nav-links span { font-weight: bold; margin-right: 5px; color: #334155; }
         .nav-links a { margin: 0 3px; text-decoration: none; color: #2563eb; padding: 2px 5px; border-radius: 3px; transition: all 0.1s ease; cursor: pointer; }
         .nav-links a.active { color: #ffffff; background: #2563eb; font-weight: bold; }
-        .station-selector { display: flex; align-items: center; gap: 6px; font-size: 0.9rem; font-weight: bold; background: white; padding: 4px 8px; border-radius: 4px; border: 1px solid #cbd5e1; }
-        .station-selector select { font-size: 0.9rem; font-weight: bold; padding: 2px; color: #1e293b; border: 1px solid #94a3b8; border-radius: 3px; cursor: pointer; }
-        .update-tag { font-size: 0.75rem; color: #64748b; font-style: italic; }
-        table { border-collapse: collapse; background: #ffffff; width: 100%; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-radius: 4px; overflow: hidden; }
-        th, td { border: 1px solid #e2e8f0; padding: 6px 8px; text-align: center; font-size: 0.8rem; }
-        th { background-color: #f1f5f9; color: #334155; font-weight: bold; }
-        .time-col { background: #f8fafc; font-weight: bold; font-size: 0.85rem; color: #0f172a; white-space: nowrap; width: 70px; }
-        .model-hdr { background-color: #cbd5e1; font-weight: bold; color: #1e293b; border-bottom: 2px solid #94a3b8; }
+        .station-selector { display: flex; align-items: center; gap: 6px; font-size: 0.85rem; font-weight: bold; background: white; padding: 4px 8px; border-radius: 4px; border: 1px solid #cbd5e1; }
+        .station-selector select { font-size: 0.85rem; font-weight: bold; color: #1e3a8a; padding: 2px 4px; cursor: pointer; border: 1px solid #cbd5e1; border-radius: 3px; }
+        .dprog-bar { background: #f1f5f9; border: 1px solid #cbd5e1; padding: 8px; border-radius: 4px; margin-bottom: 12px; display: flex; align-items: center; gap: 10px; }
+        .dprog-title { font-weight: bold; color: #475569; font-size: 0.82rem; text-transform: uppercase; }
+        .dprog-btn { margin: 0 3px; text-decoration: none; color: #2563eb; padding: 2px 5px; border-radius: 3px; cursor: pointer; font-size: 0.8rem; }
+        .dprog-btn.active { color: white; background: #475569; font-weight: bold; }
+        .main-layout { display: flex; gap: 20px; align-items: flex-start; position: relative; }
+        .table-container { max-height: 72vh; overflow-y: auto; border: 1px solid #cbd5e1; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        table { border-collapse: collapse; background: white; width: 690px; table-layout: fixed; }
+        th { background: #2563eb; color: white; padding: 8px; border: 1px solid #cbd5e1; font-size: 0.8rem; text-align: center; position: sticky; top: 0; z-index: 10; }
+        td { border: 1px solid #cbd5e1; padding: 6px; text-align: center; font-family: monospace; font-size: 0.85rem; white-space: nowrap; position: relative; }
+        .time-col { background: #3b82f6; color: white; font-weight: bold; width: 95px; position: sticky; left: 0; }
+        .href-col { background: #ffffff; color: #0f172a; border-left: 2px solid #cbd5e1 !important; font-weight: bold; }
+        .side-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; width: 360px; display: block; }
+        .legend-title { font-weight: bold; border-bottom: 1px solid #cbd5e1; padding-bottom: 5px; margin-bottom: 10px; text-align: center; font-size: 0.95rem; color: #1e293b; }
+        .legend-item { display: flex; justify-content: space-between; margin-bottom: 4px; padding: 5px; border-radius: 3px; font-size: 0.8rem; border: 1px solid #e2e8f0; }
+        .explanation-box { margin-top: 15px; padding-top: 10px; border-top: 1px dashed #cbd5e1; font-size: 0.78rem; line-height: 1.4; color: #475569; }
         
-        /* Color Matrix Threshold States */
-        .cell-vfr { background-color: #f0fdf4 !important; color: #166534 !important; }
-        .cell-mvfr { background-color: #eff6ff !important; color: #1e40af !important; font-weight: 500; }
-        .cell-ifr { background-color: #fef2f2 !important; color: #991b1b !important; font-weight: bold; }
-        .cell-lifr { background-color: #ffa6a6 !important; color: #7f0000 !important; font-weight: bold; }
+        /* Color Threshold States */
+        .cell-vfr { background-color: #f0fdf4; color: #166534; }
+        .cell-mvfr { background-color: #eff6ff; color: #1e40af; }
+        .cell-ifr { background-color: #fef2f2; color: #991b1b; font-weight: bold; }
+        .cell-lifr { background-color: #ffa6a6; color: #7f0000; font-weight: bold; }
+        .cell-alert { background-color: #fef2f2; color: #dc2626; font-weight: bold; border: 1px solid #dc2626; }
+        .cell-shear { background-color: #fae8ff; color: #86198f; font-weight: bold; }
         
-        /* Wind & Shear States */
-        .cell-wind-alert { border: 2px solid #dc2626 !important; font-weight: bold; background-color: #fef2f2; }
-        .cell-shear-alert { background-color: #fae8ff !important; color: #86198f !important; font-weight: bold; border: 2px dashed #c084fc !important; }
-        
-        /* Lightning Probability Heat Map */
+        /* Heatmap probabilities */
         .ltg-none { background-color: #ffffff; color: #cbd5e1; }
-        .ltg-vlow { background-color: #fef9c3 !important; color: #713f12 !important; font-weight: bold; }
-        .ltg-low { background-color: #fef08a !important; color: #854d0e !important; font-weight: bold; }
-        .ltg-med { background-color: #fed7aa !important; color: #9a3412 !important; font-weight: bold; }
-        .ltg-high { background-color: #fca5a5 !important; color: #991b1b !important; font-weight: bold; box-shadow: inset 0 0 4px #ef4444; }
-        
-        /* Interactive Elements */
-        .hover-cell { cursor: help; transition: background 0.05s ease; }
-        .hover-cell:hover { filter: brightness(0.93); border: 1px solid #475569; }
-        #hover-popup-card { position: absolute; z-index: 1000; display: none; background: #1e293b; color: #f8fafc; border-radius: 6px; padding: 10px 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.25); font-size: 0.8rem; pointer-events: none; max-width: 280px; border: 1px solid #475569; line-height: 1.4; }
-        .popup-header { font-weight: bold; color: #38bdf8; border-bottom: 1px solid #475569; margin-bottom: 6px; padding-bottom: 4px; font-size: 0.85rem; }
+        .ltg-vlow { background-color: #fef9c3; color: #713f12; }
+        .ltg-low { background-color: #fef08a; color: #854d0e; }
+        .ltg-med { background-color: #fed7aa; color: #9a3412; font-weight: bold; }
+        .ltg-high { background-color: #fca5a5; color: #991b1b; font-weight: bold; }
+
+        #hover-popup-card { position: absolute; z-index: 500; background: #ffffff; color: #1e293b; border: 2px solid #3b82f6; border-radius: 6px; padding: 12px; width: 280px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none; pointer-events: none; font-size: 0.8rem; line-height: 1.4; }
+        .popup-header { font-weight: bold; border-bottom: 1px solid #e2e8f0; margin-bottom: 6px; padding-bottom: 4px; color: #2563eb; text-transform: uppercase; }
+        .status-banner { font-weight: bold; font-size: 0.9rem; color: #1e3a8a; margin-bottom: 12px; text-transform: uppercase; background: #dbeafe; padding: 6px; border-radius: 4px; text-align: center; }
     </style>
 </head>
 <body>
 
     <div class="control-bar">
+        <div class="nav-links">
+            <span>Aviation:</span>
+            <a onmouseover="updateMetric('mom_mean')" class="active" id="nav-mom_mean">PBL Mom Mean</a>
+            <a onmouseover="updateMetric('mom_max')" id="nav-mom_max">PBL Mom Max</a>
+            <a onmouseover="updateMetric('ceiling')" id="nav-ceiling">Ceilings</a>
+            <a onmouseover="updateMetric('vis')" id="nav-vis">Visibility</a>
+            <a onmouseover="updateMetric('shear')" id="nav-shear">Wind Shear</a>
+            | <span>Launch Variables (kft):</span>
+            <a onmouseover="updateMetric('hght_0c')" id="nav-hght_0c">0°C Height</a>
+            <a onmouseover="updateMetric('hght_5c')" id="nav-hght_5c">-5°C Height</a>
+            <a onmouseover="updateMetric('hght_10c')" id="nav-hght_10c">-10°C Height</a>
+            <a onmouseover="updateMetric('hght_20c')" id="nav-hght_20c">-20°C Height</a>
+            <a onmouseover="updateMetric('cloud_top')" id="nav-cloud_top">Highest Cloud Top</a>
+            <a onmouseover="updateMetric('cloud_thick')" id="nav-cloud_thick">Max Layer Thickness</a>
+        </div>
         <div class="station-selector">
-            <span>Target Terminal Location:</span>
-            <select id="station-picker" onchange="changeStation(this.value)">
-                <option value="KXMR">Cape Canaveral Space Force Station (KXMR)</option>
-                <option value="KDAB">Daytona Beach International (KDAB)</option>
-                <option value="KMLB">Melbourne Orlando International (KMLB)</option>
-                <option value="KFPR">St. Lucie County International (KFPR)</option>
-                <option value="KPBI">Palm Beach International (KPBI)</option>
+            <label for="stn-dropdown">Station:</label>
+            <select id="stn-dropdown" onchange="activeStn = this.value; renderMatrix();">
+                <option value="kxmr" selected>KXMR (Cape Canaveral)</option>
+                <option value="kdab">KDAB (Daytona Beach)</option>
+                <option value="kmlb">KMLB (Melbourne)</option>
+                <option value="kfpr">KFPR (Fort Pierce)</option>
+                <option value="kpbi">KPBI (West Palm Beach)</option>
             </select>
         </div>
-        <div class="nav-links" id="history-nav"><span>Available Forecast Run Cycles:</span></div>
-        <div class="update-tag" id="run-age-label">Awaiting run initialization...</div>
     </div>
 
-    <div id="hover-popup-card"></div>
+    <div class="dprog-bar">
+        <span class="dprog-title">dprog/dt Timeline:</span>
+        <div id="run-selector-container"></div>
+    </div>
 
-    <table id="matrix-display-table">
-        <thead>
-            <tr id="top-header-row"></tr>
-            <tr id="sub-header-row"></tr>
-        </thead>
-        <tbody id="matrix-body"></tbody>
-    </table>
+    <div class="status-banner" id="view-title">Loading Matrix Engine...</div>
+
+    <div class="main-layout">
+        <div id="hover-popup-card"></div>
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width: 95px;">Time (UTC)</th>
+                        <th>GFS</th>
+                        <th>RAP</th>
+                        <th>HRRR</th>
+                        <th style="width: 110px; background:#475569; color:white; border-left: 2px solid #cbd5e1 !important;">HREF LTG</th>
+                    </tr>
+                </thead>
+                <tbody id="matrix-body"></tbody>
+            </table>
+        </div>
+        <div class="side-panel" id="dynamic-legend-panel"></div>
+    </div>
 
     <script>
         let historyRuns = [];
-        let currentRunIndex = 0;
-        let currentStation = "KXMR";
+        let activeRunIdx = 0;
+        let activeMetric = 'mom_mean';
+        let activeStn = 'kxmr';
         const popupCard = document.getElementById("hover-popup-card");
 
         async function initDashboard() {
             try {
                 const r = await fetch("history.json?t=" + new Date().getTime());
                 historyRuns = await r.json();
-                buildNavigation();
-                loadRun(0);
+                buildTimelineNav();
+                loadRunIndex(0);
             } catch(e) {
-                document.getElementById("run-age-label").innerText = "Critical Error: history.json unresolved.";
+                document.getElementById("view-title").innerText = "Error loading history.json pipeline";
                 console.error(e);
             }
         }
 
-        function buildNavigation() {
-            const nav = document.getElementById("history-nav");
-            nav.innerHTML = "<span>Available Forecast Run Cycles:</span>";
+        function buildTimelineNav() {
+            const container = document.getElementById("run-selector-container");
+            container.innerHTML = "";
             historyRuns.forEach((run, idx) => {
-                const a = document.createElement("a");
-                a.innerText = run.timestamp;
-                a.className = idx === currentRunIndex ? "active" : "";
-                a.onclick = () => loadRun(idx);
-                nav.appendChild(a);
+                const btn = document.createElement("a");
+                btn.className = `dprog-btn ${idx === activeRunIdx ? 'active' : ''}`;
+                btn.innerText = run.timestamp;
+                btn.onclick = () => loadRunIndex(idx);
+                container.appendChild(btn);
             });
         }
 
-        function changeStation(val) {
-            currentStation = val;
-            buildMatrix();
+        function loadRunIndex(idx) {
+            activeRunIdx = idx;
+            buildTimelineNav();
+            renderMatrix();
         }
 
-        function loadRun(idx) {
-            currentRunIndex = idx;
-            buildNavigation();
-            document.getElementById("run-age-label").innerText = `Cycle Generated: ${historyRuns[idx].timestamp}`;
-            buildMatrix();
+        function updateMetric(metricKey) {
+            activeMetric = metricKey;
+            document.querySelectorAll(".nav-links a").forEach(el => el.classList.remove("active"));
+            const targetNav = document.getElementById(`nav-${metricKey}`);
+            if (targetNav) targetNav.classList.add("active");
+            renderMatrix();
         }
 
-        function evaluateFlightRules(ceil, vis) {
-            if (ceil < 500 || vis < 1) return { label: `LIFR (${ceil} ft)`, cls: "cell-lifr" };
-            if (ceil < 1000 || vis < 3) return { label: `IFR (${ceil} ft)`, cls: "cell-ifr" };
-            if (ceil <= 3000 || vis <= 5) return { label: `MVFR (${ceil} ft)`, cls: "cell-mvfr" };
-            return { label: "VFR", cls: "cell-vfr" };
-        }
-
-        function buildMatrix() {
-            if (!historyRuns.length) return;
-            const runData = historyRuns[currentRunIndex];
-            const stn = currentStation;
+        function getCellProperties(metric, val) {
+            if (val === null || val === undefined) return { txt: "-", cls: "" };
             
-            const topRow = document.getElementById("top-header-row");
-            const subRow = document.getElementById("sub-header-row");
-            const body = document.getElementById("matrix-body");
+            // Format numbers to readable strings
+            let txt = typeof val === "number" ? val.toFixed(1) : val;
 
-            topRow.innerHTML = `<th rowspan="2" class="time-col" style="vertical-align: middle;">Valid (UTC)<br>Day/Hour</th>`;
-            subRow.innerHTML = "";
+            if (metric === 'mom_mean') {
+                if (val >= 25) return { txt: txt + " kt", cls: "cell-alert" };
+                if (val >= 15) return { txt: txt + " kt", cls: "cell-mvfr" };
+                return { txt: txt + " kt", cls: "cell-vfr" };
+            }
+            if (metric === 'mom_max') {
+                if (val >= 35) return { txt: txt + " kt", cls: "cell-alert" };
+                if (val >= 25) return { txt: txt + " kt", cls: "cell-ifr" };
+                return { txt: txt + " kt", cls: "cell-vfr" };
+            }
+            if (metric === 'ceiling') {
+                if (val >= 23000) return { txt: "CLR", cls: "cell-vfr" };
+                if (val < 500) return { txt: Math.round(val) + " ft", cls: "cell-lifr" };
+                if (val < 1000) return { txt: Math.round(val) + " ft", cls: "cell-ifr" };
+                if (val <= 3000) return { txt: Math.round(val) + " ft", cls: "cell-mvfr" };
+                return { txt: Math.round(val) + " ft", cls: "cell-vfr" };
+            }
+            if (metric === 'vis') {
+                if (val < 1) return { txt: txt + " sm", cls: "cell-lifr" };
+                if (val < 3) return { txt: txt + " sm", cls: "cell-ifr" };
+                if (val <= 5) return { txt: txt + " sm", cls: "cell-mvfr" };
+                return { txt: txt + " sm", cls: "cell-vfr" };
+            }
+            if (metric === 'shear') {
+                return val ? { txt: "WSHEAR", cls: "cell-shear" } : { txt: "None", cls: "cell-vfr" };
+            }
+            
+            // Isotherm height / Launch fields mapping
+            return { txt: txt + " kft", cls: "cell-vfr" };
+        }
+
+        function renderMatrix() {
+            if (!historyRuns.length) return;
+            const cycle = historyRuns[activeRunIdx];
+            const stn = activeStn.toLowerCase();
+            const body = document.getElementById("matrix-body");
+            
+            document.getElementById("view-title").innerText = `${activeMetric.replace('_',' ').toUpperCase()} Matrix | Target: ${stn.toUpperCase()}`;
             body.innerHTML = "";
 
             const models = ["gfs", "rap", "hrrr"];
-            models.forEach(m => {
-                topRow.innerHTML += `<th colspan="3" class="model-hdr">${m.toUpperCase()} Bufkit Diagnostic Profiles</th>`;
-                subRow.innerHTML += `<th>Aviation Profile</th><th>Mom. Winds</th><th>Isotherms / Clouds</th>`;
-            });
-            
-            // Reverted header code directly to your single rowspan=2 cell layout
-            topRow.innerHTML += `<th rowspan="2" class="model-hdr" style="background:#0f172a; color:#fff; vertical-align: middle;">HREF Probability<br><span style="font-size:0.7rem; font-weight:normal;">4-Hr Lightning Density</span></th>`;
+            let timeSet = new Set();
 
-            let allTimes = new Set();
             models.forEach(m => {
-                const stnLower = stn.toLowerCase();
-                if (runData.data[stnLower] && runData.data[stnLower][m]) {
-                    Object.keys(runData.data[stnLower][m]).forEach(t => allTimes.add(t));
+                if (cycle.data[stn] && cycle.data[stn][m]) {
+                    Object.keys(cycle.data[stn][m]).forEach(t => timeSet.add(t));
                 }
             });
 
-            // --- CHRONOLOGICAL TIMELINE SORT FIX ---
-            // Parses "DD/HH" strings to ensure days and forecast hours sequence chronologically
-            let sortedTimes = Array.from(allTimes).sort((a, b) => {
+            // Chronological date array ordering setup
+            let sortedTimes = Array.from(timeSet).sort((a, b) => {
                 const [dayA, hourA] = a.split('/').map(Number);
                 const [dayB, hourB] = b.split('/').map(Number);
                 if (dayA !== dayB) return dayA - dayB;
                 return hourA - hourB;
             });
 
-            sortedTimes.forEach(rowKey => {
+            sortedTimes.forEach(timeKey => {
                 const tr = document.createElement("tr");
-                tr.innerHTML = `<td class="time-col">${rowKey}Z</td>`;
-
-                const stnLower = stn.toLowerCase();
+                tr.innerHTML = `<td class="time-col">${timeKey}Z</td>`;
 
                 models.forEach(m => {
-                    const mData = (runData.data[stnLower] && runData.data[stnLower][m]) ? runData.data[stnLower][m][rowKey] : null;
-
-                    if (!mData) {
-                        tr.innerHTML += `<td class="ltg-none">-</td><td class="ltg-none">-</td><td class="ltg-none">-</td>`;
+                    const profile = (cycle.data[stn] && cycle.data[stn][m]) ? cycle.data[stn][m][timeKey] : null;
+                    if (!profile) {
+                        tr.innerHTML += `<td>-</td>`;
                         return;
                     }
 
-                    let avObj = evaluateFlightRules(mData.ceiling, mData.vis);
-                    let avClass = avObj.cls;
-                    if (mData.shear) avClass += " cell-shear-alert";
-
-                    let cell1Id = `pop_${stn}_${m}_${rowKey.replace('/','_')}_av`;
-                    tr.innerHTML += `<td id="${cell1Id}" class="hover-cell ${avClass}">${avObj.label}</td>`;
-
-                    let wClass = (mData.mom_max >= 25 || mData.mom_mean >= 15) ? "cell-wind-alert" : "cell-vfr";
-                    let cell2Id = `pop_${stn}_${m}_${rowKey.replace('/','_')}_wind`;
-                    tr.innerHTML += `<td id="${cell2Id}" class="hover-cell ${wClass}">Mean: ${mData.mom_mean} kt<br>Max: ${mData.mom_max} kt</td>`;
-
-                    let cell3Id = `pop_${stn}_${m}_${rowKey.replace('/','_')}_thermo`;
-                    tr.innerHTML += `<td id="${cell3Id}" class="hover-cell cell-vfr">0°C: ${mData.hght_0c} kft<br>Top: ${mData.cloud_top} kft</td>`;
+                    let val = profile[activeMetric];
+                    let props = getCellProperties(activeMetric, val);
+                    let cellId = `c_${stn}_${m}_${timeKey.replace('/','_')}`;
+                    
+                    tr.innerHTML += `<td id="${cellId}" class="${props.cls}" style="cursor:help;">${props.txt}</td>`;
 
                     setTimeout(() => {
-                        setupCellHover(cell1Id, { type: "av", model: m.toUpperCase(), ceil: mData.ceiling, visibility: mData.vis, w_shear: mData.shear, w_mean: mData.mom_mean, w_max: mData.mom_max });
-                        setupCellHover(cell2Id, { type: "wind", model: m.toUpperCase(), w_mean: mData.mom_mean, w_max: mData.mom_max });
-                        setupCellHover(cell3Id, { type: "thermo", model: m.toUpperCase(), h0: mData.hght_0c, h5: mData.hght_5c, h10: mData.hght_10c, h20: mData.hght_20c, ctop: mData.cloud_top, cthick: mData.cloud_thick });
+                        const cellEl = document.getElementById(cellId);
+                        if(cellEl) {
+                            cellEl.onmouseenter = (e) => showPopup(e, m, profile);
+                            cellEl.onmousemove = movePopup;
+                            cellEl.onmouseleave = hidePopup;
+                        }
                     }, 0);
                 });
 
-                // Fixed lowercase lookup
-                let ltgObj = (runData.href_lightning && runData.href_lightning[stnLower]) ? runData.href_lightning[stnLower][rowKey] : null;
-
-                let p25 = 0, p50 = 0, p100 = 0, p200 = 0;
-                if (ltgObj) {
-                    p25  = ltgObj.p25  || 0;
-                    p50  = ltgObj.p50  || 0;
-                    p100 = ltgObj.p100 || 0;
-                    p200 = ltgObj.p200 || 0;
-                }
-
-                let ltgClass = "ltg-none";
-                let ltgLabel = "0%";
-
+                // Render HREF column on the right
+                let ltgData = (cycle.href_lightning && cycle.href_lightning[stn]) ? cycle.href_lightning[stn][timeKey] : null;
+                let p25 = ltgData ? (ltgData.p25 || 0) : 0;
+                
+                let ltgCls = "ltg-none";
                 if (p25 > 0) {
-                    ltgLabel = `${p25}%`;
-                    if (p25 >= 30) ltgClass = "ltg-high";
-                    else if (p25 >= 15) ltgClass = "ltg-med";
-                    else if (p25 >= 5) ltgClass = "ltg-low";
-                    else ltgClass = "ltg-vlow";
+                    if (p25 >= 30) ltgCls = "ltg-high";
+                    else if (p25 >= 15) ltgCls = "ltg-med";
+                    else if (p25 >= 5) ltgCls = "ltg-low";
+                    else ltgCls = "ltg-vlow";
                 }
 
-                let ltgCellId = `pop_${stn}_href_${rowKey.replace('/','_')}`;
-                tr.innerHTML += `<td id="${ltgCellId}" class="hover-cell ${ltgClass}">${ltgLabel}</td>`;
+                let hrefCellId = `c_${stn}_href_${timeKey.replace('/','_')}`;
+                tr.innerHTML += `<td id="${hrefCellId}" class="href-col ${ltgCls}" style="cursor:help; border-left: 2px solid #cbd5e1 !important;">${p25}%</td>`;
 
                 setTimeout(() => {
-                    setupCellHover(ltgCellId, { type: "ltg", p25: p25, p50: p50, p100: p100, p200: p200 });
+                    const hrefEl = document.getElementById(hrefCellId);
+                    if(hrefEl) {
+                        hrefEl.onmouseenter = (e) => showLtgPopup(e, ltgData);
+                        hrefEl.onmousemove = movePopup;
+                        hrefEl.onmouseleave = hidePopup;
+                    }
                 }, 0);
 
                 body.appendChild(tr);
             });
+
+            renderSidebarLegend();
         }
 
-        function setupCellHover(id, data) {
-            const el = document.getElementById(id);
-            if (!el) return;
-            el.addEventListener("mouseenter", (e) => showHoverPopup(e, data));
-            el.addEventListener("mousemove", moveHoverPopup);
-            el.addEventListener("mouseleave", hideHoverPopup);
+        function showPopup(e, model, p) {
+            popupCard.innerHTML = `
+                <div class="popup-header">${model.toUpperCase()} Profile Diagnostics</div>
+                • Ceilings: <strong>${p.ceiling >= 23000 ? 'Clear' : p.ceiling + ' ft'}</strong><br>
+                • Visibility: <strong>${p.vis} sm</strong><br>
+                • Mean Boundary Wind: <strong>${p.mom_mean} kt</strong><br>
+                • Max Wind Speed: <strong>${p.mom_max} kt</strong><br>
+                • Wind Shear: <strong>${p.shear ? 'Low-Level Alert' : 'None'}</strong><br>
+                <div style="margin-top:6px; border-top:1px solid #cbd5e1; padding-top:4px; font-size:0.75rem;">
+                    0°C Height: ${p.hght_0c} kft | -10°C Height: ${p.hght_10c} kft<br>
+                    Cloud Top: ${p.cloud_top} kft | Thickness: ${p.cloud_thick} kft
+                </div>
+            `;
+            popupCard.style.display = "block";
+            movePopup(e);
         }
 
-        function showHoverPopup(e, data) {
-            if (data.type === "ltg") {
-                popupCard.innerHTML = `
-                    <div class="popup-header">HREF Lightning Probability</div>
-                    <strong>Grid Radius Thresholds:</strong><br>
-                    • Strike within 25km: <strong>${data.p25}%</strong><br>
-                    • Strike within 50km: <strong>${data.p50}%</strong><br>
-                    • Strike within 100km: <strong>${data.p100}%</strong><br>
-                    • Strike within 200km: <strong>${data.p200}%</strong>
-                `;
+        function showLtgPopup(e, ltg) {
+            if (!ltg) {
+                popupCard.innerHTML = `<div class="popup-header">HREF Probability</div>No Strike Data Generated.`;
             } else {
-                popupCard.innerHTML = data.type === "av" ? `
-                    <div class="popup-header">${data.model} Profile Details</div>
-                    • Mean Boundary Layer Wind: <strong>${data.w_mean} kt</strong><br>
-                    • Max Column Velocity: <strong>${data.w_max} kt</strong><br>
-                    • Lowest Ceiling: <strong>${data.ceil >= 23000 ? "Clear" : data.ceil + " ft"}</strong><br>
-                    • Visibility: <strong>${data.visibility} sm</strong><br>
-                    • Wind Shear: <strong>${data.w_shear ? data.w_shear : "None Detected"}</strong>
-                ` : data.type === "wind" ? `
-                    <div class="popup-header">${data.model} Boundary Layer Winds</div>
-                    • Mean Profile Wind Speed: <strong>${data.w_mean} kt</strong><br>
-                    • Max Profile Column Velocity: <strong>${data.w_max} kt</strong>
-                ` : `
-                    <div class="popup-header">${data.model} Thermodynamic Heights</div>
-                    <strong>Freezing & Charging Isotherms:</strong><br>
-                    • 0°C Level: <strong>${data.h0} kft</strong><br>
-                    • -5°C Level: <strong>${data.h5} kft</strong><br>
-                    • -10°C Level: <strong>${data.h10} kft</strong><br>
-                    • -20°C Level: <strong>${data.h20} kft</strong>
-                    <div style="margin-top:6px; border-top:1px solid #e2e8f0; padding-top:4px;">
-                        • Highest Cloud Top: <strong>${data.ctop} kft</strong><br>
-                        • Max Layer Thickness: <strong>${data.cthick} kft</strong>
-                    </div>
+                popupCard.innerHTML = `
+                    <div class="popup-header">HREF Lightning Density</div>
+                    • Within 25km Radius: <strong>${ltg.p25 || 0}%</strong><br>
+                    • Within 50km Radius: <strong>${ltg.p50 || 0}%</strong><br>
+                    • Within 100km Radius: <strong>${ltg.p100 || 0}%</strong><br>
+                    • Within 200km Radius: <strong>${ltg.p200 || 0}%</strong>
                 `;
             }
             popupCard.style.display = "block";
-            moveHoverPopup(e);
+            movePopup(e);
         }
-        
-        function moveHoverPopup(e) { 
-            popupCard.style.left = (e.pageX + 15) + "px"; 
-            popupCard.style.top = (e.pageY - 40) + "px"; 
+
+        function movePopup(e) {
+            popupCard.style.left = (e.pageX + 15) + "px";
+            popupCard.style.top = (e.pageY - 40) + "px";
         }
-        
-        function hideHoverPopup() { 
-            popupCard.style.display = "none"; 
+
+        function hidePopup() { popupCard.style.display = "none"; }
+
+        function renderSidebarLegend() {
+            const panel = document.getElementById("dynamic-legend-panel");
+            let isLaunchMetric = ['hght_0c','hght_5c','hght_10c','hght_20c','cloud_top','cloud_thick'].includes(activeMetric);
+
+            if (!isLaunchMetric) {
+                panel.innerHTML = `
+                    <div class="legend-title">Aviation Rules Legend</div>
+                    <div class="legend-item cell-vfr"><span>VFR Status</span><span>&gt; 3000 ft / 5 sm</span></div>
+                    <div class="legend-item cell-mvfr"><span>MVFR Alert</span><span>1000-3000 ft</span></div>
+                    <div class="legend-item cell-ifr"><span>IFR Restriction</span><span>500-1000 ft</span></div>
+                    <div class="legend-item cell-lifr"><span>LIFR Critical</span><span>&lt; 500 ft</span></div>
+                    <div class="legend-item cell-alert"><span>High Wind Threshold</span><span>Dangerous Max/Mean</span></div>
+                    <div class="legend-item cell-shear"><span>Wind Shear Alert</span><span>Turbulence Diagnostic</span></div>
+                `;
+            } else {
+                panel.innerHTML = `
+                    <div class="legend-title">Launch Commit Criteria</div>
+                    <div style="font-weight:bold; font-size:0.75rem; margin-bottom:4px; color:#475569;">Isotherm Environments</div>
+                    <div class="legend-item" style="background:#ffedd5; color:#7c2d12;"><span>0°C to -5°C</span><span>Mixed Phase Charging</span></div>
+                    <div class="legend-item" style="background:#fed7aa; color:#c2410c;"><span>-10°C to -20°C</span><span>Glaciated Lightning Engine</span></div>
+                    <div class="explanation-box">
+                        Tracks heights for freezing and charge accumulation layers against cloud thickness to evaluate triggered lightning risks.
+                    </div>
+                `;
+            }
         }
 
         window.onload = initDashboard;
