@@ -138,7 +138,7 @@
                 subRow.innerHTML += `<th>Aviation Profile</th><th>Mom. Winds</th><th>Isotherms / Clouds</th>`;
             });
             
-            // Reverted header cells completely back to original setup
+            // Reverted header code directly to your single rowspan=2 cell layout
             topRow.innerHTML += `<th rowspan="2" class="model-hdr" style="background:#0f172a; color:#fff; vertical-align: middle;">HREF Probability<br><span style="font-size:0.7rem; font-weight:normal;">4-Hr Lightning Density</span></th>`;
 
             let allTimes = new Set();
@@ -148,7 +148,15 @@
                     Object.keys(runData.data[stnLower][m]).forEach(t => allTimes.add(t));
                 }
             });
-            let sortedTimes = Array.from(allTimes).sort();
+
+            // --- CHRONOLOGICAL TIMELINE SORT FIX ---
+            // Parses "DD/HH" strings to ensure days and forecast hours sequence chronologically
+            let sortedTimes = Array.from(allTimes).sort((a, b) => {
+                const [dayA, hourA] = a.split('/').map(Number);
+                const [dayB, hourB] = b.split('/').map(Number);
+                if (dayA !== dayB) return dayA - dayB;
+                return hourA - hourB;
+            });
 
             sortedTimes.forEach(rowKey => {
                 const tr = document.createElement("tr");
@@ -185,7 +193,7 @@
                     }, 0);
                 });
 
-                // Fixed data key case disconnect
+                // Fixed lowercase lookup
                 let ltgObj = (runData.href_lightning && runData.href_lightning[stnLower]) ? runData.href_lightning[stnLower][rowKey] : null;
 
                 let p25 = 0, p50 = 0, p100 = 0, p200 = 0;
@@ -262,6 +270,7 @@
                 `;
             }
             popupCard.style.display = "block";
+            moveHoverPopup(e);
         }
         
         function moveHoverPopup(e) { 
