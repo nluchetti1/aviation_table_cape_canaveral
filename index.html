@@ -25,8 +25,8 @@
         .href-col { background: #ffffff; color: #0f172a; border-left: 2px solid #cbd5e1 !important; font-weight: bold; }
         .side-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 15px; width: 360px; display: block; }
         .legend-title { font-weight: bold; border-bottom: 1px solid #cbd5e1; padding-bottom: 5px; margin-bottom: 10px; text-align: center; font-size: 0.95rem; color: #1e293b; }
+        .legend-section-title { font-weight: bold; font-size: 0.8rem; margin: 12px 0 4px 0; color: #475569; text-transform: uppercase; letter-spacing: 0.05em; }
         .legend-item { display: flex; justify-content: space-between; margin-bottom: 4px; padding: 5px; border-radius: 3px; font-size: 0.8rem; border: 1px solid #e2e8f0; }
-        .explanation-box { margin-top: 15px; padding-top: 10px; border-top: 1px dashed #cbd5e1; font-size: 0.78rem; line-height: 1.4; color: #475569; }
         
         /* Color Threshold States */
         .cell-vfr { background-color: #f0fdf4; color: #166534; }
@@ -101,7 +101,24 @@
                 <tbody id="matrix-body"></tbody>
             </table>
         </div>
-        <div class="side-panel" id="dynamic-legend-panel"></div>
+        
+        <div class="side-panel">
+            <div class="legend-title">Matrix Threshold Criteria</div>
+            
+            <div class="legend-section-title">Aviation Rules</div>
+            <div class="legend-item cell-vfr"><span>VFR Status</span><span>&gt; 3000 ft / 5 sm</span></div>
+            <div class="legend-item cell-mvfr"><span>MVFR Alert</span><span>1000-3000 ft</span></div>
+            <div class="legend-item cell-ifr"><span>IFR Restriction</span><span>500-1000 ft</span></div>
+            <div class="legend-item cell-lifr"><span>LIFR Critical</span><span>&lt; 500 ft</span></div>
+            <div class="legend-item cell-alert"><span>High Wind Threshold</span><span>Dangerous Max/Mean</span></div>
+            <div class="legend-item cell-shear"><span>Wind Shear Alert</span><span>Turbulence Profile</span></div>
+            
+            <div class="legend-section-title">HREF Probability (Exceedance)</div>
+            <div class="legend-item ltg-vlow"><span>Very Low Prob</span><span>&gt; 0% Strikes</span></div>
+            <div class="legend-item ltg-low"><span>Low Probability</span><span>&gt; 5% Strikes</span></div>
+            <div class="legend-item ltg-med"><span>Medium Probability</span><span>&gt; 15% Strikes</span></div>
+            <div class="legend-item ltg-high"><span>High Probability</span><span>&gt; 30% Strikes</span></div>
+        </div>
     </div>
 
     <script>
@@ -151,8 +168,6 @@
 
         function getCellProperties(metric, val) {
             if (val === null || val === undefined) return { txt: "-", cls: "" };
-            
-            // Format numbers to readable strings
             let txt = typeof val === "number" ? val.toFixed(1) : val;
 
             if (metric === 'mom_mean') {
@@ -181,8 +196,6 @@
             if (metric === 'shear') {
                 return val ? { txt: "WSHEAR", cls: "cell-shear" } : { txt: "None", cls: "cell-vfr" };
             }
-            
-            // Isotherm height / Launch fields mapping
             return { txt: txt + " kft", cls: "cell-vfr" };
         }
 
@@ -198,17 +211,30 @@
             const models = ["gfs", "rap", "hrrr"];
             let timeSet = new Set();
 
+            // Case-insensitive lookup for initialization
             models.forEach(m => {
-                if (cycle.data[stn] && cycle.data[stn][m]) {
-                    Object.keys(cycle.data[stn][m]).forEach(t => timeSet.add(t));
+                let stnData = cycle.data[stn] || cycle.data[stn.toUpperCase()];
+                if (stnData) {
+                    let modelData = stnData[m] || stnData[m.toUpperCase()];
+                    if (modelData) {
+                        Object.keys(modelData).forEach(t => timeSet.add(t));
+                    }
                 }
             });
 
-            // Chronological date array ordering setup
             let sortedTimes = Array.from(timeSet).sort((a, b) => {
                 const [dayA, hourA] = a.split('/').map(Number);
                 const [dayB, hourB] = b.split('/').map(Number);
-                if (dayA !== dayB) return dayA - dayB;
+                
+                let finalDayA = dayA;
+                let finalDayB = dayB;
+                
+                if (Math.abs(dayA - dayB) > 15) {
+                    if (dayA < dayB) finalDayA += 32;
+                    else finalDayB += 32;
+                }
+
+                if (finalDayA !== finalDayB) return finalDayA - finalDayB;
                 return hourA - hourB;
             });
 
@@ -217,7 +243,10 @@
                 tr.innerHTML = `<td class="time-col">${timeKey}Z</td>`;
 
                 models.forEach(m => {
-                    const profile = (cycle.data[stn] && cycle.data[stn][m]) ? cycle.data[stn][m][timeKey] : null;
+                    let stnData = cycle.data[stn] || cycle.data[stn.toUpperCase()];
+                    let modelData = stnData ? (stnData[m] || stnData[m.toUpperCase()]) : null;
+                    const profile = modelData ? modelData[timeKey] : null;
+
                     if (!profile) {
                         tr.innerHTML += `<td>-</td>`;
                         return;
@@ -239,8 +268,7 @@
                     }, 0);
                 });
 
-                // Render HREF column on the right
-                let ltgData = (cycle.href_lightning && cycle.href_lightning[stn]) ? cycle.href_lightning[stn][timeKey] : null;
+                let ltgData = (cycle.href_lightning && (cycle.href_lightning[stn] || cycle.href_lightning[stn.toUpperCase()])) ? (cycle.href_lightning[stn] || cycle.href_lightning[stn.toUpperCase()])[timeKey] : null;
                 let p25 = ltgData ? (ltgData.p25 || 0) : 0;
                 
                 let ltgCls = "ltg-none";
@@ -265,8 +293,6 @@
 
                 body.appendChild(tr);
             });
-
-            renderSidebarLegend();
         }
 
         function showPopup(e, model, p) {
@@ -292,10 +318,11 @@
             } else {
                 popupCard.innerHTML = `
                     <div class="popup-header">HREF Lightning Density</div>
-                    • Within 25km Radius: <strong>${ltg.p25 || 0}%</strong><br>
-                    • Within 50km Radius: <strong>${ltg.p50 || 0}%</strong><br>
-                    • Within 100km Radius: <strong>${ltg.p100 || 0}%</strong><br>
-                    • Within 200km Radius: <strong>${ltg.p200 || 0}%</strong>
+                    <strong>Exceedance Strike Thresholds:</strong><br>
+                    • Probability of ≥ 25 strikes: <strong>${ltg.p25 || 0}%</strong><br>
+                    • Probability of ≥ 50 strikes: <strong>${ltg.p50 || 0}%</strong><br>
+                    • Probability of ≥ 100 strikes: <strong>${ltg.p100 || 0}%</strong><br>
+                    • Probability of ≥ 200 strikes: <strong>${ltg.p200 || 0}%</strong>
                 `;
             }
             popupCard.style.display = "block";
@@ -308,33 +335,6 @@
         }
 
         function hidePopup() { popupCard.style.display = "none"; }
-
-        function renderSidebarLegend() {
-            const panel = document.getElementById("dynamic-legend-panel");
-            let isLaunchMetric = ['hght_0c','hght_5c','hght_10c','hght_20c','cloud_top','cloud_thick'].includes(activeMetric);
-
-            if (!isLaunchMetric) {
-                panel.innerHTML = `
-                    <div class="legend-title">Aviation Rules Legend</div>
-                    <div class="legend-item cell-vfr"><span>VFR Status</span><span>&gt; 3000 ft / 5 sm</span></div>
-                    <div class="legend-item cell-mvfr"><span>MVFR Alert</span><span>1000-3000 ft</span></div>
-                    <div class="legend-item cell-ifr"><span>IFR Restriction</span><span>500-1000 ft</span></div>
-                    <div class="legend-item cell-lifr"><span>LIFR Critical</span><span>&lt; 500 ft</span></div>
-                    <div class="legend-item cell-alert"><span>High Wind Threshold</span><span>Dangerous Max/Mean</span></div>
-                    <div class="legend-item cell-shear"><span>Wind Shear Alert</span><span>Turbulence Diagnostic</span></div>
-                `;
-            } else {
-                panel.innerHTML = `
-                    <div class="legend-title">Launch Commit Criteria</div>
-                    <div style="font-weight:bold; font-size:0.75rem; margin-bottom:4px; color:#475569;">Isotherm Environments</div>
-                    <div class="legend-item" style="background:#ffedd5; color:#7c2d12;"><span>0°C to -5°C</span><span>Mixed Phase Charging</span></div>
-                    <div class="legend-item" style="background:#fed7aa; color:#c2410c;"><span>-10°C to -20°C</span><span>Glaciated Lightning Engine</span></div>
-                    <div class="explanation-box">
-                        Tracks heights for freezing and charge accumulation layers against cloud thickness to evaluate triggered lightning risks.
-                    </div>
-                `;
-            }
-        }
 
         window.onload = initDashboard;
     </script>
