@@ -1,5 +1,6 @@
 import datetime
 import json
+import math
 import os
 import re
 import requests
@@ -7,6 +8,11 @@ import concurrent.futures
 import logging
 import pygrib
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,6 +34,12 @@ STN_COORDS = {
 THRESHOLD_MAP = {25: "p25", 50: "p50", 100: "p100", 200: "p200"}
 MSG_INDEX_THRESHOLDS = {1: "p25", 2: "p50", 3: "p100", 4: "p200"}
 
+# Bounding box used for the HREF lightning density spatial plots (covers peninsular FL)
+FL_DOMAIN = {"lat_min": 24.3, "lat_max": 31.2, "lon_min": -87.7, "lon_max": -79.5}
+
+# Spatial plot PNGs are written here (relative path, served alongside index.html)
+MAPS_DIR = "./maps"
+
 # Global cache for static grid indices to maximize ThreadPool performance
 _GRID_INDEX_CACHE = {}
 
@@ -42,6 +54,26 @@ def purge_workspace(cache_dir=CACHE_DIR):
             except Exception:
                 pass
     return cache_dir
+
+
+def prune_stale_maps(history_runs, maps_dir=MAPS_DIR):
+    """Deletes spatial-map PNGs on disk that are no longer referenced by any of the
+    retained history_runs (keeps the maps/ folder from growing unbounded run-over-run)."""
+    if not os.path.exists(maps_dir):
+        return
+
+    referenced = set()
+    for run in history_runs:
+        for row_maps in (run.get("href_maps") or {}).values():
+            for rel_path in (row_maps or {}).values():
+                referenced.add(os.path.basename(rel_path))
+
+    for f in os.listdir(maps_dir):
+        if f not in referenced:
+            try:
+                os.unlink(os.path.join(maps_dir, f))
+            except Exception:
+                pass
 
 
 def pressure_to_height_ft(pres_hpa):
@@ -101,6 +133,156 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
         logging.error(f"Pygrib extraction failed for {stn.upper()}: {e}")
 
     return threshold_results
+
+
+def _fig_to_png_file(fig, filename):
+    os.makedirs(MAPS_DIR, exist_ok=True)
+    out_path = os.path.join(MAPS_DIR, filename)
+    fig.savefig(out_path, format="png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    # Relative path for use directly as an <img src="..."> in index.html
+    return f"maps/{filename}"
+
+
+def generate_spatial_threshold_maps(filepath, file_prefix):
+    """
+    Builds a Florida-domain spatial plot (PNG, written to MAPS_DIR) for each of the 4
+    HREF lightning exceedance thresholds (p25/p50/p100/p200) from a single GRIB2 file.
+    `file_prefix` should uniquely identify the run/forecast-hour, e.g. "20260630_00z_f012".
+    Returns a dict like {"p25": "maps/20260630_00z_f012_p25.png", ...} (missing keys if a
+    given threshold message wasn't found or plotting failed).
+    """
+    maps = {}
+    try:
+        grbs = pygrib.open(filepath)
+        sample = grbs[1]
+        lats, lons = sample.latlons()
+        lons_n = np.where(lons > 180, lons - 360.0, lons)
+
+        domain_mask = (
+            (lats >= FL_DOMAIN["lat_min"]) & (lats <= FL_DOMAIN["lat_max"]) &
+            (lons_n >= FL_DOMAIN["lon_min"]) & (lons_n <= FL_DOMAIN["lon_max"])
+        )
+        ys, xs = np.where(domain_mask)
+        if len(ys) == 0:
+            grbs.close()
+            return maps
+
+        y0, y1 = ys.min(), ys.max()
+        x0, x1 = xs.min(), xs.max()
+        sub_lats = lats[y0:y1 + 1, x0:x1 + 1]
+        sub_lons = lons_n[y0:y1 + 1, x0:x1 + 1]
+
+        proj = ccrs.PlateCarree()
+        states_provinces = cfeature.NaturalEarthFeature(
+            category="cultural", name="admin_1_states_provinces_lines",
+            scale="50m", facecolor="none"
+        )
+        counties = cfeature.NaturalEarthFeature(
+            category="cultural", name="admin_2_counties",
+            scale="10m", facecolor="none"
+        )
+
+        grbs.seek(0)
+        for msg_idx, grb in enumerate(grbs, start=1):
+            msg_str = str(grb).lower()
+
+            if "upperlimit=25" in msg_str or "prob > 0.25" in msg_str or "probability=25" in msg_str:
+                thresh_key = "p25"
+            elif "upperlimit=50" in msg_str or "prob > 0.50" in msg_str or "probability=50" in msg_str:
+                thresh_key = "p50"
+            elif "upperlimit=100" in msg_str or "prob > 1.0" in msg_str or "probability=100" in msg_str:
+                thresh_key = "p100"
+            elif "upperlimit=200" in msg_str or "prob > 2.0" in msg_str or "probability=200" in msg_str:
+                thresh_key = "p200"
+            else:
+                thresh_key = MSG_INDEX_THRESHOLDS.get(msg_idx)
+
+            if not thresh_key or thresh_key in maps:
+                continue
+
+            try:
+                raw_vals = grb.values[y0:y1 + 1, x0:x1 + 1]
+                vals = np.nan_to_num(np.asarray(raw_vals, dtype=float), nan=0.0)
+                # Normalize fractional probabilities (0-1) up to percent (0-100)
+                if vals.max() <= 1.0:
+                    vals = vals * 100.0
+
+                fig = plt.figure(figsize=(4.0, 4.2), dpi=100)
+                ax = fig.add_subplot(1, 1, 1, projection=proj)
+                ax.set_extent(
+                    [FL_DOMAIN["lon_min"], FL_DOMAIN["lon_max"], FL_DOMAIN["lat_min"], FL_DOMAIN["lat_max"]],
+                    crs=proj
+                )
+
+                # Base map styling
+                ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="#dbeafe", zorder=0)
+                ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#f1f5f9", zorder=0)
+                ax.add_feature(counties, edgecolor="#cbd5e1", linewidth=0.35, zorder=1)
+                ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="#1e293b", linewidth=0.9, zorder=3)
+                ax.add_feature(states_provinces, edgecolor="#475569", linewidth=0.8, zorder=3)
+                ax.add_feature(cfeature.BORDERS.with_scale("50m"), edgecolor="#1e293b", linewidth=0.8, zorder=3)
+
+                masked_vals = np.ma.masked_less_equal(vals, 0.0)
+                mesh = ax.pcolormesh(
+                    sub_lons, sub_lats, masked_vals, cmap="hot_r", vmin=0, vmax=100,
+                    shading="auto", transform=proj, zorder=2, alpha=0.85
+                )
+
+                # Station markers for orientation
+                for stn_id, coords in STN_COORDS.items():
+                    ax.plot(
+                        coords["lon"], coords["lat"], marker="^", markersize=5,
+                        color="#2563eb", markeredgecolor="white", markeredgewidth=0.6,
+                        transform=proj, zorder=4
+                    )
+
+                gl = ax.gridlines(draw_labels=False, linewidth=0.4, color="#94a3b8", alpha=0.5, linestyle="--")
+
+                ax.set_title(f"HREF ≥ {thresh_key[1:]} Flash Density", fontsize=9, fontweight="bold", color="#1e293b")
+                cbar = fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.03)
+                cbar.set_label("Exceedance Probability (%)", fontsize=7)
+                cbar.ax.tick_params(labelsize=6)
+
+                maps[thresh_key] = _fig_to_png_file(fig, f"{file_prefix}_{thresh_key}.png")
+            except Exception as plot_err:
+                logging.error(f"Spatial plot render failed for {thresh_key}: {plot_err}")
+
+        grbs.close()
+    except Exception as e:
+        logging.error(f"Spatial map extraction failed for {filepath}: {e}")
+
+    return maps
+
+
+def fetch_href_spatial_map(session, date_str, cycle, f_hour_int):
+    """Downloads the HREF lightning GRIB2 once per forecast hour (domain-wide, not
+    station-specific) and renders the Florida spatial threshold maps from it."""
+    base_url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/spc_post.{date_str}/ltgdensity"
+    file_name = f"spc_post.t{cycle}z.hrefld_4hr.f{f_hour_int:03d}.grib2"
+    url = f"{base_url}/{file_name}"
+    local_path = os.path.join(CACHE_DIR, f"spatial_{file_name}")
+
+    try:
+        with session.get(url, timeout=10, stream=True) as r:
+            if r.status_code == 200:
+                with open(local_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+                file_prefix = f"{date_str}_{cycle}z_f{f_hour_int:03d}"
+                maps = generate_spatial_threshold_maps(local_path, file_prefix)
+
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                return maps
+    except Exception as e:
+        logging.debug(f"Spatial map download break for {file_name}: {e}")
+
+    if os.path.exists(local_path):
+        try: os.remove(local_path)
+        except Exception: pass
+    return {}
 
 
 def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour_int):
@@ -166,7 +348,7 @@ def fetch_href_lightning(time_keys):
 
     if not active_cycle:
         logging.warning("No active 00Z or 12Z SPC HREF lightning directories found on NOMADS.")
-        return href_data
+        return href_data, {}
 
     logging.info(f"Targeting Valid NOMADS Initialization Run: {active_date_str} at {active_cycle}Z")
 
@@ -174,6 +356,8 @@ def fetch_href_lightning(time_keys):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures_map = {}
+        map_futures_map = {}
+        row_to_fhour = {}
         for row_key in time_keys:
             try:
                 d_part, h_part = map(int, row_key.split("/"))
@@ -191,6 +375,8 @@ def fetch_href_lightning(time_keys):
             if f_hour_int < 1 or f_hour_int > 48:
                 continue
 
+            row_to_fhour[row_key] = f_hour_int
+
             for stn, coords in STN_COORDS.items():
                 future = executor.submit(
                     fetch_href_lightning_point,
@@ -199,6 +385,12 @@ def fetch_href_lightning(time_keys):
                 )
                 futures_map[future] = (stn, row_key)
 
+            # One spatial-map render per forecast hour (domain-wide, not per station)
+            map_future = executor.submit(
+                fetch_href_spatial_map, session, active_date_str, active_cycle, f_hour_int
+            )
+            map_futures_map[map_future] = row_key
+
         for future in concurrent.futures.as_completed(futures_map):
             stn, row_key = futures_map[future]
             try:
@@ -206,6 +398,14 @@ def fetch_href_lightning(time_keys):
                 href_data[stn][row_key] = vals
             except Exception:
                 pass
+
+        href_maps = {}
+        for future in concurrent.futures.as_completed(map_futures_map):
+            row_key = map_futures_map[future]
+            try:
+                href_maps[row_key] = future.result()
+            except Exception:
+                href_maps[row_key] = {}
 
     # Streamlined runner-safe Audit Log
     logging.info("=============================================")
@@ -227,9 +427,10 @@ def fetch_href_lightning(time_keys):
             logging.info(f"  {stn.upper()} -> All 48 forecast intervals returned flat 0%")
             
     logging.info(f"Audit Complete: Cleanly tracked {total_signals} total non-zero cell vectors.")
+    logging.info(f"Spatial threshold maps rendered for {sum(1 for v in href_maps.values() if v)} of {len(href_maps)} forecast hours.")
     logging.info("=============================================")
 
-    return href_data
+    return href_data, href_maps
 
 
 def parse_time_series_bufkit(bufkit_text):
@@ -251,7 +452,7 @@ def parse_time_series_bufkit(bufkit_text):
 
         lines = block.splitlines()
         profile_layers = []
-        pres_idx, tmpc_idx, dwpt_idx, sknt_idx = 0, 1, 3, 5
+        pres_idx, tmpc_idx, dwpt_idx, sknt_idx, drct_idx = 0, 1, 3, 5, 4
         header_names = []
         in_profile = False
 
@@ -267,6 +468,7 @@ def parse_time_series_bufkit(bufkit_text):
                     if "TMPC" in header_names: tmpc_idx = header_names.index("TMPC")
                     if "DWPT" in header_names: dwpt_idx = header_names.index("DWPT")
                     if "SKNT" in header_names: sknt_idx = header_names.index("SKNT")
+                    if "DRCT" in header_names: drct_idx = header_names.index("DRCT")
                 except ValueError:
                     pass
                 continue
@@ -275,7 +477,7 @@ def parse_time_series_bufkit(bufkit_text):
                 if "STID" in cleaned or "STNM" in cleaned:
                     break
                 parts = cleaned.split()
-                if len(parts) > max(pres_idx, tmpc_idx, dwpt_idx, sknt_idx):
+                if len(parts) > max(pres_idx, tmpc_idx, dwpt_idx, sknt_idx, drct_idx):
                     try:
                         if not parts[0].replace(".", "", 1).replace("-", "", 1).isdigit():
                             continue
@@ -283,7 +485,18 @@ def parse_time_series_bufkit(bufkit_text):
                         tmpc = float(parts[tmpc_idx])
                         dwpt = float(parts[dwpt_idx])
                         sknt = float(parts[sknt_idx])
+                        try:
+                            drct = float(parts[drct_idx])
+                        except (ValueError, IndexError):
+                            drct = None
                         if 100.0 <= pres <= 1050.0:
+                            # Meteorological wind vector components (u: east+, v: north+).
+                            # "FROM" direction convention -> components point opposite the heading.
+                            if drct is not None and 0.0 <= drct <= 360.0:
+                                u_comp = -sknt * math.sin(math.radians(drct))
+                                v_comp = -sknt * math.cos(math.radians(drct))
+                            else:
+                                u_comp, v_comp = None, None
                             profile_layers.append({
                                 "pres": pres,
                                 "hght": pressure_to_height_ft(pres),
@@ -291,6 +504,9 @@ def parse_time_series_bufkit(bufkit_text):
                                 "dwpt": dwpt,
                                 "depr": tmpc - dwpt,
                                 "sknt": sknt,
+                                "drct": drct,
+                                "u": u_comp,
+                                "v": v_comp,
                             })
                     except (ValueError, IndexError):
                         continue
@@ -309,6 +525,43 @@ def parse_time_series_bufkit(bufkit_text):
                     fraction = (target_temp - t1) / (t2 - t1)
                     return (h1 + fraction * (h2 - h1)) / 1000.0
             return profile_layers[-1]["hght"] / 1000.0
+
+        def get_wind_component_at_agl(target_agl_ft, sfc_hght):
+            """Linearly interpolate u/v wind components to a target height (ft AGL)."""
+            for i in range(len(profile_layers) - 1):
+                l1, l2 = profile_layers[i], profile_layers[i + 1]
+                if l1["u"] is None or l1["v"] is None or l2["u"] is None or l2["v"] is None:
+                    continue
+                agl1 = l1["hght"] - sfc_hght
+                agl2 = l2["hght"] - sfc_hght
+                if (agl1 <= target_agl_ft <= agl2) or (agl2 <= target_agl_ft <= agl1):
+                    if agl1 == agl2:
+                        return l1["u"], l1["v"]
+                    fraction = (target_agl_ft - agl1) / (agl2 - agl1)
+                    u = l1["u"] + fraction * (l2["u"] - l1["u"])
+                    v = l1["v"] + fraction * (l2["v"] - l1["v"])
+                    return u, v
+            # Fall back to the last available wind-bearing layer
+            for layer in reversed(profile_layers):
+                if layer["u"] is not None and layer["v"] is not None:
+                    return layer["u"], layer["v"]
+            return None, None
+
+        def calc_shear_0_6km():
+            """0-6 km AGL bulk shear magnitude (kt), using true wind vector components."""
+            if not profile_layers:
+                return None
+            sfc_layer = profile_layers[0]
+            if sfc_layer["u"] is None or sfc_layer["v"] is None:
+                return None
+            sfc_hght = sfc_layer["hght"]
+            u_sfc, v_sfc = sfc_layer["u"], sfc_layer["v"]
+            target_agl_ft = 6000.0 * 3.280839895  # 6 km converted to feet
+            u_6km, v_6km = get_wind_component_at_agl(target_agl_ft, sfc_hght)
+            if u_6km is None or v_6km is None:
+                return None
+            shear_kt = math.hypot(u_6km - u_sfc, v_6km - v_sfc)
+            return round(shear_kt, 1)
 
         cloud_layers = []
         active_cloud = None
@@ -336,7 +589,7 @@ def parse_time_series_bufkit(bufkit_text):
         hourly_data[valid_hour_key] = {
             "mom_mean": round(mean_wind, 1),
             "mom_max": round(max_pbl, 1),
-            "shear": "WS020/25022KT" if max_pbl > 35 else None,
+            "shear": calc_shear_0_6km(),
             "vis": vis,
             "ceiling": ceiling_val,
             "hght_0c": round(get_height_of_isotherm(0.0), 1),
@@ -363,7 +616,7 @@ def fetch_station_model(session, stn, model):
 
 
 def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_rows):
-    href_lightning = fetch_href_lightning(time_rows)
+    href_lightning, href_maps = fetch_href_lightning(time_rows)
 
     history_runs = []
     if os.path.exists(HISTORY_FILE):
@@ -378,6 +631,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         "timestamp": current_timestamp,
         "data": current_sounding_matrix,
         "href_lightning": href_lightning,
+        "href_maps": href_maps,
     }
 
     if not history_runs or history_runs[0]["timestamp"] != current_timestamp:
@@ -386,6 +640,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
 
     with open(HISTORY_FILE, "w") as f:
         json.dump(history_runs, f, indent=2)
+    prune_stale_maps(history_runs)
     logging.info("Dashboard matrix completely compiled and written to history.json.")
 
 
