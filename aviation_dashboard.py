@@ -63,6 +63,14 @@ RRFS_LATENCY_H = 4           # approx hours before a cycle's files are complete 
 # REFS averages ('avrg') post ~6-hourly. Since the app runs hourly, each run just picks up
 # the latest available cycle; the 6-hourly cadence is fine (rows repeat until the next cycle).
 
+# HRRR pressure-level GRIB2 on AWS (byte-range friendly via .idx, no bot-blocking). HRRR
+# only reaches f48 on the 00/06/12/18z "extended" cycles; other cycles stop at f18. We pull
+# HRRR pads through this AWS path (same idx machinery as RRFS) rather than the flaky NOMADS
+# grib-filter, which was silently failing the cycle probe.
+HRRR_AWS_ROOT = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
+HRRR_EXTENDED_CYCLES = [0, 6, 12, 18]
+HRRR_LATENCY_H = 3
+
 # The exact REFS ensemble-mean filename ordering has drifted across the pre-op feed. We probe
 # these candidate patterns (formatted with cycle `c` and forecast-hour ints) once per run and
 # cache whichever resolves, so every subsequent hour reuses the confirmed pattern.
@@ -1006,12 +1014,14 @@ def determine_model_cycle(session, model):
 
 
 def fetch_all_pad_soundings():
-    """Build the pad sounding matrix {pad_id: {model: {row_key: variables}}} across
-    all three models for the 1-48h window (GFS) / 1-48h (RAP/HRRR capped to availability)."""
+    """Build the pad sounding matrix {pad_id: {model: {row_key: variables}}} from NOMADS.
+    GFS and RAP are pulled here via the NOMADS grib-filter; HRRR is intentionally skipped
+    (its NOMADS filter probe was unreliable) and instead sourced from AWS in the RRFS pass."""
     pad_matrix = {pid: {m: {} for m in MODELS} for pid in LAUNCH_PADS}
+    nomads_models = [m for m in MODELS if m != "hrrr"]  # HRRR comes from AWS instead
 
     with requests.Session() as session:
-        for model in MODELS:
+        for model in nomads_models:
             date_str, cycle = determine_model_cycle(session, model)
             if not cycle:
                 logging.warning(f"No available {model.upper()} cycle found for pad soundings.")
@@ -1145,11 +1155,19 @@ def _rrfs_determine_cycle(session, model_kind):
     temperature data (guards against picking a precip-only product like 'avrg')."""
     global _REFS_RESOLVED_PATTERN
     now = datetime.datetime.now(datetime.timezone.utc)
-    for back in range(0, 30):
+
+    # HRRR only reaches f48 on the 00/06/12/18z extended cycles; restrict to those so we
+    # never pick an odd-hour cycle that stops at f18.
+    if model_kind == "hrrr":
+        cycle_hours, latency_h = HRRR_EXTENDED_CYCLES, HRRR_LATENCY_H
+    else:
+        cycle_hours, latency_h = RRFS_CYCLE_HOURS, RRFS_LATENCY_H
+
+    for back in range(0, 36):
         cand = now - datetime.timedelta(hours=back)
-        if cand.hour not in RRFS_CYCLE_HOURS:
+        if cand.hour not in cycle_hours:
             continue
-        if (now - cand).total_seconds() / 3600.0 < RRFS_LATENCY_H:
+        if (now - cand).total_seconds() / 3600.0 < latency_h:
             continue
         date_str = cand.strftime("%Y%m%d")
         cycle = f"{cand.hour:02d}"
@@ -1189,13 +1207,15 @@ def _rrfs_determine_cycle(session, model_kind):
 
 
 def _rrfs_grib_url(model_kind, date_str, cycle, f_hour_int):
-    """Build the AWS S3 URL for an RRFS deterministic or REFS ensemble-mean prslev file.
-    For REFS, uses the module-cached resolved filename pattern (falls back to the first
-    candidate if not yet resolved)."""
+    """Build the AWS S3 URL for an RRFS deterministic, REFS ensemble-mean, or HRRR
+    pressure-level file. For REFS, uses the module-cached resolved filename pattern."""
     if model_kind == "refs":
         pat = _REFS_RESOLVED_PATTERN or REFS_FILENAME_CANDIDATES[0]
         f_name = pat.format(c=cycle, f2=f"{f_hour_int:02d}", f3=f"{f_hour_int:03d}")
         return f"{RRFS_AWS_ROOT}/rrfs_a/refs.{date_str}/{cycle}/enspost/{f_name}"
+    elif model_kind == "hrrr":
+        f_name = f"hrrr.t{cycle}z.wrfprsf{f_hour_int:02d}.grib2"
+        return f"{HRRR_AWS_ROOT}/hrrr.{date_str}/conus/{f_name}"
     else:
         f_name = f"rrfs.t{cycle}z.prslev.3km.f{f_hour_int:03d}.conus.grib2"
         return f"{RRFS_AWS_ROOT}/rrfs_public/rrfs.{date_str}/{cycle}/{f_name}"
@@ -1249,13 +1269,15 @@ def fetch_rrfs_pad_hour(session, model_kind, date_str, cycle, f_hour_int, row_ke
     return row_key, model_kind, out
 
 
-def fetch_all_rrfs_refs_soundings():
-    """Build {site_id: {'rrfs'|'refs': {row_key: variables}}} from AWS for both systems,
-    for BOTH the launch pads and the BUFKIT airport points (airports have no BUFKIT RRFS/
-    REFS profiles yet, so we point-extract them from the raw grid the same way)."""
+def fetch_all_rrfs_refs_soundings(include_hrrr=True):
+    """Build {site_id: {'rrfs'|'refs'|'hrrr': {row_key: variables}}} from AWS, for BOTH the
+    launch pads and the BUFKIT airport points (airports have no BUFKIT RRFS/REFS profiles).
+    HRRR is pulled here too (via the same idx byte-range path) because the NOMADS grib-filter
+    probe for HRRR was unreliable; its results replace the failed NOMADS HRRR pad column."""
     kinds = []
     if RRFS_ENABLED: kinds.append("rrfs")
     if REFS_ENABLED: kinds.append("refs")
+    if include_hrrr: kinds.append("hrrr")
 
     # Combined site set: launch pads + the 5 airport stations, all point-extracted.
     all_coords = {}
@@ -1273,12 +1295,11 @@ def fetch_all_rrfs_refs_soundings():
         for kind in kinds:
             date_str, cycle = _rrfs_determine_cycle(session, kind)
             if not cycle:
-                logging.warning(f"No available {kind.upper()} cycle found on AWS (pre-op feed may be down).")
+                logging.warning(f"No available {kind.upper()} cycle found on AWS.")
                 continue
             cycle_init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
-            # RRFS deterministic and REFS avrg both provide hourly forecast output, so we
-            # request every hour 1-48. Any hour that happens to be missing simply 404s on
-            # the .idx probe and is skipped, so the exact availability never has to be hardcoded.
+            # RRFS/REFS/HRRR all provide hourly forecast output; request 1-48 and let any
+            # missing hour 404 on its .idx probe (so exact availability is never hardcoded).
             f_hours = list(range(1, RRFS_MAX_FH + 1))
 
             logging.info(f"Fetching {kind.upper()} columns from AWS ({len(all_coords)} sites): {date_str} {cycle}z, {len(f_hours)} hours")
@@ -1406,28 +1427,31 @@ def run_pipeline():
         logging.error(f"Launch-pad sounding fetch failed, continuing without pads: {e}")
         pad_matrix = None
 
-    # Fetch RRFS (deterministic) + REFS (ensemble avg) columns from AWS and merge them in.
-    # These are point-extracted for BOTH the launch pads (into pad_matrix) and the BUFKIT
-    # airport stations (into sounding_matrix), since airports have no BUFKIT RRFS/REFS yet.
+    # Fetch RRFS + REFS + HRRR columns from AWS (single idx-based pass). RRFS/REFS are
+    # point-extracted for BOTH pads and airports; AWS HRRR is applied to PADS ONLY (the
+    # airports already have superior BUFKIT HRRR soundings, so we don't overwrite those).
     if RRFS_ENABLED or REFS_ENABLED:
         try:
-            rrfs_matrix = fetch_all_rrfs_refs_soundings()
+            aws_matrix = fetch_all_rrfs_refs_soundings(include_hrrr=True)
             if pad_matrix is None:
                 pad_matrix = {pid: {} for pid in LAUNCH_PADS}
-            for sid, kinds in rrfs_matrix.items():
+            for sid, kinds in aws_matrix.items():
                 is_pad = sid in LAUNCH_PADS
                 target = pad_matrix if is_pad else sounding_matrix
-                if not is_pad and sid not in target:
-                    target[sid] = {}
                 target.setdefault(sid, {})
                 for kind, rows in kinds.items():
-                    if rows:
-                        target[sid][kind] = rows
-            r_hours = sum(len(k.get("rrfs", {})) for k in rrfs_matrix.values())
-            e_hours = sum(len(k.get("refs", {})) for k in rrfs_matrix.values())
-            logging.info(f"RRFS/REFS columns merged (RRFS {r_hours}, REFS {e_hours} site-hours across pads + airports).")
+                    if not rows:
+                        continue
+                    # AWS HRRR only fills pad columns; airports retain BUFKIT HRRR.
+                    if kind == "hrrr" and not is_pad:
+                        continue
+                    target[sid][kind] = rows
+            r_hours = sum(len(k.get("rrfs", {})) for k in aws_matrix.values())
+            e_hours = sum(len(k.get("refs", {})) for k in aws_matrix.values())
+            h_hours = sum(len(aws_matrix[p].get("hrrr", {})) for p in LAUNCH_PADS if p in aws_matrix)
+            logging.info(f"AWS columns merged (RRFS {r_hours}, REFS {e_hours} site-hours; HRRR {h_hours} pad-hours).")
         except Exception as e:
-            logging.error(f"RRFS/REFS fetch failed, continuing without them: {e}")
+            logging.error(f"AWS RRFS/REFS/HRRR fetch failed, continuing without them: {e}")
 
     generate_aviation_dashboard(STATIONS, MODELS, sounding_matrix, time_rows, pad_matrix=pad_matrix)
 
