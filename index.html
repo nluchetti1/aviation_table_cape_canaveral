@@ -55,8 +55,8 @@
         .ltg-high { background-color: #fca5a5; color: #991b1b; }
 
         #hover-popup-card { position: absolute; z-index: 500; background: #ffffff; color: #1e293b; border: 2px solid #3b82f6; border-radius: 6px; padding: 12px; width: 310px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none; pointer-events: none; font-size: 0.8rem; line-height: 1.4; }
-        #hover-popup-card.popup-wide { width: 540px; }
-        .ltg-map-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
+        #hover-popup-card.popup-wide { width: 860px; max-width: 94vw; }
+        .ltg-map-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 10px; }
         .ltg-map-cell { border: 1px solid #e2e8f0; border-radius: 4px; overflow: hidden; background: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 80px; }
         .ltg-map-cell img { width: 100%; height: auto; display: block; }
         .ltg-map-empty { color: #94a3b8; font-size: 0.7rem; text-align: center; font-weight: bold; }
@@ -600,7 +600,7 @@
 
                     <div class="explanation-box">
                         <strong>Launch Commit Criteria (LCC) Guides &amp; Methodology:</strong><br><br>
-                        • <strong>HREF Lightning Density:</strong> Machine-learning calibrated probability utilizing a 4-hour rolling mean of ensemble proxy metrics (e.g., updraft helicity, graupel flux) to forecast grid-based strike exceedances.<br><br>
+                        • <strong>HREF Lightning Density:</strong> A convection-allowing ensemble combining several high-resolution models, each giving a plausible storm evolution. Every member estimates lightning flashes from storm properties (updraft strength, mixed-phase microphysics, storm depth), accumulated over ~20 × 20 km grid boxes for the chosen period (1-, 3-, or 6-hour). The displayed value is the percentage of members exceeding each flash-count threshold.<br><br>
                         • <strong>Isotherm Profiles (0/-5/-10/-20°C Height):</strong> The profile is scanned for each target isotherm; the height (kft) is linearly interpolated between the two sounding levels that bracket that temperature. These delineate the charging zones where triboelectric (ice/graupel collision) charging and natural/triggered lightning are most favorable.<br><br>
                         • <strong>Highest Cloud Top:</strong> Height (kft) of the top of the highest layer meeting the saturation criterion (relative humidity ≥ 95%), compared against the isotherm heights above to judge whether the flight path would pass through a glaciated (charge-bearing) cloud region.<br><br>
                         • <strong>Max Layer Thickness:</strong> Contiguous saturated levels (RH ≥ 95%) are grouped into discrete cloud decks; this reports the depth (kft) of the single thickest continuous deck, a proxy for the most robust convective/charging layer.<br><br>
@@ -684,24 +684,39 @@
         }
 
         function movePopup(e) {
-            // Measure the popup, then place it so it never runs off the right or bottom edge.
+            // Measure the popup, then place it so it never runs off any edge.
             const pad = 15;
             const rect = popupCard.getBoundingClientRect();
             const pw = rect.width || 540;
             const ph = rect.height || 400;
+            const isWide = popupCard.classList.contains("popup-wide");
 
-            let left = e.pageX + pad;
-            let top = e.pageY - 40;
-
-            // Flip to the left of the cursor if it would overflow the right edge.
-            if (left + pw > window.scrollX + window.innerWidth - pad) {
-                left = e.pageX - pw - pad;
-                if (left < window.scrollX + pad) left = window.scrollX + pad;
+            let left, top;
+            if (isWide) {
+                // Wide map strip: center horizontally on the cursor, sit just below it,
+                // then clamp inside the viewport so all four panels stay fully visible.
+                left = e.pageX - pw / 2;
+                top = e.pageY + pad;
+            } else {
+                left = e.pageX + pad;
+                top = e.pageY - 40;
+                // Flip to the left of the cursor if it would overflow the right edge.
+                if (left + pw > window.scrollX + window.innerWidth - pad) {
+                    left = e.pageX - pw - pad;
+                }
             }
-            // Clamp vertically so the bottom (higher-threshold panels) stays on screen.
+
+            // Horizontal clamp
+            const minLeft = window.scrollX + pad;
+            const maxLeft = window.scrollX + window.innerWidth - pw - pad;
+            if (left > maxLeft) left = maxLeft;
+            if (left < minLeft) left = minLeft;
+
+            // Vertical clamp (keeps the bottom of the panel on screen)
             const maxTop = window.scrollY + window.innerHeight - ph - pad;
+            const minTop = window.scrollY + pad;
             if (top > maxTop) top = maxTop;
-            if (top < window.scrollY + pad) top = window.scrollY + pad;
+            if (top < minTop) top = minTop;
 
             popupCard.style.left = left + "px";
             popupCard.style.top = top + "px";
