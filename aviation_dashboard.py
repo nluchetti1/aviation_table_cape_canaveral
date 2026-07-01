@@ -45,6 +45,26 @@ LAUNCH_PADS = {
 THRESHOLD_MAP = {25: "p25", 50: "p50", 100: "p100", 200: "p200"}
 MSG_INDEX_THRESHOLDS = {1: "p25", 2: "p50", 3: "p100", 4: "p200"}
 
+# ---- RRFS / REFS configuration -------------------------------------------------
+# RRFS (deterministic) and REFS (ensemble) are pre-operational until 2026-08-31 12z.
+# We pull from the public AWS Open-Data bucket (no auth, HTTP range-request friendly)
+# rather than NOMADS, using each file's .idx sidecar to byte-range only the ~21 isobaric
+# levels we need instead of downloading the whole ~40MB CONUS file.
+#
+# The rrfs_public/ tree is the "operationally-representative" set per the AWS registry:
+#   rrfs_public/rrfs.YYYYMMDD/CC/rrfs.tCCz.prslev.3km.fFFF.conus.grib2      (deterministic)
+#   rrfs_public/refs.YYYYMMDD/CC/ensprod/ ...                              (ensemble products)
+RRFS_ENABLED = True          # master switch for the RRFS deterministic pad column
+REFS_ENABLED = True          # master switch for the REFS ensemble-average pad column
+RRFS_AWS_ROOT = "https://noaa-rrfs-pds.s3.amazonaws.com"
+RRFS_CYCLE_HOURS = [0, 6, 12, 18]   # cycles that run to full length
+RRFS_MAX_FH = 48             # RRFS/REFS run to 60h; cap at 48 to match the rest of the board
+RRFS_LATENCY_H = 4           # approx hours before a cycle's files are complete on AWS
+# REFS averages ('avrg') post ~6-hourly. Since the app runs hourly, each run just picks up
+# the latest available cycle; the 6-hourly cadence is fine (rows repeat until the next cycle).
+
+
+
 # Bounding box — zoomed into the Space Coast launch corridor rather than all of FL
 FL_DOMAIN = {"lat_min": 25.5, "lat_max": 30.5, "lon_min": -83.5, "lon_max": -79.5}
 
@@ -959,9 +979,12 @@ def fetch_all_pad_soundings():
                 continue
             cycle_init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
 
-            # HRRR native output is hourly to f48 (extended runs); RAP to f21/f51; GFS 3-hourly is fine hourly here.
+            # All three are requested hourly across the 48h window. GFS carries hourly
+            # native output through f120 on NOMADS (3-hourly only kicks in after f120),
+            # so within 48h we get a full hourly series that matches the BUFKIT airports
+            # and avoids sparse every-third-row gaps in the merged table.
             max_fh = 48
-            step = 1 if model in ("rap", "hrrr") else 3
+            step = 1
             f_hours = list(range(step, max_fh + 1, step))
 
             logging.info(f"Fetching {model.upper()} pad columns: {date_str} {cycle}z, {len(f_hours)} hours")
@@ -994,6 +1017,234 @@ def fetch_all_pad_soundings():
                 logging.info(f"{model.upper()} pad soundings: {hours_ok}/{len(f_hours)} forecast hours produced data.")
 
     return pad_matrix
+
+
+# ---------------------------------------------------------------------------
+# RRFS (deterministic) + REFS (ensemble mean) pad columns via AWS Open Data
+# ---------------------------------------------------------------------------
+
+def _parse_grib_idx(idx_text):
+    """Parse a GRIB2 .idx sidecar into a list of (msg_num, byte_start, shortName, level).
+    Each idx line looks like: '1:0:d=2026070100:REFC:entire atmosphere:...'
+    We only need the byte offsets so we can range-request specific messages."""
+    entries = []
+    lines = [ln for ln in idx_text.splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
+        parts = ln.split(":")
+        if len(parts) < 5:
+            continue
+        try:
+            msg_num = int(parts[0])
+            byte_start = int(parts[1])
+        except ValueError:
+            continue
+        short = parts[3].strip()
+        level = parts[4].strip()
+        # Byte end = start of next message - 1 (or EOF for the last message)
+        byte_end = None
+        if i + 1 < len(lines):
+            nxt = lines[i + 1].split(":")
+            try:
+                byte_end = int(nxt[1]) - 1
+            except (ValueError, IndexError):
+                byte_end = None
+        entries.append({"msg": msg_num, "start": byte_start, "end": byte_end,
+                        "short": short, "level": level})
+    return entries
+
+
+def _range_download_grib(session, grib_url, idx_entries, wanted_levels_hpa, debug=False):
+    """Given parsed idx entries, byte-range download only the isobaric TMP/RH/HGT/UGRD/VGRD
+    messages at the wanted levels and concatenate them into a local temp GRIB2 file."""
+    # Match idx level strings like "500 mb" and variable names.
+    wanted_vars = ("TMP", "RH", "HGT", "UGRD", "VGRD")
+    wanted_level_strs = {f"{lv} mb" for lv in wanted_levels_hpa}
+
+    ranges = []
+    for e in idx_entries:
+        if e["short"] not in wanted_vars:
+            continue
+        if e["level"] not in wanted_level_strs:
+            continue
+        if e["end"] is None:
+            ranges.append((e["start"], ""))  # open-ended to EOF
+        else:
+            ranges.append((e["start"], e["end"]))
+
+    if not ranges:
+        if debug:
+            logging.warning("[RRFS DEBUG]   idx parsed but no matching isobaric TMP/RH/HGT/U/V "
+                            "messages at wanted levels — check idx var/level naming.")
+        return None
+
+    local_path = os.path.join(CACHE_DIR, f"rrfs_col_{abs(hash(grib_url)) % 10_000_000}.grib2")
+    try:
+        with open(local_path, "wb") as fh:
+            # Group into a single multi-range request where possible; fall back to per-range.
+            for start, end in ranges:
+                hdr = {"Range": f"bytes={start}-{end}"}
+                r = session.get(grib_url, headers=hdr, timeout=25)
+                if r.status_code in (200, 206):
+                    fh.write(r.content)
+        if os.path.getsize(local_path) == 0:
+            os.remove(local_path)
+            return None
+        return local_path
+    except Exception as e:
+        if debug:
+            logging.warning(f"[RRFS DEBUG]   range download failed: {e}")
+        if os.path.exists(local_path):
+            try: os.remove(local_path)
+            except Exception: pass
+        return None
+
+
+def _rrfs_determine_cycle(session, model_kind):
+    """Find the most recent RRFS/REFS cycle available on AWS by probing .idx existence.
+    model_kind: 'rrfs' (deterministic) or 'refs' (ensemble). Returns (date_str, cycle)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for back in range(0, 30):
+        cand = now - datetime.timedelta(hours=back)
+        if cand.hour not in RRFS_CYCLE_HOURS:
+            continue
+        if (now - cand).total_seconds() / 3600.0 < RRFS_LATENCY_H:
+            continue
+        date_str = cand.strftime("%Y%m%d")
+        cycle = f"{cand.hour:02d}"
+        probe = _rrfs_grib_url(model_kind, date_str, cycle, 1) + ".idx"
+        try:
+            r = session.get(probe, timeout=10)
+            if r.status_code == 200 and len(r.text) > 50:
+                return date_str, cycle
+        except Exception:
+            continue
+    return None, None
+
+
+def _rrfs_grib_url(model_kind, date_str, cycle, f_hour_int):
+    """Build the AWS S3 URL for an RRFS deterministic or REFS ensemble-average prslev file.
+
+    REFS combined ensemble products live (somewhat confusingly) under the rrfs_a/ tree in
+    an enspost/ subdir, with the ensemble average tagged 'avrg' and a 2-digit forecast hour:
+      rrfs_a/refs.YYYYMMDD/CC/enspost/refs.tCCz.avrg.fFF.conus.grib2
+    RRFS deterministic prslev is under the rrfs_public/ tree with a 3-digit forecast hour:
+      rrfs_public/rrfs.YYYYMMDD/CC/rrfs.tCCz.prslev.3km.fFFF.conus.grib2
+    """
+    if model_kind == "refs":
+        f_name = f"refs.t{cycle}z.avrg.f{f_hour_int:02d}.conus.grib2"
+        return f"{RRFS_AWS_ROOT}/rrfs_a/refs.{date_str}/{cycle}/enspost/{f_name}"
+    else:
+        f_name = f"rrfs.t{cycle}z.prslev.3km.f{f_hour_int:03d}.conus.grib2"
+        return f"{RRFS_AWS_ROOT}/rrfs_public/rrfs.{date_str}/{cycle}/{f_name}"
+
+
+def fetch_rrfs_pad_hour(session, model_kind, date_str, cycle, f_hour_int, row_key, all_coords, debug=False):
+    """Fetch one RRFS/REFS forecast hour from AWS via idx byte-range, extract columns at
+    every site in all_coords (pads + airports), and compute variables.
+    Returns (row_key, model_kind, {site_id: variables})."""
+    grib_url = _rrfs_grib_url(model_kind, date_str, cycle, f_hour_int)
+    idx_url = grib_url + ".idx"
+    out = {}
+    local_path = None
+    try:
+        idx_resp = session.get(idx_url, timeout=15)
+        if debug:
+            logging.info(f"[RRFS DEBUG] {model_kind.upper()} f{f_hour_int:03d} idx HTTP {idx_resp.status_code}")
+            logging.info(f"[RRFS DEBUG]   idx URL: {idx_url}")
+        if idx_resp.status_code != 200:
+            if debug:
+                logging.warning(f"[RRFS DEBUG]   >>> idx not found. Check {model_kind.upper()} "
+                                f"AWS path/filename. GRIB URL was: {grib_url}")
+            return row_key, model_kind, out
+
+        idx_entries = _parse_grib_idx(idx_resp.text)
+        if debug:
+            uniq_vars = sorted({e["short"] for e in idx_entries})
+            logging.info(f"[RRFS DEBUG]   idx has {len(idx_entries)} messages; distinct vars: {uniq_vars[:25]}")
+
+        local_path = _range_download_grib(session, grib_url, idx_entries, PAD_LEVELS_HPA, debug=debug)
+        if not local_path:
+            return row_key, model_kind, out
+
+        if debug:
+            sz = os.path.getsize(local_path)
+            logging.info(f"[RRFS DEBUG]   range-downloaded {sz} bytes of isobaric fields")
+
+        site_profiles = build_pad_profiles_from_grib(local_path, all_coords, debug=debug)
+        for sid, layers in site_profiles.items():
+            result = compute_profile_variables(layers)
+            if result is not None:
+                out[sid] = result
+    except Exception as e:
+        logging.debug(f"RRFS fetch break {model_kind} f{f_hour_int:03d}: {e}")
+        if debug:
+            logging.warning(f"[RRFS DEBUG]   >>> exception: {e}")
+    finally:
+        if local_path and os.path.exists(local_path):
+            try: os.remove(local_path)
+            except Exception: pass
+    return row_key, model_kind, out
+
+
+def fetch_all_rrfs_refs_soundings():
+    """Build {site_id: {'rrfs'|'refs': {row_key: variables}}} from AWS for both systems,
+    for BOTH the launch pads and the BUFKIT airport points (airports have no BUFKIT RRFS/
+    REFS profiles yet, so we point-extract them from the raw grid the same way)."""
+    kinds = []
+    if RRFS_ENABLED: kinds.append("rrfs")
+    if REFS_ENABLED: kinds.append("refs")
+
+    # Combined site set: launch pads + the 5 airport stations, all point-extracted.
+    all_coords = {}
+    for pid, c in LAUNCH_PADS.items():
+        all_coords[pid] = {"lat": c["lat"], "lon": c["lon"]}
+    for sid, c in STN_COORDS.items():
+        all_coords[sid] = {"lat": c["lat"], "lon": c["lon"]}
+
+    if not kinds:
+        return {sid: {} for sid in all_coords}
+
+    matrix = {sid: {k: {} for k in kinds} for sid in all_coords}
+
+    with requests.Session() as session:
+        for kind in kinds:
+            date_str, cycle = _rrfs_determine_cycle(session, kind)
+            if not cycle:
+                logging.warning(f"No available {kind.upper()} cycle found on AWS (pre-op feed may be down).")
+                continue
+            cycle_init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
+            # RRFS deterministic and REFS avrg both provide hourly forecast output, so we
+            # request every hour 1-48. Any hour that happens to be missing simply 404s on
+            # the .idx probe and is skipped, so the exact availability never has to be hardcoded.
+            f_hours = list(range(1, RRFS_MAX_FH + 1))
+
+            logging.info(f"Fetching {kind.upper()} columns from AWS ({len(all_coords)} sites): {date_str} {cycle}z, {len(f_hours)} hours")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                futures = []
+                for idx, fh in enumerate(f_hours):
+                    valid_dt = cycle_init + datetime.timedelta(hours=fh)
+                    row_key = f"{valid_dt.day:02d}/{valid_dt.hour:02d}"
+                    dbg = (idx == 0)  # verbose only on first hour
+                    futures.append(executor.submit(
+                        fetch_rrfs_pad_hour, session, kind, date_str, cycle, fh, row_key, all_coords, dbg
+                    ))
+                for fut in concurrent.futures.as_completed(futures):
+                    try:
+                        row_key, mk, site_vals = fut.result()
+                        for sid, vd in site_vals.items():
+                            matrix[sid][mk][row_key] = vd
+                    except Exception:
+                        pass
+
+            sample = next(iter(all_coords))
+            hours_ok = len(matrix[sample].get(kind, {}))
+            if hours_ok == 0:
+                logging.warning(f"[RRFS DEBUG] {kind.upper()} produced ZERO usable site-hours — "
+                                f"see [RRFS DEBUG] lines above for the idx/URL mismatch.")
+            else:
+                logging.info(f"{kind.upper()} soundings: {hours_ok}/{len(f_hours)} forecast hours produced data.")
+
+    return matrix
 
 
 def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_rows, pad_matrix=None):
@@ -1091,6 +1342,29 @@ def run_pipeline():
     except Exception as e:
         logging.error(f"Launch-pad sounding fetch failed, continuing without pads: {e}")
         pad_matrix = None
+
+    # Fetch RRFS (deterministic) + REFS (ensemble avg) columns from AWS and merge them in.
+    # These are point-extracted for BOTH the launch pads (into pad_matrix) and the BUFKIT
+    # airport stations (into sounding_matrix), since airports have no BUFKIT RRFS/REFS yet.
+    if RRFS_ENABLED or REFS_ENABLED:
+        try:
+            rrfs_matrix = fetch_all_rrfs_refs_soundings()
+            if pad_matrix is None:
+                pad_matrix = {pid: {} for pid in LAUNCH_PADS}
+            for sid, kinds in rrfs_matrix.items():
+                is_pad = sid in LAUNCH_PADS
+                target = pad_matrix if is_pad else sounding_matrix
+                if not is_pad and sid not in target:
+                    target[sid] = {}
+                target.setdefault(sid, {})
+                for kind, rows in kinds.items():
+                    if rows:
+                        target[sid][kind] = rows
+            r_hours = sum(len(k.get("rrfs", {})) for k in rrfs_matrix.values())
+            e_hours = sum(len(k.get("refs", {})) for k in rrfs_matrix.values())
+            logging.info(f"RRFS/REFS columns merged (RRFS {r_hours}, REFS {e_hours} site-hours across pads + airports).")
+        except Exception as e:
+            logging.error(f"RRFS/REFS fetch failed, continuing without them: {e}")
 
     generate_aviation_dashboard(STATIONS, MODELS, sounding_matrix, time_rows, pad_matrix=pad_matrix)
 
