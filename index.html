@@ -315,26 +315,40 @@
 
             const isLaunchMode = launchMetrics.includes(activeMetric);
 
+            // Show RRFS/REFS columns whenever the selected site actually carries that data.
+            // Both launch pads AND airport stations are now point-extracted from AWS, so we
+            // detect availability directly rather than gating on pad-vs-airport.
+            const hasRrfs = !!(stationData["rrfs"] && Object.keys(stationData["rrfs"]).length);
+            const hasRefs = !!(stationData["refs"] && Object.keys(stationData["refs"]).length);
+            const models = ["gfs", "rap", "hrrr"];
+            if (hasRrfs) models.push("rrfs");
+            if (hasRefs) models.push("refs");
+
+            const modelHeaders = {
+                gfs: "GFS", rap: "RAP", hrrr: "HRRR",
+                rrfs: "RRFS", refs: "REFS<br><span style='font-weight:normal;font-size:0.7em'>avg</span>"
+            };
+            const modelThs = models.map(m => {
+                const extra = (m === "rrfs" || m === "refs")
+                    ? " style='background:#1e3a5f; color:white;'" : "";
+                return `<th${extra}>${modelHeaders[m]}</th>`;
+            }).join("");
+
             if (isLaunchMode) {
                 headerRow.innerHTML = `
                     <th style="width: 95px;">Time (UTC)</th>
-                    <th>GFS</th>
-                    <th>RAP</th>
-                    <th>HRRR</th>
+                    ${modelThs}
                     <th style="width: 110px; background:#475569; color:white; border-left: 2px solid #cbd5e1 !important;">HREF LTG</th>
                 `;
             } else {
                 headerRow.innerHTML = `
                     <th style="width: 95px;">Time (UTC)</th>
-                    <th>GFS</th>
-                    <th>RAP</th>
-                    <th>HRRR</th>
+                    ${modelThs}
                 `;
             }
 
             renderLegendPanel();
 
-            const models = ["gfs", "rap", "hrrr"];
             let timeSet = new Set();
 
             models.forEach(m => {
