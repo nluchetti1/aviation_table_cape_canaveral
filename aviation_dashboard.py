@@ -633,32 +633,42 @@ def compute_profile_variables(profile_layers):
         except Exception:
             return None
 
-    # A layer is "in cloud" when RH >= 95%. This is a tighter, more realistic ceiling
-    # criterion than dewpoint-depression <= 2C, which was flagging MVFR too aggressively.
+    def _group_cloud_layers(is_cloud_fn):
+        """Walk the profile bottom-up, grouping contiguous 'in cloud' levels into decks.
+        is_cloud_fn(layer) -> bool decides membership."""
+        decks = []
+        active = None
+        for layer in profile_layers:
+            if is_cloud_fn(layer):
+                if active is None:
+                    active = {"base": layer["hght"], "top": layer["hght"]}
+                else:
+                    active["top"] = layer["hght"]
+            elif active is not None:
+                decks.append(active)
+                active = None
+        if active:
+            decks.append(active)
+        return decks
+
+    # Ceiling uses the stricter RH >= 95% criterion: a discrete "is there a solid deck here"
+    # test that avoids over-calling MVFR. Cloud TOP and THICKNESS use the more permissive
+    # dewpoint-depression <= 2C criterion, which captures the fuller vertical extent of the
+    # moist/cloudy layer (RH >= 95% clips the deck edges and undercounts thickness).
     RH_CLOUD_THRESHOLD = 95.0
-    cloud_layers = []
-    active_cloud = None
-    for layer in profile_layers:
-        rh = _layer_rh(layer)
-        is_cloud = (rh is not None and rh >= RH_CLOUD_THRESHOLD)
-        if is_cloud:
-            if active_cloud is None:
-                active_cloud = {"base": layer["hght"], "top": layer["hght"], "min_temp": layer["tmpc"]}
-            else:
-                active_cloud["top"] = layer["hght"]
-                active_cloud["min_temp"] = min(active_cloud["min_temp"], layer["tmpc"])
-        elif active_cloud is not None:
-            cloud_layers.append(active_cloud)
-            active_cloud = None
-    if active_cloud:
-        cloud_layers.append(active_cloud)
+    ceiling_decks = _group_cloud_layers(
+        lambda l: (_layer_rh(l) is not None and _layer_rh(l) >= RH_CLOUD_THRESHOLD)
+    )
+    extent_decks = _group_cloud_layers(
+        lambda l: (l.get("depr") is not None and l["depr"] <= 2.0)
+    )
 
     pbl_winds = [l["sknt"] for l in profile_layers if l["pres"] >= 850.0]
     mean_wind = sum(pbl_winds) / len(pbl_winds) if pbl_winds else 0.0
     max_pbl = max(pbl_winds) if pbl_winds else 0.0
     sfc_depr = profile_layers[0]["depr"] if profile_layers else 10.0
     vis = 0.25 if sfc_depr <= 0.5 else (1.0 if sfc_depr <= 1.0 else (3.0 if sfc_depr <= 2.0 else 10.0))
-    valid_ceilings = [c for c in cloud_layers if c["base"] >= 100.0]
+    valid_ceilings = [c for c in ceiling_decks if c["base"] >= 100.0]
     ceiling_val = round(valid_ceilings[0]["base"]) if valid_ceilings else 24000.0
 
     return {
@@ -671,8 +681,8 @@ def compute_profile_variables(profile_layers):
         "hght_5c": round(get_height_of_isotherm(-5.0), 1),
         "hght_10c": round(get_height_of_isotherm(-10.0), 1),
         "hght_20c": round(get_height_of_isotherm(-20.0), 1),
-        "cloud_top": round(max([c["top"] for c in cloud_layers], default=0.0) / 1000.0, 1),
-        "cloud_thick": round(max([max(0.0, c["top"] - c["base"]) for c in cloud_layers], default=0.0) / 1000.0, 1),
+        "cloud_top": round(max([c["top"] for c in extent_decks], default=0.0) / 1000.0, 1),
+        "cloud_thick": round(max([max(0.0, c["top"] - c["base"]) for c in extent_decks], default=0.0) / 1000.0, 1),
     }
 
 
