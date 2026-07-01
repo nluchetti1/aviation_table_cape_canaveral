@@ -31,6 +31,17 @@ STN_COORDS = {
     "kpbi": {"lat": 26.683, "lon": -80.095}
 }
 
+# Cape Canaveral / KSC launch pads. These are derived from raw model isobaric GRIB2
+# (GFS/RAP/HRRR) rather than BUFKIT, since the pads have no dedicated BUFKIT profiles.
+LAUNCH_PADS = {
+    "lc39a": {"lat": 28.608, "lon": -80.604, "label": "LC-39A (KSC)"},
+    "lc39b": {"lat": 28.627, "lon": -80.621, "label": "LC-39B (KSC)"},
+    "lc37":  {"lat": 28.532, "lon": -80.565, "label": "LC-37B (CCSFS)"},
+    "slc40": {"lat": 28.562, "lon": -80.577, "label": "SLC-40 (CCSFS)"},
+    "slc41": {"lat": 28.583, "lon": -80.583, "label": "SLC-41 (CCSFS)"},
+    "lc36":  {"lat": 28.470, "lon": -80.538, "label": "LC-36 (CCSFS)"},
+}
+
 THRESHOLD_MAP = {25: "p25", 50: "p50", 100: "p100", 200: "p200"}
 MSG_INDEX_THRESHOLDS = {1: "p25", 2: "p50", 3: "p100", 4: "p200"}
 
@@ -427,7 +438,9 @@ def fetch_href_lightning(time_keys):
     all_href_time_keys = {}  # row_key -> f_hour_int
     for f_hour_int in range(1, 49):
         valid_dt = cycle_init_utc + datetime.timedelta(hours=f_hour_int)
-        row_key = f"{valid_dt.day}/{valid_dt.hour:02d}"
+        # Zero-pad the day to exactly match the sounding-matrix key format ("%d/%H"),
+        # otherwise "1/06" and "01/06" collide as two separate rows for the same hour.
+        row_key = f"{valid_dt.day:02d}/{valid_dt.hour:02d}"
         all_href_time_keys[row_key] = f_hour_int
 
     # Also include any sounding-matrix time keys that fall inside the HREF window but
@@ -441,7 +454,8 @@ def fetch_href_lightning(time_keys):
                 valid_dt = valid_dt.replace(day=d_part)
             f_hour_int = int(round((valid_dt - cycle_init_utc).total_seconds() / 3600))
             if 1 <= f_hour_int <= 48:
-                all_href_time_keys[row_key] = f_hour_int
+                norm_key = f"{valid_dt.day:02d}/{valid_dt.hour:02d}"
+                all_href_time_keys[norm_key] = f_hour_int
         except Exception:
             continue
 
@@ -503,6 +517,99 @@ def fetch_href_lightning(time_keys):
     logging.info("=============================================")
 
     return href_data, href_maps
+
+
+def compute_profile_variables(profile_layers):
+    """
+    Given a list of profile layers (each a dict with pres/hght/tmpc/dwpt/depr/sknt/u/v),
+    compute the full set of aviation + launch variables. Shared by both the BUFKIT
+    station path and the raw-GRIB launch-pad path so the math stays identical.
+    Returns the per-hour data dict, or None if the profile is unusable.
+    """
+    if not profile_layers:
+        return None
+    profile_layers = sorted(profile_layers, key=lambda x: x["pres"], reverse=True)
+
+    def get_height_of_isotherm(target_temp):
+        for i in range(len(profile_layers) - 1):
+            t1, t2 = profile_layers[i]["tmpc"], profile_layers[i + 1]["tmpc"]
+            h1, h2 = profile_layers[i]["hght"], profile_layers[i + 1]["hght"]
+            if (t1 >= target_temp >= t2) or (t1 <= target_temp <= t2):
+                if t1 == t2:
+                    return h1 / 1000.0
+                fraction = (target_temp - t1) / (t2 - t1)
+                return (h1 + fraction * (h2 - h1)) / 1000.0
+        return profile_layers[-1]["hght"] / 1000.0
+
+    def get_wind_component_at_agl(target_agl_ft, sfc_hght):
+        """Linearly interpolate u/v wind components to a target height (ft AGL)."""
+        for i in range(len(profile_layers) - 1):
+            l1, l2 = profile_layers[i], profile_layers[i + 1]
+            if l1["u"] is None or l1["v"] is None or l2["u"] is None or l2["v"] is None:
+                continue
+            agl1 = l1["hght"] - sfc_hght
+            agl2 = l2["hght"] - sfc_hght
+            if (agl1 <= target_agl_ft <= agl2) or (agl2 <= target_agl_ft <= agl1):
+                if agl1 == agl2:
+                    return l1["u"], l1["v"]
+                fraction = (target_agl_ft - agl1) / (agl2 - agl1)
+                u = l1["u"] + fraction * (l2["u"] - l1["u"])
+                v = l1["v"] + fraction * (l2["v"] - l1["v"])
+                return u, v
+        for layer in reversed(profile_layers):
+            if layer["u"] is not None and layer["v"] is not None:
+                return layer["u"], layer["v"]
+        return None, None
+
+    def calc_shear_0_6km():
+        """0-6 km AGL bulk shear magnitude (kt), using true wind vector components."""
+        sfc_layer = profile_layers[0]
+        if sfc_layer["u"] is None or sfc_layer["v"] is None:
+            return None
+        sfc_hght = sfc_layer["hght"]
+        u_sfc, v_sfc = sfc_layer["u"], sfc_layer["v"]
+        target_agl_ft = 6000.0 * 3.280839895  # 6 km converted to feet
+        u_6km, v_6km = get_wind_component_at_agl(target_agl_ft, sfc_hght)
+        if u_6km is None or v_6km is None:
+            return None
+        return round(math.hypot(u_6km - u_sfc, v_6km - v_sfc), 1)
+
+    cloud_layers = []
+    active_cloud = None
+    for layer in profile_layers:
+        if layer["depr"] <= 2.0:
+            if active_cloud is None:
+                active_cloud = {"base": layer["hght"], "top": layer["hght"], "min_temp": layer["tmpc"]}
+            else:
+                active_cloud["top"] = layer["hght"]
+                active_cloud["min_temp"] = min(active_cloud["min_temp"], layer["tmpc"])
+        elif active_cloud is not None:
+            cloud_layers.append(active_cloud)
+            active_cloud = None
+    if active_cloud:
+        cloud_layers.append(active_cloud)
+
+    pbl_winds = [l["sknt"] for l in profile_layers if l["pres"] >= 850.0]
+    mean_wind = sum(pbl_winds) / len(pbl_winds) if pbl_winds else 0.0
+    max_pbl = max(pbl_winds) if pbl_winds else 0.0
+    sfc_depr = profile_layers[0]["depr"] if profile_layers else 10.0
+    vis = 0.25 if sfc_depr <= 0.5 else (1.0 if sfc_depr <= 1.0 else (3.0 if sfc_depr <= 2.0 else 10.0))
+    valid_ceilings = [c for c in cloud_layers if c["base"] >= 100.0]
+    ceiling_val = round(valid_ceilings[0]["base"]) if valid_ceilings else 24000.0
+
+    return {
+        "mom_mean": round(mean_wind, 1),
+        "mom_max": round(max_pbl, 1),
+        "shear": calc_shear_0_6km(),
+        "vis": vis,
+        "ceiling": ceiling_val,
+        "hght_0c": round(get_height_of_isotherm(0.0), 1),
+        "hght_5c": round(get_height_of_isotherm(-5.0), 1),
+        "hght_10c": round(get_height_of_isotherm(-10.0), 1),
+        "hght_20c": round(get_height_of_isotherm(-20.0), 1),
+        "cloud_top": round(max([c["top"] for c in cloud_layers], default=0.0) / 1000.0, 1),
+        "cloud_thick": round(max([max(0.0, c["top"] - c["base"]) for c in cloud_layers], default=0.0) / 1000.0, 1),
+    }
 
 
 def parse_time_series_bufkit(bufkit_text):
@@ -587,90 +694,9 @@ def parse_time_series_bufkit(bufkit_text):
             continue
         profile_layers.sort(key=lambda x: x["pres"], reverse=True)
 
-        def get_height_of_isotherm(target_temp):
-            for i in range(len(profile_layers) - 1):
-                t1, t2 = profile_layers[i]["tmpc"], profile_layers[i + 1]["tmpc"]
-                h1, h2 = profile_layers[i]["hght"], profile_layers[i + 1]["hght"]
-                if (t1 >= target_temp >= t2) or (t1 <= target_temp <= t2):
-                    if t1 == t2:
-                        return h1 / 1000.0
-                    fraction = (target_temp - t1) / (t2 - t1)
-                    return (h1 + fraction * (h2 - h1)) / 1000.0
-            return profile_layers[-1]["hght"] / 1000.0
-
-        def get_wind_component_at_agl(target_agl_ft, sfc_hght):
-            """Linearly interpolate u/v wind components to a target height (ft AGL)."""
-            for i in range(len(profile_layers) - 1):
-                l1, l2 = profile_layers[i], profile_layers[i + 1]
-                if l1["u"] is None or l1["v"] is None or l2["u"] is None or l2["v"] is None:
-                    continue
-                agl1 = l1["hght"] - sfc_hght
-                agl2 = l2["hght"] - sfc_hght
-                if (agl1 <= target_agl_ft <= agl2) or (agl2 <= target_agl_ft <= agl1):
-                    if agl1 == agl2:
-                        return l1["u"], l1["v"]
-                    fraction = (target_agl_ft - agl1) / (agl2 - agl1)
-                    u = l1["u"] + fraction * (l2["u"] - l1["u"])
-                    v = l1["v"] + fraction * (l2["v"] - l1["v"])
-                    return u, v
-            # Fall back to the last available wind-bearing layer
-            for layer in reversed(profile_layers):
-                if layer["u"] is not None and layer["v"] is not None:
-                    return layer["u"], layer["v"]
-            return None, None
-
-        def calc_shear_0_6km():
-            """0-6 km AGL bulk shear magnitude (kt), using true wind vector components."""
-            if not profile_layers:
-                return None
-            sfc_layer = profile_layers[0]
-            if sfc_layer["u"] is None or sfc_layer["v"] is None:
-                return None
-            sfc_hght = sfc_layer["hght"]
-            u_sfc, v_sfc = sfc_layer["u"], sfc_layer["v"]
-            target_agl_ft = 6000.0 * 3.280839895  # 6 km converted to feet
-            u_6km, v_6km = get_wind_component_at_agl(target_agl_ft, sfc_hght)
-            if u_6km is None or v_6km is None:
-                return None
-            shear_kt = math.hypot(u_6km - u_sfc, v_6km - v_sfc)
-            return round(shear_kt, 1)
-
-        cloud_layers = []
-        active_cloud = None
-        for layer in profile_layers:
-            if layer["depr"] <= 2.0:
-                if active_cloud is None:
-                    active_cloud = {"base": layer["hght"], "top": layer["hght"], "min_temp": layer["tmpc"]}
-                else:
-                    active_cloud["top"] = layer["hght"]
-                    active_cloud["min_temp"] = min(active_cloud["min_temp"], layer["tmpc"])
-            elif active_cloud is not None:
-                cloud_layers.append(active_cloud)
-                active_cloud = None
-        if active_cloud:
-            cloud_layers.append(active_cloud)
-
-        pbl_winds = [l["sknt"] for l in profile_layers if l["pres"] >= 850.0]
-        mean_wind = sum(pbl_winds) / len(pbl_winds) if pbl_winds else 0.0
-        max_pbl = max(pbl_winds) if pbl_winds else 0.0
-        sfc_depr = profile_layers[0]["depr"] if profile_layers else 10.0
-        vis = 0.25 if sfc_depr <= 0.5 else (1.0 if sfc_depr <= 1.0 else (3.0 if sfc_depr <= 2.0 else 10.0))
-        valid_ceilings = [c for c in cloud_layers if c["base"] >= 100.0]
-        ceiling_val = round(valid_ceilings[0]["base"]) if valid_ceilings else 24000.0
-
-        hourly_data[valid_hour_key] = {
-            "mom_mean": round(mean_wind, 1),
-            "mom_max": round(max_pbl, 1),
-            "shear": calc_shear_0_6km(),
-            "vis": vis,
-            "ceiling": ceiling_val,
-            "hght_0c": round(get_height_of_isotherm(0.0), 1),
-            "hght_5c": round(get_height_of_isotherm(-5.0), 1),
-            "hght_10c": round(get_height_of_isotherm(-10.0), 1),
-            "hght_20c": round(get_height_of_isotherm(-20.0), 1),
-            "cloud_top": round(max([c["top"] for c in cloud_layers], default=0.0) / 1000.0, 1),
-            "cloud_thick": round(max([max(0.0, c["top"] - c["base"]) for c in cloud_layers], default=0.0) / 1000.0, 1),
-        }
+        result = compute_profile_variables(profile_layers)
+        if result is not None:
+            hourly_data[valid_hour_key] = result
     return hourly_data
 
 
@@ -687,7 +713,290 @@ def fetch_station_model(session, stn, model):
     return stn, model, {}
 
 
-def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_rows):
+# ---------------------------------------------------------------------------
+# Launch-pad soundings derived from raw isobaric GRIB2 (GFS / RAP / HRRR)
+# ---------------------------------------------------------------------------
+
+# Isobaric levels to request from the NOMADS GRIB filter, in hPa. GFS carries the
+# full mandatory+standard set; RAP/HRRR carry 25 hPa spacing but we request the same
+# nominal list and just use whatever comes back.
+PAD_LEVELS_HPA = [1000, 975, 950, 925, 900, 850, 800, 750, 700, 650, 600,
+                  550, 500, 450, 400, 350, 300, 250, 200, 150, 100]
+
+
+def _rh_to_dewpoint_c(temp_c, rh_pct):
+    """Magnus-formula dewpoint (°C) from temperature (°C) and relative humidity (%)."""
+    if rh_pct is None or rh_pct <= 0:
+        return temp_c - 30.0  # very dry fallback
+    rh = max(1.0, min(100.0, rh_pct))
+    a, b = 17.625, 243.04
+    gamma = math.log(rh / 100.0) + (a * temp_c) / (b + temp_c)
+    return (b * gamma) / (a - gamma)
+
+
+def _nomads_grib_url(model, date_str, cycle, f_hour_int):
+    """Build a NOMADS GRIB-filter URL that subsets to isobaric T/RH/HGT/UGRD/VGRD +
+    surface pressure over a small Cape Canaveral bounding box (keeps downloads tiny)."""
+    lev_params = "".join(f"&lev_{lv}_mb=on" for lv in PAD_LEVELS_HPA)
+    var_params = "&var_TMP=on&var_RH=on&var_HGT=on&var_UGRD=on&var_VGRD=on&var_PRES=on"
+    region = "&subregion=&leftlon=-81.2&rightlon=-80.0&toplat=29.2&bottomlat=28.0"
+
+    if model == "hrrr":
+        base = "https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl"
+        f_name = f"hrrr.t{cycle}z.wrfprsf{f_hour_int:02d}.grib2"
+        dir_part = f"&dir=%2Fhrrr.{date_str}%2Fconus"
+    elif model == "rap":
+        base = "https://nomads.ncep.noaa.gov/cgi-bin/filter_rap.pl"
+        f_name = f"rap.t{cycle}z.awp130pgrbf{f_hour_int:02d}.grib2"
+        dir_part = f"&dir=%2Frap.{date_str}"
+    else:  # gfs
+        base = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
+        f_name = f"gfs.t{cycle}z.pgrb2.0p25.f{f_hour_int:03d}"
+        dir_part = f"&dir=%2Fgfs.{date_str}%2F{cycle}%2Fatmos"
+
+    return f"{base}?file={f_name}{lev_params}{var_params}{region}{dir_part}"
+
+
+def build_pad_profiles_from_grib(filepath, pad_coords, debug=False):
+    """
+    Extract a vertical column at each pad's nearest grid cell from a raw isobaric
+    GRIB2 file and assemble profile_layers dicts (matching the BUFKIT schema) so the
+    shared compute_profile_variables() can run on them.
+    Returns {pad_id: profile_layers_list}. When debug=True, logs a summary of every
+    distinct (shortName, typeOfLevel) seen and how many isobaric fields matched, so a
+    first live run reveals exactly what NOMADS returned vs what the parser expects.
+    """
+    per_pad_levels = {pid: {} for pid in pad_coords}
+    seen_short_types = {}   # (shortName, typeOfLevel) -> count      [debug]
+    matched_counts = {"t": 0, "rh": 0, "hgt": 0, "u": 0, "v": 0}   # [debug]
+    isobaric_levels_seen = set()                                    # [debug]
+    total_msgs = 0                                                  # [debug]
+    try:
+        grbs = pygrib.open(filepath)
+        # Cache lat/lon grid + nearest-cell index per pad from the first message.
+        grid_lats, grid_lons = None, None
+        pad_ij = {}
+
+        for grb in grbs:
+            total_msgs += 1
+            try:
+                level = grb.level
+                short = getattr(grb, "shortName", "")
+                type_lvl = getattr(grb, "typeOfLevel", "")
+            except Exception:
+                continue
+
+            if debug:
+                key = (short, type_lvl)
+                seen_short_types[key] = seen_short_types.get(key, 0) + 1
+
+            if type_lvl != "isobaricInhPa" or level not in PAD_LEVELS_HPA:
+                continue
+
+            if debug:
+                isobaric_levels_seen.add(level)
+
+            if grid_lats is None:
+                grid_lats, grid_lons = grb.latlons()
+                glons = np.where(grid_lons > 180, grid_lons - 360.0, grid_lons)
+                for pid, c in pad_coords.items():
+                    dist = (grid_lats - c["lat"]) ** 2 + (glons - c["lon"]) ** 2
+                    pad_ij[pid] = np.unravel_index(np.argmin(dist), dist.shape)
+
+            vals = grb.values
+            field = None
+            if short in ("t", "TMP"): field = "t"
+            elif short in ("r", "RH"): field = "rh"
+            elif short in ("gh", "HGT"): field = "hgt"
+            elif short in ("u", "UGRD", "10u"): field = "u"
+            elif short in ("v", "VGRD", "10v"): field = "v"
+            if field is None:
+                continue
+
+            if debug:
+                matched_counts[field] += 1
+
+            for pid, (iy, ix) in pad_ij.items():
+                per_pad_levels[pid].setdefault(level, {})[field] = float(vals[iy, ix])
+
+        grbs.close()
+    except Exception as e:
+        logging.error(f"Pad GRIB parse failed for {filepath}: {e}")
+        return {}
+
+    if debug:
+        logging.info(f"[PAD DEBUG] {os.path.basename(filepath)}: {total_msgs} total GRIB messages")
+        logging.info(f"[PAD DEBUG]   distinct (shortName, typeOfLevel) seen: "
+                     + ", ".join(f"{k[0]}/{k[1]}={v}" for k, v in sorted(seen_short_types.items())))
+        logging.info(f"[PAD DEBUG]   isobaric levels matched (hPa): {sorted(isobaric_levels_seen, reverse=True)}")
+        logging.info(f"[PAD DEBUG]   fields matched to parser: {matched_counts}")
+        if sum(matched_counts.values()) == 0:
+            logging.warning("[PAD DEBUG]   >>> ZERO fields matched. shortNames above don't match the "
+                            "parser's expected set (t/r/gh/u/v). Update the field mapping to match.")
+
+    pad_profiles = {}
+    for pid, levels in per_pad_levels.items():
+        layers = []
+        for pres, f in levels.items():
+            if "t" not in f:
+                continue
+            tmpc = f["t"] - 273.15 if f["t"] > 100 else f["t"]  # K -> C guard
+            rh = f.get("rh")
+            dwpt = _rh_to_dewpoint_c(tmpc, rh)
+            u = f.get("u")
+            v = f.get("v")
+            sknt = math.hypot(u, v) * 1.943844 if (u is not None and v is not None) else 0.0
+            # GRIB geopotential height (gpm) -> feet if present, else barometric fallback
+            hght_ft = f["hgt"] * 3.280839895 if "hgt" in f else pressure_to_height_ft(pres)
+            layers.append({
+                "pres": pres,
+                "hght": hght_ft,
+                "tmpc": tmpc,
+                "dwpt": dwpt,
+                "depr": tmpc - dwpt,
+                "sknt": sknt,
+                "drct": None,
+                "u": u * 1.943844 if u is not None else None,  # m/s -> kt
+                "v": v * 1.943844 if v is not None else None,
+            })
+        if layers:
+            pad_profiles[pid] = layers
+    return pad_profiles
+
+
+def fetch_pad_model(session, model, date_str, cycle, f_hour_int, row_key, debug=False):
+    """Download one raw GRIB2 subset and build pad profiles/variables for a single
+    model forecast hour. Returns (row_key, model, {pad_id: variables_dict}).
+    When debug=True, logs the request URL, HTTP status, and downloaded byte size."""
+    url = _nomads_grib_url(model, date_str, cycle, f_hour_int)
+    local_path = os.path.join(CACHE_DIR, f"pad_{model}_{cycle}z_f{f_hour_int:03d}.grib2")
+    out = {}
+    try:
+        with session.get(url, timeout=25, stream=True) as r:
+            if debug:
+                logging.info(f"[PAD DEBUG] {model.upper()} f{f_hour_int:03d} HTTP {r.status_code}")
+                logging.info(f"[PAD DEBUG]   URL: {url}")
+            if r.status_code != 200:
+                if debug:
+                    logging.warning(f"[PAD DEBUG]   >>> Non-200 status. Check the NOMADS filter path/"
+                                    f"filename for {model.upper()}. First 300 chars of body:")
+                    try:
+                        logging.warning(f"[PAD DEBUG]   {r.text[:300]}")
+                    except Exception:
+                        pass
+                return row_key, model, out
+            with open(local_path, "wb") as fh:
+                for chunk in r.iter_content(chunk_size=16384):
+                    fh.write(chunk)
+
+        if debug:
+            sz = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+            logging.info(f"[PAD DEBUG]   downloaded {sz} bytes")
+
+        pad_profiles = build_pad_profiles_from_grib(local_path, LAUNCH_PADS, debug=debug)
+        for pid, layers in pad_profiles.items():
+            result = compute_profile_variables(layers)
+            if result is not None:
+                out[pid] = result
+        if debug:
+            sample_pid = next(iter(pad_profiles), None)
+            n_layers = len(pad_profiles[sample_pid]) if sample_pid else 0
+            logging.info(f"[PAD DEBUG]   built {len(pad_profiles)} pad profiles, "
+                         f"~{n_layers} levels each, {len(out)} produced variable sets")
+    except Exception as e:
+        logging.debug(f"Pad fetch break {model} f{f_hour_int:03d}: {e}")
+        if debug:
+            logging.warning(f"[PAD DEBUG]   >>> Exception during {model.upper()} f{f_hour_int:03d}: {e}")
+    finally:
+        if os.path.exists(local_path):
+            try: os.remove(local_path)
+            except Exception: pass
+    return row_key, model, out
+
+
+def determine_model_cycle(session, model):
+    """Find the most recent available cycle for a given model on NOMADS by probing
+    directory listings for the last few candidate cycles."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if model == "gfs":
+        cycle_hours, latency_h = [0, 6, 12, 18], 5
+    else:  # rap, hrrr are hourly
+        cycle_hours, latency_h = list(range(24)), 2
+
+    for back in range(0, 30):
+        cand = now - datetime.timedelta(hours=back)
+        if cand.hour not in cycle_hours:
+            continue
+        if (now - cand).total_seconds() / 3600.0 < latency_h:
+            continue
+        date_str = cand.strftime("%Y%m%d")
+        cycle = f"{cand.hour:02d}"
+        # Probe one representative file
+        probe_url = _nomads_grib_url(model, date_str, cycle, 1)
+        try:
+            resp = session.head(probe_url, timeout=8)
+            if resp.status_code == 200:
+                return date_str, cycle
+            resp = session.get(probe_url, timeout=8, stream=True)
+            if resp.status_code == 200:
+                resp.close()
+                return date_str, cycle
+        except Exception:
+            continue
+    return None, None
+
+
+def fetch_all_pad_soundings():
+    """Build the pad sounding matrix {pad_id: {model: {row_key: variables}}} across
+    all three models for the 1-48h window (GFS) / 1-48h (RAP/HRRR capped to availability)."""
+    pad_matrix = {pid: {m: {} for m in MODELS} for pid in LAUNCH_PADS}
+
+    with requests.Session() as session:
+        for model in MODELS:
+            date_str, cycle = determine_model_cycle(session, model)
+            if not cycle:
+                logging.warning(f"No available {model.upper()} cycle found for pad soundings.")
+                continue
+            cycle_init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
+
+            # HRRR native output is hourly to f48 (extended runs); RAP to f21/f51; GFS 3-hourly is fine hourly here.
+            max_fh = 48
+            step = 1 if model in ("rap", "hrrr") else 3
+            f_hours = list(range(step, max_fh + 1, step))
+
+            logging.info(f"Fetching {model.upper()} pad columns: {date_str} {cycle}z, {len(f_hours)} hours")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                futures = []
+                for idx, fh in enumerate(f_hours):
+                    valid_dt = cycle_init + datetime.timedelta(hours=fh)
+                    row_key = f"{valid_dt.day:02d}/{valid_dt.hour:02d}"
+                    # Emit verbose diagnostics only on the first forecast hour of each
+                    # model so the log shows exactly what NOMADS returned without spam.
+                    dbg = (idx == 0)
+                    futures.append(executor.submit(
+                        fetch_pad_model, session, model, date_str, cycle, fh, row_key, dbg
+                    ))
+                for fut in concurrent.futures.as_completed(futures):
+                    try:
+                        row_key, mdl, pad_vals = fut.result()
+                        for pid, vars_dict in pad_vals.items():
+                            pad_matrix[pid][mdl][row_key] = vars_dict
+                    except Exception:
+                        pass
+
+            # Per-model summary: how many forecast hours produced usable pad data.
+            sample_pad = next(iter(LAUNCH_PADS))
+            hours_ok = len(pad_matrix[sample_pad].get(model, {}))
+            if hours_ok == 0:
+                logging.warning(f"[PAD DEBUG] {model.upper()} produced ZERO usable pad-hours — "
+                                f"see the [PAD DEBUG] lines above for HTTP status / shortName mismatch.")
+            else:
+                logging.info(f"{model.upper()} pad soundings: {hours_ok}/{len(f_hours)} forecast hours produced data.")
+
+    return pad_matrix
+
+
+def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_rows, pad_matrix=None):
     href_lightning, href_maps = fetch_href_lightning(time_rows)
 
     history_runs = []
@@ -700,10 +1009,17 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         except Exception:
             history_runs = []
 
+    # Merge launch-pad (raw-GRIB) soundings into the same station-keyed data block so the
+    # frontend treats them identically to the BUFKIT stations (just extra dropdown entries).
+    combined_data = dict(current_sounding_matrix)
+    if pad_matrix:
+        for pid, model_data in pad_matrix.items():
+            combined_data[pid] = model_data
+
     current_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     current_entry = {
         "timestamp": current_timestamp,
-        "data": current_sounding_matrix,
+        "data": combined_data,
         # HREF lightning point/percentage data DOES participate in dprog/dt history.
         "href_lightning": href_lightning,
     }
@@ -767,7 +1083,16 @@ def run_pipeline():
     if trimmed_rows:
         time_rows = trimmed_rows
 
-    generate_aviation_dashboard(STATIONS, MODELS, sounding_matrix, time_rows)
+    # Fetch launch-pad soundings from raw GRIB2 (additive; independent of BUFKIT stations).
+    try:
+        pad_matrix = fetch_all_pad_soundings()
+        pad_hours = sum(len(m.get("hrrr", {})) for m in pad_matrix.values())
+        logging.info(f"Launch-pad soundings assembled ({pad_hours} HRRR pad-hours across {len(pad_matrix)} pads).")
+    except Exception as e:
+        logging.error(f"Launch-pad sounding fetch failed, continuing without pads: {e}")
+        pad_matrix = None
+
+    generate_aviation_dashboard(STATIONS, MODELS, sounding_matrix, time_rows, pad_matrix=pad_matrix)
 
 
 if __name__ == "__main__":
