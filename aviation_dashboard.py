@@ -1,4 +1,4 @@
-import datetime
+=import datetime
 import json
 import math
 import os
@@ -62,6 +62,19 @@ RRFS_MAX_FH = 48             # RRFS/REFS run to 60h; cap at 48 to match the rest
 RRFS_LATENCY_H = 4           # approx hours before a cycle's files are complete on AWS
 # REFS averages ('avrg') post ~6-hourly. Since the app runs hourly, each run just picks up
 # the latest available cycle; the 6-hourly cadence is fine (rows repeat until the next cycle).
+
+# The exact REFS ensemble-mean filename ordering has drifted across the pre-op feed. We probe
+# these candidate patterns (formatted with cycle `c` and forecast-hour ints) once per run and
+# cache whichever resolves, so every subsequent hour reuses the confirmed pattern.
+REFS_FILENAME_CANDIDATES = [
+    "refs.t{c}z.mean.f{f2}.conus.grib2",
+    "refs.t{c}z.conus.mean.f{f2}.grib2",
+    "refs.t{c}z.mean.f{f3}.conus.grib2",
+    "refs.t{c}z.conus.prslev.mean.f{f2}.grib2",
+    "rrfsce.t{c}z.conus.mean.f{f2}.grib2",
+]
+_REFS_RESOLVED_PATTERN = None   # set once we confirm a working pattern this run
+
 
 
 
@@ -1101,7 +1114,10 @@ def _range_download_grib(session, grib_url, idx_entries, wanted_levels_hpa, debu
 
 def _rrfs_determine_cycle(session, model_kind):
     """Find the most recent RRFS/REFS cycle available on AWS by probing .idx existence.
-    model_kind: 'rrfs' (deterministic) or 'refs' (ensemble). Returns (date_str, cycle)."""
+    model_kind: 'rrfs' (deterministic) or 'refs' (ensemble). Returns (date_str, cycle).
+    For REFS, also resolves and caches which filename pattern actually carries isobaric
+    temperature data (guards against picking a precip-only product like 'avrg')."""
+    global _REFS_RESOLVED_PATTERN
     now = datetime.datetime.now(datetime.timezone.utc)
     for back in range(0, 30):
         cand = now - datetime.timedelta(hours=back)
@@ -1111,27 +1127,48 @@ def _rrfs_determine_cycle(session, model_kind):
             continue
         date_str = cand.strftime("%Y%m%d")
         cycle = f"{cand.hour:02d}"
-        probe = _rrfs_grib_url(model_kind, date_str, cycle, 1) + ".idx"
-        try:
-            r = session.get(probe, timeout=10)
-            if r.status_code == 200 and len(r.text) > 50:
-                return date_str, cycle
-        except Exception:
-            continue
+
+        if model_kind == "refs":
+            # Try each candidate filename; accept the first whose idx contains isobaric TMP.
+            # Probe several forecast hours (some ensemble products don't emit f01), so we
+            # don't reject a valid pattern just because its earliest hour is missing.
+            base = f"{RRFS_AWS_ROOT}/rrfs_a/refs.{date_str}/{cycle}/enspost"
+            resolved = False
+            for pat in REFS_FILENAME_CANDIDATES:
+                for probe_fh in (1, 6, 8, 12):
+                    fn = pat.format(c=cycle, f2=f"{probe_fh:02d}", f3=f"{probe_fh:03d}")
+                    probe = f"{base}/{fn}.idx"
+                    try:
+                        r = session.get(probe, timeout=10)
+                        if r.status_code == 200 and "TMP" in r.text and "mb" in r.text:
+                            _REFS_RESOLVED_PATTERN = pat
+                            logging.info(f"[RRFS DEBUG] REFS resolved filename pattern: {pat} "
+                                         f"(confirmed at f{probe_fh:02d})")
+                            resolved = True
+                            break
+                    except Exception:
+                        continue
+                if resolved:
+                    return date_str, cycle
+            continue  # this cycle had no working REFS mean file; try older cycle
+        else:
+            probe = _rrfs_grib_url(model_kind, date_str, cycle, 1) + ".idx"
+            try:
+                r = session.get(probe, timeout=10)
+                if r.status_code == 200 and len(r.text) > 50:
+                    return date_str, cycle
+            except Exception:
+                continue
     return None, None
 
 
 def _rrfs_grib_url(model_kind, date_str, cycle, f_hour_int):
-    """Build the AWS S3 URL for an RRFS deterministic or REFS ensemble-average prslev file.
-
-    REFS combined ensemble products live (somewhat confusingly) under the rrfs_a/ tree in
-    an enspost/ subdir, with the ensemble average tagged 'avrg' and a 2-digit forecast hour:
-      rrfs_a/refs.YYYYMMDD/CC/enspost/refs.tCCz.avrg.fFF.conus.grib2
-    RRFS deterministic prslev is under the rrfs_public/ tree with a 3-digit forecast hour:
-      rrfs_public/rrfs.YYYYMMDD/CC/rrfs.tCCz.prslev.3km.fFFF.conus.grib2
-    """
+    """Build the AWS S3 URL for an RRFS deterministic or REFS ensemble-mean prslev file.
+    For REFS, uses the module-cached resolved filename pattern (falls back to the first
+    candidate if not yet resolved)."""
     if model_kind == "refs":
-        f_name = f"refs.t{cycle}z.avrg.f{f_hour_int:02d}.conus.grib2"
+        pat = _REFS_RESOLVED_PATTERN or REFS_FILENAME_CANDIDATES[0]
+        f_name = pat.format(c=cycle, f2=f"{f_hour_int:02d}", f3=f"{f_hour_int:03d}")
         return f"{RRFS_AWS_ROOT}/rrfs_a/refs.{date_str}/{cycle}/enspost/{f_name}"
     else:
         f_name = f"rrfs.t{cycle}z.prslev.3km.f{f_hour_int:03d}.conus.grib2"
