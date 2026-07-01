@@ -607,10 +607,33 @@ def compute_profile_variables(profile_layers):
             return None
         return round(math.hypot(u_6km - u_sfc, v_6km - v_sfc), 1)
 
+    def _layer_rh(layer):
+        """Relative humidity (%) for a layer. Uses stored 'rh' if present (raw GRIB paths),
+        otherwise derives it from temperature/dewpoint (BUFKIT path) via the Magnus formula."""
+        rh = layer.get("rh")
+        if rh is not None:
+            return rh
+        t = layer.get("tmpc")
+        td = layer.get("dwpt")
+        if t is None or td is None:
+            return None
+        a, b = 17.625, 243.04
+        try:
+            gt = (a * t) / (b + t)
+            gd = (a * td) / (b + td)
+            return 100.0 * math.exp(gd - gt)
+        except Exception:
+            return None
+
+    # A layer is "in cloud" when RH >= 95%. This is a tighter, more realistic ceiling
+    # criterion than dewpoint-depression <= 2C, which was flagging MVFR too aggressively.
+    RH_CLOUD_THRESHOLD = 95.0
     cloud_layers = []
     active_cloud = None
     for layer in profile_layers:
-        if layer["depr"] <= 2.0:
+        rh = _layer_rh(layer)
+        is_cloud = (rh is not None and rh >= RH_CLOUD_THRESHOLD)
+        if is_cloud:
             if active_cloud is None:
                 active_cloud = {"base": layer["hght"], "top": layer["hght"], "min_temp": layer["tmpc"]}
             else:
@@ -775,7 +798,9 @@ def _nomads_grib_url(model, date_str, cycle, f_hour_int):
     region = "&subregion=&leftlon=-81.2&rightlon=-80.0&toplat=29.2&bottomlat=28.0"
 
     if model == "hrrr":
-        base = "https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl"
+        # Use the pressure-level HRRR filter (filter_hrrr_2d.pl is SURFACE fields only and
+        # cannot serve the wrfprs 3D isobaric file we need for a sounding).
+        base = "https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_sub.pl"
         f_name = f"hrrr.t{cycle}z.wrfprsf{f_hour_int:02d}.grib2"
         dir_part = f"&dir=%2Fhrrr.{date_str}%2Fconus"
     elif model == "rap":
@@ -887,6 +912,7 @@ def build_pad_profiles_from_grib(filepath, pad_coords, debug=False):
                 "tmpc": tmpc,
                 "dwpt": dwpt,
                 "depr": tmpc - dwpt,
+                "rh": rh,  # native GRIB RH (%), used directly for RH>=95% cloud detection
                 "sknt": sknt,
                 "drct": None,
                 "u": u * 1.943844 if u is not None else None,  # m/s -> kt
