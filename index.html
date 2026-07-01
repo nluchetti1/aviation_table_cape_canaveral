@@ -70,17 +70,19 @@
         .dprog-btn { margin: 0 3px; text-decoration: none; color: #2563eb; padding: 2px 5px; border-radius: 3px; cursor: pointer; font-size: 0.8rem; border: 1px solid #cbd5e1; background: white; }
         .dprog-btn.active { color: white; background: #475569; font-weight: bold; }
 
-        .href-slider-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 14px; margin-bottom: 12px; }
-        .href-slider-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .href-slider-panel { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px; padding: 10px 14px; margin-bottom: 12px; }
+        .href-slider-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
         .href-slider-title { font-weight: bold; color: #1e293b; font-size: 0.9rem; }
         .href-slider-time { font-weight: bold; color: #2563eb; background: #dbeafe; padding: 3px 10px; border-radius: 4px; font-size: 0.85rem; }
-        #href-slider-input { width: 100%; margin: 6px 0 10px 0; cursor: pointer; }
-        .href-slider-controls { display: flex; justify-content: center; gap: 8px; margin-bottom: 12px; }
-        .href-slider-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 12px; max-width: 900px; margin: 0 auto; }
-        .href-slider-cell { border: 1px solid #cbd5e1; border-radius: 4px; background: white; overflow: hidden; text-align: center; padding-bottom: 6px; }
-        .href-slider-cell img { width: 100%; height: auto; display: block; }
-        .href-slider-cell-label { font-size: 0.75rem; font-weight: bold; color: #475569; padding: 6px 0 2px 0; }
-        .href-slider-cell-empty { padding: 70px 10px; color: #94a3b8; font-size: 0.85rem; }
+        #href-slider-input { width: 100%; margin: 4px 0 8px 0; cursor: pointer; }
+        .href-slider-controls { display: flex; justify-content: center; gap: 8px; margin-bottom: 10px; }
+        /* Cap the whole grid to the viewport so all four panels are visible at once.
+           Each cell gets an equal share of the available height; images scale to fit. */
+        .href-slider-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 10px; max-height: calc(100vh - 230px); margin: 0 auto; justify-content: center; }
+        .href-slider-cell { border: 1px solid #cbd5e1; border-radius: 4px; background: white; overflow: hidden; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 0; }
+        .href-slider-cell img { max-width: 100%; max-height: calc((100vh - 260px) / 2); width: auto; height: auto; object-fit: contain; display: block; }
+        .href-slider-cell-label { font-size: 0.75rem; font-weight: bold; color: #475569; padding: 4px 0 4px 0; flex-shrink: 0; }
+        .href-slider-cell-empty { padding: 60px 10px; color: #94a3b8; font-size: 0.85rem; }
     </style>
 </head>
 <body>
@@ -105,11 +107,21 @@
         <div class="station-selector">
             <label for="stn-dropdown">Station:</label>
             <select id="stn-dropdown" onchange="activeStn = this.value; renderMatrix();">
-                <option value="kxmr" selected>KXMR (Cape Canaveral)</option>
-                <option value="kdab">KDAB (Daytona Beach)</option>
-                <option value="kmlb">KMLB (Melbourne)</option>
-                <option value="kfpr">KFPR (Fort Pierce)</option>
-                <option value="kpbi">KPBI (West Palm Beach)</option>
+                <optgroup label="BUFKIT Stations">
+                    <option value="kxmr" selected>KXMR (Cape Canaveral)</option>
+                    <option value="kdab">KDAB (Daytona Beach)</option>
+                    <option value="kmlb">KMLB (Melbourne)</option>
+                    <option value="kfpr">KFPR (Fort Pierce)</option>
+                    <option value="kpbi">KPBI (West Palm Beach)</option>
+                </optgroup>
+                <optgroup label="Launch Pads (raw GRIB)">
+                    <option value="lc39a">LC-39A (KSC)</option>
+                    <option value="lc39b">LC-39B (KSC)</option>
+                    <option value="lc37">LC-37B (CCSFS)</option>
+                    <option value="slc40">SLC-40 (CCSFS)</option>
+                    <option value="slc41">SLC-41 (CCSFS)</option>
+                    <option value="lc36">LC-36 (CCSFS)</option>
+                </optgroup>
             </select>
         </div>
     </div>
@@ -160,6 +172,13 @@
 
         const aviationMetrics = ['mom_mean', 'mom_max', 'ceiling', 'vis', 'shear'];
         const launchMetrics = ['hght_0c', 'hght_5c', 'hght_10c', 'hght_20c', 'cloud_top', 'cloud_thick', 'href_density'];
+
+        // Launch pads have no dedicated HREF lightning point data; they all sit within a
+        // few km of the KXMR sampling point, so use KXMR's HREF density as their proxy.
+        const PAD_IDS = ['lc39a', 'lc39b', 'lc37', 'slc40', 'slc41', 'lc36'];
+        function hrefStationFor(stn) {
+            return PAD_IDS.includes(stn.toLowerCase()) ? 'kxmr' : stn.toLowerCase();
+        }
 
         let hrefSliderTimes = [];
         let hrefSliderIdx = 0;
@@ -343,7 +362,8 @@
                 // Build time list from HREF lightning data (not sounding times) so we
                 // get the full 48-hour range even when models don't extend that far.
                 const ltgRoot = (historyRuns[activeRunIdx] && historyRuns[activeRunIdx].href_lightning) || {};
-                const ltgAnyStn = ltgRoot[lowerStn] || ltgRoot[upperStn] || ltgRoot[Object.keys(ltgRoot)[0]] || {};
+                const hrefStn = hrefStationFor(activeStn);
+                const ltgAnyStn = ltgRoot[hrefStn] || ltgRoot[Object.keys(ltgRoot)[0]] || {};
                 let hrefTimeSet = new Set([...Object.keys(ltgAnyStn), ...Array.from(timeSet)]);
                 hrefSliderTimes = Array.from(hrefTimeSet).sort((a, b) => {
                     const [dayA, hourA] = a.split('/').map(Number);
@@ -369,7 +389,7 @@
                 tr.innerHTML = `<td class="time-col">${timeKey}Z</td>`;
 
                 let ltgRoot = cycle.href_lightning || {};
-                let ltgStation = ltgRoot[lowerStn] || ltgRoot[upperStn] || {};
+                let ltgStation = ltgRoot[hrefStationFor(activeStn)] || {};
                 let ltgData = ltgStation[timeKey] || null;
                 let mapsRoot = hrefMapsLatest || {};
                 let mapsData = mapsRoot[timeKey] || null;
@@ -455,7 +475,7 @@
             const lowerStn = activeStn.toLowerCase();
             const upperStn = activeStn.toUpperCase();
             let ltgRoot = cycle.href_lightning || {};
-            let ltgStation = ltgRoot[lowerStn] || ltgRoot[upperStn] || {};
+            let ltgStation = ltgRoot[hrefStationFor(activeStn)] || {};
             let ltgData = ltgStation[timeKey] || null;
             let mapsData = (hrefMapsLatest || {})[timeKey] || null;
 
@@ -541,12 +561,12 @@
                     <div class="legend-item cell-shear-40"><span>Strong Shear</span><span>≥ 40 kt Magnitude</span></div>
                     
                     <div class="explanation-box">
-                        <strong>Aviation Parameter Definitions:</strong><br><br>
-                        • <strong>PBL Mom Mean:</strong> Average momentum transfer evaluated through the Planetary Boundary Layer.<br><br>
-                        • <strong>PBL Mom Max:</strong> Peak wind speed evaluated within the mixed boundary layer structure (own amber/orange tiering, distinct from ceiling/visibility colors).<br><br>
-                        • <strong>Ceilings:</strong> Lowest saturated layer meeting broken/overcast criteria (&gt;50% cloud cover).<br><br>
-                        • <strong>Visibility:</strong> Horizontal surface restrictions expressed in statute miles.<br><br>
-                        • <strong>0-6 km Bulk Shear:</strong> Deep-layer vertical speed/directional shear used to gauge convective organization potential and localized turbulence profiles.
+                        <strong>Aviation Parameter Definitions &amp; Methodology:</strong><br><br>
+                        • <strong>PBL Mom Mean:</strong> Arithmetic mean of wind speed (kt) across every BUFKIT sounding level at or below 850 hPa (the approximate top of the daytime mixed layer). Represents the bulk momentum available for downward transport to the surface.<br><br>
+                        • <strong>PBL Mom Max:</strong> The single highest wind speed (kt) found among those same sub-850 hPa levels — the peak reservoir of momentum that gusts could tap, shown with its own amber/orange tiering distinct from the ceiling/visibility colors.<br><br>
+                        • <strong>Ceilings:</strong> Scanned bottom-up through the profile; a cloud layer is flagged where dewpoint depression (T − Td) ≤ 2°C. The base height (ft) of the lowest such layer at or above 100 ft is reported as the ceiling; if none exist the sky is treated as clear (24,000 ft).<br><br>
+                        • <strong>Visibility:</strong> Estimated from surface dewpoint depression as a saturation proxy — ≤0.5°C → ¼ sm, ≤1°C → 1 sm, ≤2°C → 3 sm, otherwise 10 sm. A first-order fog/mist screen, not a direct obs.<br><br>
+                        • <strong>0-6 km Bulk Shear:</strong> Wind direction/speed at each level are decomposed into u/v vector components; the surface vector is subtracted from the vector interpolated to 6 km AGL, and the magnitude (hypotenuse) of that difference is the bulk shear (kt). Gauges deep-layer convective organization potential.
                     </div>
                 `;
             } else {
@@ -565,12 +585,12 @@
                     <div class="legend-item cell-ifr"><span>-20°C Breach</span><span>Cloud Top ≥ -20°C</span></div>
 
                     <div class="explanation-box">
-                        <strong>Launch Commit Criteria (LCC) Guides:</strong><br><br>
+                        <strong>Launch Commit Criteria (LCC) Guides &amp; Methodology:</strong><br><br>
                         • <strong>HREF Lightning Density:</strong> Machine-learning calibrated probability utilizing a 4-hour rolling mean of ensemble proxy metrics (e.g., updraft helicity, graupel flux) to forecast grid-based strike exceedances.<br><br>
-                        • <strong>Isotherm Profiles:</strong> Evaluating heights (kft) of key charging zones (0°C to -20°C). Crucial for assessing triboelectric charging and natural triggering mechanisms.<br><br>
-                        • <strong>Highest Cloud Top:</strong> Monitored relative to environmental temperature barriers to ensure rocket flight paths do not interface with active cloud layer glaciation fields.<br><br>
-                        • <strong>Max Layer Thickness:</strong> Tracks depths of continuous cloud decks to ensure compliant launch corridor margins.<br><br>
-                        • <strong>HREF Density Map:</strong> Hover any cell (or the HREF LTG column) to view live Florida-domain spatial plots of the HREF ensemble flash-density field for all four exceedance thresholds (≥25/50/100/200 flashes).
+                        • <strong>Isotherm Profiles (0/-5/-10/-20°C Height):</strong> The profile is scanned for each target isotherm; the height (kft) is linearly interpolated between the two sounding levels that bracket that temperature. These delineate the charging zones where triboelectric (ice/graupel collision) charging and natural/triggered lightning are most favorable.<br><br>
+                        • <strong>Highest Cloud Top:</strong> Height (kft) of the top of the highest layer meeting the saturation criterion (dewpoint depression ≤ 2°C), compared against the isotherm heights above to judge whether the flight path would pass through a glaciated (charge-bearing) cloud region.<br><br>
+                        • <strong>Max Layer Thickness:</strong> Contiguous saturated levels (T − Td ≤ 2°C) are grouped into discrete cloud decks; this reports the depth (kft) of the single thickest continuous deck, a proxy for the most robust convective/charging layer.<br><br>
+                        • <strong>HREF Density Map:</strong> Hover any cell (or the HREF LTG column) to view live Space-Coast-domain spatial plots of the HREF ensemble flash-density field for all four exceedance thresholds (≥25/50/100/200 flashes). All four panels share an identical 0–100% color scale for direct comparison.
                     </div>
                 `;
             }
@@ -649,8 +669,27 @@
         }
 
         function movePopup(e) {
-            popupCard.style.left = (e.pageX + 15) + "px";
-            popupCard.style.top = (e.pageY - 40) + "px";
+            // Measure the popup, then place it so it never runs off the right or bottom edge.
+            const pad = 15;
+            const rect = popupCard.getBoundingClientRect();
+            const pw = rect.width || 540;
+            const ph = rect.height || 400;
+
+            let left = e.pageX + pad;
+            let top = e.pageY - 40;
+
+            // Flip to the left of the cursor if it would overflow the right edge.
+            if (left + pw > window.scrollX + window.innerWidth - pad) {
+                left = e.pageX - pw - pad;
+                if (left < window.scrollX + pad) left = window.scrollX + pad;
+            }
+            // Clamp vertically so the bottom (higher-threshold panels) stays on screen.
+            const maxTop = window.scrollY + window.innerHeight - ph - pad;
+            if (top > maxTop) top = maxTop;
+            if (top < window.scrollY + pad) top = window.scrollY + pad;
+
+            popupCard.style.left = left + "px";
+            popupCard.style.top = top + "px";
         }
 
         function hidePopup() { popupCard.style.display = "none"; }
