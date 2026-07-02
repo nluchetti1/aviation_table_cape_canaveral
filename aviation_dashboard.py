@@ -560,13 +560,11 @@ def fetch_href_lightning(time_keys):
     return href_data, href_maps
 
 
-def compute_profile_variables(profile_layers, pwat=None):
+def compute_profile_variables(profile_layers):
     """
     Given a list of profile layers (each a dict with pres/hght/tmpc/dwpt/depr/sknt/u/v),
     compute the full set of aviation + launch variables. Shared by both the BUFKIT
     station path and the raw-GRIB launch-pad path so the math stays identical.
-    `pwat` (precipitable water, inches) is an optional column-integrated value supplied by
-    the caller (from GRIB PWAT or BUFKIT), since it isn't a per-level quantity.
     Returns the per-hour data dict, or None if the profile is unusable.
     """
     if not profile_layers:
@@ -703,7 +701,6 @@ def compute_profile_variables(profile_layers, pwat=None):
         "cloud_thick": round(max([max(0.0, c["top"] - c["base"]) for c in extent_decks], default=0.0) / 1000.0, 1),
         "thick_layer": 1 if thick_layer_violated else 0,
         "thick_layer_ft": round(thickest_in_band_ft),
-        "pwat": round(pwat, 2) if pwat is not None else None,
     }
 
 
@@ -789,16 +786,7 @@ def parse_time_series_bufkit(bufkit_text):
             continue
         profile_layers.sort(key=lambda x: x["pres"], reverse=True)
 
-        # BUFKIT carries precipitable water as a surface parameter "PWAT = <mm>".
-        pwat_in = None
-        pwat_match = re.search(r"PWAT\s*=\s*([-\d.]+)", block)
-        if pwat_match:
-            try:
-                pwat_in = float(pwat_match.group(1)) / 25.4  # mm -> inches
-            except ValueError:
-                pwat_in = None
-
-        result = compute_profile_variables(profile_layers, pwat=pwat_in)
+        result = compute_profile_variables(profile_layers)
         if result is not None:
             hourly_data[valid_hour_key] = result
     return hourly_data
@@ -842,7 +830,7 @@ def _nomads_grib_url(model, date_str, cycle, f_hour_int):
     """Build a NOMADS GRIB-filter URL that subsets to isobaric T/RH/HGT/UGRD/VGRD +
     surface pressure over a small Cape Canaveral bounding box (keeps downloads tiny)."""
     lev_params = "".join(f"&lev_{lv}_mb=on" for lv in PAD_LEVELS_HPA)
-    var_params = "&var_TMP=on&var_RH=on&var_HGT=on&var_UGRD=on&var_VGRD=on&var_PRES=on&var_PWAT=on"
+    var_params = "&var_TMP=on&var_RH=on&var_HGT=on&var_UGRD=on&var_VGRD=on&var_PRES=on"
     region = "&subregion=&leftlon=-81.2&rightlon=-80.0&toplat=29.2&bottomlat=28.0"
 
     if model == "hrrr":
@@ -873,7 +861,6 @@ def build_pad_profiles_from_grib(filepath, pad_coords, debug=False):
     first live run reveals exactly what NOMADS returned vs what the parser expects.
     """
     per_pad_levels = {pid: {} for pid in pad_coords}
-    per_pad_pwat = {pid: None for pid in pad_coords}                 # column PWAT (mm->in)
     seen_short_types = {}   # (shortName, typeOfLevel) -> count      [debug]
     matched_counts = {"t": 0, "rh": 0, "hgt": 0, "u": 0, "v": 0}   # [debug]
     isobaric_levels_seen = set()                                    # [debug]
@@ -896,21 +883,6 @@ def build_pad_profiles_from_grib(filepath, pad_coords, debug=False):
             if debug:
                 key = (short, type_lvl)
                 seen_short_types[key] = seen_short_types.get(key, 0) + 1
-
-            # Precipitable water is a column-integrated field (not isobaric). Capture it
-            # per pad before the isobaric filter below. GRIB PWAT is in kg/m^2 (== mm);
-            # convert to inches (/25.4) to match the customary launch-weather unit.
-            if short in ("pwat", "PWAT"):
-                if grid_lats is None:
-                    grid_lats, grid_lons = grb.latlons()
-                    glons = np.where(grid_lons > 180, grid_lons - 360.0, grid_lons)
-                    for pid, c in pad_coords.items():
-                        dist = (grid_lats - c["lat"]) ** 2 + (glons - c["lon"]) ** 2
-                        pad_ij[pid] = np.unravel_index(np.argmin(dist), dist.shape)
-                pw_vals = grb.values
-                for pid, (iy, ix) in pad_ij.items():
-                    per_pad_pwat[pid] = float(pw_vals[iy, ix]) / 25.4
-                continue
 
             if type_lvl != "isobaricInhPa" or level not in PAD_LEVELS_HPA:
                 continue
@@ -983,7 +955,7 @@ def build_pad_profiles_from_grib(filepath, pad_coords, debug=False):
                 "v": v * 1.943844 if v is not None else None,
             })
         if layers:
-            pad_profiles[pid] = {"layers": layers, "pwat": per_pad_pwat.get(pid)}
+            pad_profiles[pid] = layers
     return pad_profiles
 
 
@@ -1017,13 +989,13 @@ def fetch_pad_model(session, model, date_str, cycle, f_hour_int, row_key, debug=
             logging.info(f"[PAD DEBUG]   downloaded {sz} bytes")
 
         pad_profiles = build_pad_profiles_from_grib(local_path, LAUNCH_PADS, debug=debug)
-        for pid, prof in pad_profiles.items():
-            result = compute_profile_variables(prof["layers"], pwat=prof.get("pwat"))
+        for pid, layers in pad_profiles.items():
+            result = compute_profile_variables(layers)
             if result is not None:
                 out[pid] = result
         if debug:
             sample_pid = next(iter(pad_profiles), None)
-            n_layers = len(pad_profiles[sample_pid]["layers"]) if sample_pid else 0
+            n_layers = len(pad_profiles[sample_pid]) if sample_pid else 0
             logging.info(f"[PAD DEBUG]   built {len(pad_profiles)} pad profiles, "
                          f"~{n_layers} levels each, {len(out)} produced variable sets")
     except Exception as e:
@@ -1167,13 +1139,10 @@ def _range_download_grib(session, grib_url, idx_entries, wanted_levels_hpa, debu
 
     ranges = []
     for e in idx_entries:
-        # PWAT is a column-integrated field (not isobaric): grab it regardless of level.
-        is_pwat = e["short"] == "PWAT"
-        if not is_pwat:
-            if e["short"] not in wanted_vars:
-                continue
-            if e["level"] not in wanted_level_strs:
-                continue
+        if e["short"] not in wanted_vars:
+            continue
+        if e["level"] not in wanted_level_strs:
+            continue
         if e["end"] is None:
             ranges.append((e["start"], ""))  # open-ended to EOF
         else:
@@ -1313,8 +1282,8 @@ def fetch_rrfs_pad_hour(session, model_kind, date_str, cycle, f_hour_int, row_ke
             logging.info(f"[RRFS DEBUG]   range-downloaded {sz} bytes of isobaric fields")
 
         site_profiles = build_pad_profiles_from_grib(local_path, all_coords, debug=debug)
-        for sid, prof in site_profiles.items():
-            result = compute_profile_variables(prof["layers"], pwat=prof.get("pwat"))
+        for sid, layers in site_profiles.items():
+            result = compute_profile_variables(layers)
             if result is not None:
                 out[sid] = result
     except Exception as e:
