@@ -103,7 +103,6 @@
             <a onmouseover="updateMetric('cloud_top')" id="nav-cloud_top">Highest Cloud Top</a>
             <a onmouseover="updateMetric('cloud_thick')" id="nav-cloud_thick">Max Layer Thickness</a>
             <a onmouseover="updateMetric('thick_layer')" id="nav-thick_layer">Thick Cloud Layer</a>
-            <a onmouseover="updateMetric('pwat')" id="nav-pwat">Precip Water</a>
             <a onmouseover="updateMetric('href_density')" id="nav-href_density">HREF Density Map</a>
         </div>
         <div class="station-selector">
@@ -173,7 +172,7 @@
         const popupCard = document.getElementById("hover-popup-card");
 
         const aviationMetrics = ['mom_mean', 'mom_max', 'ceiling', 'vis', 'shear'];
-        const launchMetrics = ['hght_0c', 'hght_5c', 'hght_10c', 'hght_20c', 'cloud_top', 'cloud_thick', 'thick_layer', 'pwat', 'href_density'];
+        const launchMetrics = ['hght_0c', 'hght_5c', 'hght_10c', 'hght_20c', 'cloud_top', 'cloud_thick', 'thick_layer', 'href_density'];
 
         // Launch pads have no dedicated HREF lightning point data; they all sit within a
         // few km of the KXMR sampling point, so use KXMR's HREF density as their proxy.
@@ -285,16 +284,6 @@
                 if (val === 1) return { txt: "VIOLATED", cls: "cell-alert" };
                 if (val === 0) return { txt: "OK", cls: "cell-vfr" };
                 return { txt: "-", cls: "" };
-            }
-
-            // Precipitable water (inches) — proxy for column moisture / disturbed weather
-            if (metric === 'pwat') {
-                if (val === null || val === undefined) return { txt: "-", cls: "" };
-                let cls = "cell-vfr";
-                if (val >= 2.0) cls = "cell-alert";
-                else if (val >= 1.5) cls = "ltg-med";
-                else if (val >= 1.0) cls = "ltg-low";
-                return { txt: val.toFixed(2) + '"', cls: cls };
             }
 
             // Cloud Top evaluation against thermodynamic levels
@@ -624,7 +613,6 @@
                         • <strong>Highest Cloud Top:</strong> Height (kft) of the top of the highest layer meeting the dewpoint-depression criterion (T − Td ≤ 2°C), compared against the isotherm heights above to judge whether the flight path would pass through a glaciated (charge-bearing) cloud region.<br><br>
                         • <strong>Max Layer Thickness:</strong> Contiguous levels with dewpoint depression T − Td ≤ 2°C are grouped into discrete decks; this reports the depth (kft) of the single thickest continuous deck. (A more permissive criterion than the ceiling's, to better capture the full vertical extent of the moist layer.)<br><br>
                         • <strong>Thick Cloud Layer (LLCC #6):</strong> Flags <em>VIOLATED</em> when the thickest cloud deck is ≥ 4,500 ft thick <em>and</em> any part of it lies in the 0°C to −20°C charging band — a direct proxy for the formal Thick Cloud Layer Launch Commit Criterion. Note this is a forecast-environment indicator, not the operational go/no-go call (which requires real-time field-mill and radar observations).<br><br>
-                        • <strong>Precip Water (PWAT):</strong> Column-integrated precipitable water (inches). A proxy for overall atmospheric moisture supporting the Disturbed-Weather / Debris-Cloud criteria — higher values (≳1.5–2.0″ in Florida) indicate a moist column favorable for deep convection.<br><br>
                         <span style="color:#64748b; font-size:0.92em;"><em>Note: the REFS ensemble-mean product carries only a single isobaric humidity level, so the moisture-based fields (ceiling, cloud top, layer thickness) cannot be reliably resolved on the REFS column and may read CLR/0. Its isotherm heights, PBL winds, and shear remain valid.</em></span><br><br>
                         • <strong>HREF Density Map:</strong> Hover any cell (or the HREF LTG column) to view live Space-Coast-domain spatial plots of the HREF ensemble flash-density field for all four exceedance thresholds (≥25/50/100/200 flashes). All four panels share an identical 0–100% color scale for direct comparison.
                     </div>
@@ -655,8 +643,7 @@
                     • -20°C Height: <strong>${p.hght_20c} kft</strong><br>
                     • Highest Cloud Top: <strong>${p.cloud_top} kft</strong><br>
                     • Max Layer Thickness: <strong>${p.cloud_thick} kft</strong><br>
-                    • Thick Cloud Layer (LLCC): <strong>${p.thick_layer === 1 ? 'VIOLATED' : (p.thick_layer === 0 ? 'OK' : '-')}</strong><br>
-                    • Precip Water: <strong>${(p.pwat !== null && p.pwat !== undefined) ? p.pwat.toFixed(2) + '"' : '-'}</strong>
+                    • Thick Cloud Layer (LLCC): <strong>${p.thick_layer === 1 ? 'VIOLATED' : (p.thick_layer === 0 ? 'OK' : '-')}</strong>
                 `;
             }
             popupCard.style.display = "block";
