@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import time
 import requests
 import concurrent.futures
 import logging
@@ -792,16 +793,22 @@ def parse_time_series_bufkit(bufkit_text):
     return hourly_data
 
 
-def fetch_station_model(session, stn, model):
+def fetch_station_model(session, stn, model, retries=2, stagger_s=0.0):
     download_id = "xmr" if stn == "kxmr" else stn
     model_prefix = "gfs3" if model == "gfs" else model
     url = f"http://www.meteo.psu.edu/bufkit/data/{model.upper()}/latest/{model_prefix}_{download_id}.buf"
-    try:
-        response = session.get(url, timeout=15)
-        if response.status_code == 200:
-            return stn, model, parse_time_series_bufkit(response.text)
-    except Exception as e:
-        logging.error(f"Error fetching {stn} {model}: {e}")
+    if stagger_s:
+        time.sleep(stagger_s)
+    for attempt in range(retries + 1):
+        try:
+            response = session.get(url, timeout=30)
+            if response.status_code == 200:
+                return stn, model, parse_time_series_bufkit(response.text)
+            logging.warning(f"{stn} {model}: HTTP {response.status_code} from PSU (attempt {attempt+1})")
+        except Exception as e:
+            logging.error(f"Error fetching {stn} {model} (attempt {attempt+1}): {e}")
+        if attempt < retries:
+            time.sleep(2 * (attempt + 1))
     return stn, model, {}
 
 
@@ -1418,11 +1425,20 @@ def run_pipeline():
 
     temp_time_rows_set = set()
     with requests.Session() as session:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # PSU's BUFKIT server appears to rate-limit/throttle bursts of concurrent
+        # connections from a single IP (seen as mass read-timeouts from cloud CI
+        # runners even though the files load fine one-at-a-time from a browser).
+        # Use a browser-like User-Agent and a small worker pool with a slight
+        # per-request stagger instead of firing all 15 station/model requests at once.
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        })
+        bufkit_jobs = [(s, m) for s in STATIONS for m in MODELS]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             futures = [
-                executor.submit(fetch_station_model, session, s, m)
-                for s in STATIONS
-                for m in MODELS
+                executor.submit(fetch_station_model, session, s, m, 2, i * 0.75)
+                for i, (s, m) in enumerate(bufkit_jobs)
             ]
             for future in concurrent.futures.as_completed(futures):
                 stn, model, data = future.result()
