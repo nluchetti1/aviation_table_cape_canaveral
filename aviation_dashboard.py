@@ -3,7 +3,6 @@ import json
 import math
 import os
 import re
-import time
 import requests
 import concurrent.futures
 import logging
@@ -664,18 +663,49 @@ def compute_profile_variables(profile_layers):
         lambda l: (l.get("depr") is not None and l["depr"] <= 2.0)
     )
 
-    pbl_winds = [l["sknt"] for l in profile_layers if l["pres"] >= 850.0]
-    mean_wind = sum(pbl_winds) / len(pbl_winds) if pbl_winds else 0.0
-    max_pbl = max(pbl_winds) if pbl_winds else 0.0
+    # --- Mixed-layer momentum (BUFKIT-style) -------------------------------------
+    # Both PBL Mom Mean (transport-style mean wind through the mixed layer) and PBL Mom Max
+    # (gust/mixing potential = strongest wind within the mixed layer) are evaluated over the
+    # DIAGNOSED mixed-layer depth, not a fixed 850 hPa slab. The mixed-layer top is found by
+    # walking up from the surface until potential temperature (theta) rises more than
+    # THETA_DELTA_K above the surface value — the classic well-mixed-layer criterion.
+    def _theta_k(layer):
+        t_k = layer["tmpc"] + 273.15
+        return t_k * (1000.0 / layer["pres"]) ** 0.286
+
+    THETA_DELTA_K = 1.5  # K above surface theta that marks the mixed-layer top
+    MIN_ML_TOP_FT = 1000.0   # floor so a strong nocturnal inversion still yields a usable layer
+    MAX_ML_TOP_FT = 12000.0  # ceiling guard against runaway deep-convective profiles
+
+    sfc_theta = _theta_k(profile_layers[0])
+    sfc_hght = profile_layers[0]["hght"]
+    ml_top_ft = None
+    for layer in profile_layers[1:]:
+        if _theta_k(layer) - sfc_theta > THETA_DELTA_K:
+            ml_top_ft = layer["hght"]
+            break
+    if ml_top_ft is None:
+        ml_top_ft = profile_layers[-1]["hght"]
+    # Clamp the diagnosed top into a sane AGL band
+    ml_top_ft = max(sfc_hght + MIN_ML_TOP_FT, min(ml_top_ft, sfc_hght + MAX_ML_TOP_FT))
+
+    ml_winds = [l["sknt"] for l in profile_layers if l["hght"] <= ml_top_ft]
+    if not ml_winds:                       # degenerate guard: at least use the surface layer
+        ml_winds = [profile_layers[0]["sknt"]]
+    mean_wind = sum(ml_winds) / len(ml_winds)
+    max_pbl = max(ml_winds)
+
     sfc_depr = profile_layers[0]["depr"] if profile_layers else 10.0
     vis = 0.25 if sfc_depr <= 0.5 else (1.0 if sfc_depr <= 1.0 else (3.0 if sfc_depr <= 2.0 else 10.0))
     valid_ceilings = [c for c in ceiling_decks if c["base"] >= 100.0]
     ceiling_val = round(valid_ceilings[0]["base"]) if valid_ceilings else 24000.0
 
     # Thick Cloud Layer LLCC (rule #6): do not fly through a cloud layer >= 4,500 ft thick
-    # where any part lies in the 0C to -20C charging band. We take the isotherm heights
-    # (kft AGL/MSL as computed) and, for each dewpoint-depression deck, check whether it is
-    # both >= 4,500 ft thick AND vertically overlaps the [-20C, 0C] height interval.
+    # where any part lies in the 0C to -20C charging band. For each dewpoint-depression deck
+    # we test TWO ways it can violate:
+    #   (a) the deck itself is >= 4,500 ft thick AND overlaps the [0C, -20C] band, or
+    #   (b) the portion of the deck that falls *inside* the band is itself >= 4,500 ft thick
+    #       (catches deep clouds that pass through the band even if grouped with layers below).
     h0c_ft = get_height_of_isotherm(0.0) * 1000.0
     h20c_ft = get_height_of_isotherm(-20.0) * 1000.0
     band_lo, band_hi = min(h0c_ft, h20c_ft), max(h0c_ft, h20c_ft)  # 0C is lower, -20C higher
@@ -684,9 +714,11 @@ def compute_profile_variables(profile_layers):
     for d in extent_decks:
         depth = max(0.0, d["top"] - d["base"])
         overlaps_band = (d["top"] >= band_lo) and (d["base"] <= band_hi)
-        if depth >= 4500.0 and overlaps_band:
+        # In-band portion of this deck
+        in_band_depth = max(0.0, min(d["top"], band_hi) - max(d["base"], band_lo))
+        if (depth >= 4500.0 and overlaps_band) or (in_band_depth >= 4500.0):
             thick_layer_violated = True
-            thickest_in_band_ft = max(thickest_in_band_ft, depth)
+            thickest_in_band_ft = max(thickest_in_band_ft, in_band_depth if in_band_depth > 0 else depth)
 
     return {
         "mom_mean": round(mean_wind, 1),
@@ -793,22 +825,16 @@ def parse_time_series_bufkit(bufkit_text):
     return hourly_data
 
 
-def fetch_station_model(session, stn, model, retries=2, stagger_s=0.0):
+def fetch_station_model(session, stn, model):
     download_id = "xmr" if stn == "kxmr" else stn
     model_prefix = "gfs3" if model == "gfs" else model
     url = f"http://www.meteo.psu.edu/bufkit/data/{model.upper()}/latest/{model_prefix}_{download_id}.buf"
-    if stagger_s:
-        time.sleep(stagger_s)
-    for attempt in range(retries + 1):
-        try:
-            response = session.get(url, timeout=30)
-            if response.status_code == 200:
-                return stn, model, parse_time_series_bufkit(response.text)
-            logging.warning(f"{stn} {model}: HTTP {response.status_code} from PSU (attempt {attempt+1})")
-        except Exception as e:
-            logging.error(f"Error fetching {stn} {model} (attempt {attempt+1}): {e}")
-        if attempt < retries:
-            time.sleep(2 * (attempt + 1))
+    try:
+        response = session.get(url, timeout=15)
+        if response.status_code == 200:
+            return stn, model, parse_time_series_bufkit(response.text)
+    except Exception as e:
+        logging.error(f"Error fetching {stn} {model}: {e}")
     return stn, model, {}
 
 
@@ -1425,20 +1451,11 @@ def run_pipeline():
 
     temp_time_rows_set = set()
     with requests.Session() as session:
-        # PSU's BUFKIT server appears to rate-limit/throttle bursts of concurrent
-        # connections from a single IP (seen as mass read-timeouts from cloud CI
-        # runners even though the files load fine one-at-a-time from a browser).
-        # Use a browser-like User-Agent and a small worker pool with a slight
-        # per-request stagger instead of firing all 15 station/model requests at once.
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        })
-        bufkit_jobs = [(s, m) for s in STATIONS for m in MODELS]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             futures = [
-                executor.submit(fetch_station_model, session, s, m, 2, i * 0.75)
-                for i, (s, m) in enumerate(bufkit_jobs)
+                executor.submit(fetch_station_model, session, s, m)
+                for s in STATIONS
+                for m in MODELS
             ]
             for future in concurrent.futures.as_completed(futures):
                 stn, model, data = future.result()
