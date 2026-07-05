@@ -619,18 +619,30 @@ def compute_profile_variables(profile_layers):
 
     def _group_cloud_layers(is_cloud_fn):
         """Walk the profile bottom-up, grouping contiguous 'in cloud' levels into decks.
-        is_cloud_fn(layer) -> bool decides membership."""
+        is_cloud_fn(layer) -> bool decides membership. To avoid a coarse (mandatory-level)
+        GRIB column merging widely-separated moist levels into one impossibly-thick deck,
+        two consecutive in-cloud levels are only joined if the vertical gap between them is
+        at most MAX_LEVEL_GAP_FT; a larger jump breaks the deck (we can't confirm the air
+        between two sparse levels is actually cloudy)."""
+        MAX_LEVEL_GAP_FT = 5000.0
         decks = []
         active = None
+        prev_hght = None
         for layer in profile_layers:
             if is_cloud_fn(layer):
                 if active is None:
                     active = {"base": layer["hght"], "top": layer["hght"]}
-                else:
+                elif (layer["hght"] - prev_hght) <= MAX_LEVEL_GAP_FT:
                     active["top"] = layer["hght"]
+                else:
+                    # Gap too large to trust as a single deck; close current, start new.
+                    decks.append(active)
+                    active = {"base": layer["hght"], "top": layer["hght"]}
+                prev_hght = layer["hght"]
             elif active is not None:
                 decks.append(active)
                 active = None
+                prev_hght = None
         if active:
             decks.append(active)
         return decks
