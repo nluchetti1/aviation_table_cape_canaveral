@@ -381,12 +381,14 @@
             if (activeMetric === 'href_density') {
                 sliderPanel.style.display = "block";
                 mainLayout.style.display = "none";
-                // Build time list from HREF lightning data (not sounding times) so we
-                // get the full 48-hour range even when models don't extend that far.
+                // Build the slider time list ONLY from hours that actually have HREF data
+                // (lightning percentages or spatial maps). HREF runs to ~48h, so this keeps
+                // the slider from extending across the multi-day sounding range.
                 const ltgRoot = (historyRuns[activeRunIdx] && historyRuns[activeRunIdx].href_lightning) || {};
                 const hrefStn = hrefStationFor(activeStn);
                 const ltgAnyStn = ltgRoot[hrefStn] || ltgRoot[Object.keys(ltgRoot)[0]] || {};
-                let hrefTimeSet = new Set([...Object.keys(ltgAnyStn), ...Array.from(timeSet)]);
+                const mapsRoot = hrefMapsLatest || {};
+                let hrefTimeSet = new Set([...Object.keys(ltgAnyStn), ...Object.keys(mapsRoot)]);
                 hrefSliderTimes = Array.from(hrefTimeSet).sort((a, b) => {
                     const [dayA, hourA] = a.split('/').map(Number);
                     const [dayB, hourB] = b.split('/').map(Number);
@@ -608,11 +610,11 @@
 
                     <div class="explanation-box">
                         <strong>Launch Commit Criteria (LCC) Guides &amp; Methodology:</strong><br><br>
-                        • <strong>HREF Lightning Density:</strong> A convection-allowing ensemble combining several high-resolution models, each giving a plausible storm evolution. Every member estimates lightning flashes from storm properties (updraft strength, mixed-phase microphysics, storm depth), calibrated by machine learning against observed lightning strikes, then accumulated over ~20 × 20 km grid boxes for the chosen period (1-, 3-, or 6-hour). The displayed value is the percentage of members exceeding each flash-count threshold.<br><br>
+                        • <strong>HREF Lightning Density:</strong> A convection-allowing ensemble combining several high-resolution models, each giving a plausible storm evolution. Every member estimates lightning flashes from storm properties (updraft strength, mixed-phase microphysics, storm depth), calibrated by machine learning against observed lightning strikes, then accumulated over ~20 × 20 km grid boxes. The displayed value is the percentage of members exceeding each flash-count threshold over a <strong>4-hour window ending at the labeled forecast hour</strong>.<br><br>
                         • <strong>Isotherm Profiles (0/-5/-10/-20°C Height):</strong> The profile is scanned for each target isotherm; the height (kft) is linearly interpolated between the two sounding levels that bracket that temperature. These delineate the charging zones where triboelectric (ice/graupel collision) charging and natural/triggered lightning are most favorable.<br><br>
                         • <strong>Highest Cloud Top:</strong> Height (kft) of the top of the highest layer meeting the dewpoint-depression criterion (T − Td ≤ 2°C), compared against the isotherm heights above to judge whether the flight path would pass through a glaciated (charge-bearing) cloud region.<br><br>
                         • <strong>Max Layer Thickness:</strong> Contiguous levels with dewpoint depression T − Td ≤ 2°C are grouped into discrete decks; this reports the depth (kft) of the single thickest continuous deck. (A more permissive criterion than the ceiling's, to better capture the full vertical extent of the moist layer.)<br><br>
-                        • <strong>Thick Cloud Layer (LLCC #6):</strong> Flags <em>VIOLATED</em> when the thickest cloud deck is ≥ 4,500 ft thick <em>and</em> any part of it lies in the 0°C to −20°C charging band — a direct proxy for the formal Thick Cloud Layer Launch Commit Criterion. Note this is a forecast-environment indicator, not the operational go/no-go call (which requires real-time field-mill and radar observations).<br><br>
+                        • <strong>Thick Cloud Layer (LLCC #6):</strong> Flags <em>VIOLATED</em> when the thickest cloud deck is ≥ 4,500 ft thick <em>and</em> any part of it lies in the 0°C to −20°C charging band.<br><br>
                         <span style="color:#64748b; font-size:0.92em;"><em>Note: the REFS ensemble-mean product carries only a single isobaric humidity level, so the moisture-based fields (ceiling, cloud top, layer thickness) cannot be reliably resolved on the REFS column and may read CLR/0. Its isotherm heights, PBL winds, and shear remain valid.</em></span><br><br>
                         • <strong>HREF Density Map:</strong> Hover any cell (or the HREF LTG column) to view live Space-Coast-domain spatial plots of the HREF ensemble flash-density field for all four exceedance thresholds (≥25/50/100/200 flashes). All four panels share an identical 0–100% color scale for direct comparison.
                     </div>
