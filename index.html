@@ -381,9 +381,8 @@
             if (activeMetric === 'href_density') {
                 sliderPanel.style.display = "block";
                 mainLayout.style.display = "none";
-                // Build the slider time list ONLY from hours that actually have HREF data
-                // (lightning percentages or spatial maps). HREF runs to ~48h, so this keeps
-                // the slider from extending across the multi-day sounding range.
+                // Build the slider time list from hours that actually have HREF data
+                // (lightning percentages or spatial maps).
                 const ltgRoot = (historyRuns[activeRunIdx] && historyRuns[activeRunIdx].href_lightning) || {};
                 const hrefStn = hrefStationFor(activeStn);
                 const ltgAnyStn = ltgRoot[hrefStn] || ltgRoot[Object.keys(ltgRoot)[0]] || {};
