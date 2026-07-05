@@ -431,10 +431,10 @@ def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour_i
 
 
 def fetch_href_lightning(time_keys):
-    href_data = {
-        stn: {row: {"p25": 0, "p50": 0, "p100": 0, "p200": 0} for row in time_keys}
-        for stn in STATIONS
-    }
+    # href_data is initialized empty and populated only for the HREF 1-48h window below,
+    # NOT pre-seeded from time_keys (which spans the full multi-day sounding range and would
+    # otherwise leak far-future zero-value keys into the lightning slider).
+    href_data = {stn: {} for stn in STATIONS}
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     session = requests.Session()
@@ -483,22 +483,6 @@ def fetch_href_lightning(time_keys):
         # otherwise "1/06" and "01/06" collide as two separate rows for the same hour.
         row_key = f"{valid_dt.day:02d}/{valid_dt.hour:02d}"
         all_href_time_keys[row_key] = f_hour_int
-
-    # Also include any sounding-matrix time keys that fall inside the HREF window but
-    # may use a slightly different day/hour representation (e.g. near month boundaries).
-    for row_key in time_keys:
-        try:
-            d_part, h_part = map(int, row_key.split("/"))
-            valid_dt = cycle_init_utc.replace(day=d_part, hour=h_part, minute=0, second=0, microsecond=0)
-            if valid_dt < cycle_init_utc:
-                valid_dt += datetime.timedelta(days=28)
-                valid_dt = valid_dt.replace(day=d_part)
-            f_hour_int = int(round((valid_dt - cycle_init_utc).total_seconds() / 3600))
-            if 1 <= f_hour_int <= 48:
-                norm_key = f"{valid_dt.day:02d}/{valid_dt.hour:02d}"
-                all_href_time_keys[norm_key] = f_hour_int
-        except Exception:
-            continue
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
         futures_map = {}
