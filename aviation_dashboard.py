@@ -87,7 +87,7 @@ _REFS_RESOLVED_PATTERN = None   # set once we confirm a working pattern this run
 
 
 # Bounding box — zoomed into the Space Coast launch corridor rather than all of FL
-FL_DOMAIN = {"lat_min": 25.5, "lat_max": 30.5, "lon_min": -83.5, "lon_max": -79.5}
+FL_DOMAIN = {"lat_min": 24.5, "lat_max": 31.0, "lon_min": -84.5, "lon_max": -79.0}
 
 # Spatial plot PNGs are written here (relative path, served alongside index.html)
 MAPS_DIR = "./maps"
@@ -172,7 +172,15 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
                 arr = np.zeros_like(grid, dtype=float)
 
             scale = 100.0 if arr.max() <= 1.0 else 1.0
-            raw_cell = float(arr[y_idx, x_idx])
+
+            # Sample a small neighborhood around the station index and take the MEDIAN, not
+            # the single cell. A lone fill/edge artifact at one grid point (which produced the
+            # spurious 100% readings) gets rejected by the median of its neighbors.
+            y0 = max(0, y_idx - 1); y1 = min(arr.shape[0], y_idx + 2)
+            x0 = max(0, x_idx - 1); x1 = min(arr.shape[1], x_idx + 2)
+            neighborhood = arr[y0:y1, x0:x1]
+            raw_cell = float(np.median(neighborhood)) if neighborhood.size else float(arr[y_idx, x_idx])
+
             pixel_value = raw_cell * scale
             pixel_value = max(0.0, min(100.0, pixel_value))
             val = int(round(pixel_value))
@@ -180,12 +188,11 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
             msg_str = str(grb).lower()
 
             # Diagnostic: when a suspiciously high value appears, dump exactly what produced
-            # it (raw cell, grid max, scale, and the message identity) so a false 100% can be
-            # traced rather than guessed at. Gated to >=90% to keep the log readable.
+            # it so a false 100% can be traced rather than guessed at. Gated to >=90%.
             if val >= 90:
-                logging.info(f"[LTG DIAG] {stn.upper()} msg#{msg_idx}: raw_cell={raw_cell:.6g} "
-                             f"grid_max={arr.max():.6g} grid_min={arr.min():.6g} scale={scale:g} "
-                             f"-> {val}% | {str(grb)[:110]}")
+                logging.info(f"[LTG DIAG] {stn.upper()} msg#{msg_idx}: median_cell={raw_cell:.6g} "
+                             f"single_cell={float(arr[y_idx, x_idx]):.6g} grid_max={arr.max():.6g} "
+                             f"scale={scale:g} -> {val}% | {str(grb)[:100]}")
             
             if "upperlimit=25" in msg_str or "prob > 0.25" in msg_str or "probability=25" in msg_str:
                 threshold_results["p25"] = val
@@ -574,7 +581,11 @@ def extract_ct_point(filepath, y_idx, x_idx):
             except (TypeError, ValueError):
                 continue
             scale = 100.0 if arr.max() <= 1.0 else 1.0
-            pv = max(0.0, min(100.0, float(arr[y_idx, x_idx]) * scale))
+            y0 = max(0, y_idx - 1); y1 = min(arr.shape[0], y_idx + 2)
+            x0 = max(0, x_idx - 1); x1 = min(arr.shape[1], x_idx + 2)
+            neigh = arr[y0:y1, x0:x1]
+            cell = float(np.median(neigh)) if neigh.size else float(arr[y_idx, x_idx])
+            pv = max(0.0, min(100.0, cell * scale))
             val = int(round(pv))
             break  # HREFCT files carry a single probability message
         grbs.close()
@@ -1040,9 +1051,11 @@ def compute_profile_variables(profile_layers):
         "shear": calc_shear_0_6km(),
         "vis": vis,
         "ceiling": ceiling_val,
+        "hght_p5c": round(get_height_of_isotherm(5.0), 1),
         "hght_0c": round(get_height_of_isotherm(0.0), 1),
         "hght_5c": round(get_height_of_isotherm(-5.0), 1),
         "hght_10c": round(get_height_of_isotherm(-10.0), 1),
+        "hght_15c": round(get_height_of_isotherm(-15.0), 1),
         "hght_20c": round(get_height_of_isotherm(-20.0), 1),
         "cloud_top": round(max([c["top"] for c in extent_decks], default=0.0) / 1000.0, 1),
         "cloud_thick": round(max([max(0.0, c["top"] - c["base"]) for c in extent_decks], default=0.0) / 1000.0, 1),
@@ -1143,12 +1156,20 @@ def fetch_station_model(session, stn, model):
     download_id = "xmr" if stn == "kxmr" else stn
     model_prefix = "gfs3" if model == "gfs" else model
     url = f"http://www.meteo.psu.edu/bufkit/data/{model.upper()}/latest/{model_prefix}_{download_id}.buf"
-    try:
-        response = session.get(url, timeout=15)
-        if response.status_code == 200:
-            return stn, model, parse_time_series_bufkit(response.text)
-    except Exception as e:
-        logging.error(f"Error fetching {stn} {model}: {e}")
+    # PSU's BUFKIT server intermittently times out; retry a few times with backoff and a
+    # longer timeout before giving up, so a transient hiccup doesn't drop a whole column.
+    for attempt in range(3):
+        try:
+            response = session.get(url, timeout=25)
+            if response.status_code == 200:
+                return stn, model, parse_time_series_bufkit(response.text)
+            break
+        except Exception as e:
+            if attempt < 2:
+                import time as _t
+                _t.sleep(2 * (attempt + 1))
+                continue
+            logging.error(f"Error fetching {stn} {model} after retries: {e}")
     return stn, model, {}
 
 
