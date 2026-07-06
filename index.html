@@ -170,6 +170,7 @@
         let hrefBlankMap = null;
         let ct1Maps = null;
         let ct4Maps = null;
+        let ctWindow = '4hr';  // toggles between '4hr' and '1hr' for the persistent CT column
         let activeMetric = 'mom_mean';
         let activeStn = 'kxmr';
         const popupCard = document.getElementById("hover-popup-card");
@@ -351,7 +352,7 @@
                 headerRow.innerHTML = `
                     <th style="width: 95px;">Time (UTC)</th>
                     ${modelThs}
-                    <th style="width: 110px; background:#475569; color:white; border-left: 2px solid #cbd5e1 !important;">CT 4hr<br><span style="font-weight:normal;font-size:0.7em">cal. thunder</span></th>
+                    <th style="width: 110px; background:#475569; color:white; border-left: 2px solid #cbd5e1 !important; cursor:pointer;" onclick="toggleCtWindow()" title="Click to toggle 1-hr / 4-hr calibrated thunder">CT ${ctWindow}<br><span style="font-weight:normal;font-size:0.7em">cal. thunder ⇄</span></th>
                 `;
             } else {
                 headerRow.innerHTML = `
@@ -387,12 +388,12 @@
                 sliderPanel.style.display = "block";
                 mainLayout.style.display = "none";
                 const isCt = (activeMetric === 'ct_thunder');
-                // Time list from whichever product's map/point keys are available.
-                const mapsRoot = isCt ? (ct4Maps || {}) : (hrefMapsLatest || {});
+                // CT slider shows the HOURLY (1-hr) calibrated-thunder field.
+                const mapsRoot = isCt ? (ct1Maps || {}) : (hrefMapsLatest || {});
                 let keySet = new Set(Object.keys(mapsRoot));
                 if (isCt) {
                     const ctRun = historyRuns[activeRunIdx] || {};
-                    const ctStn = (ctRun.ct4_points && ctRun.ct4_points[hrefStationFor(activeStn)]) || {};
+                    const ctStn = (ctRun.ct1_points && ctRun.ct1_points[hrefStationFor(activeStn)]) || {};
                     Object.keys(ctStn).forEach(k => keySet.add(k));
                 } else {
                     const ltgRoot = (historyRuns[activeRunIdx] && historyRuns[activeRunIdx].href_lightning) || {};
@@ -472,11 +473,13 @@
                 });
 
                 if (isLaunchMode) {
-                    // Persistent lightning column now shows HREF Calibrated Thunder (4-hr),
-                    // the ML-calibrated probability of >=1 CG flash within 20 km.
+                    // Persistent lightning column shows HREF Calibrated Thunder — the
+                    // ML-calibrated probability of >=1 CG flash within 20 km. The window
+                    // (1-hr / 4-hr) is toggled via the clickable column header.
                     const ctRun = historyRuns[activeRunIdx] || {};
-                    const ct4Stn = (ctRun.ct4_points && ctRun.ct4_points[hrefStationFor(activeStn)]) || {};
-                    let ctVal = ct4Stn[timeKey];
+                    const ctPointsKey = (ctWindow === '1hr') ? 'ct1_points' : 'ct4_points';
+                    const ctStn = (ctRun[ctPointsKey] && ctRun[ctPointsKey][hrefStationFor(activeStn)]) || {};
+                    let ctVal = ctStn[timeKey];
                     if (ctVal === undefined || ctVal === null) ctVal = 0;
                     if (ctVal <= 1.0 && ctVal > 0) ctVal = Math.round(ctVal * 100);
 
@@ -489,13 +492,14 @@
                     }
 
                     let hrefCellId = `c_${lowerStn}_href_${timeKey.replace('/','_')}`;
-                    const ct4Map = (ct4Maps || {})[timeKey] || null;
+                    const ctMap = ((ctWindow === '1hr' ? ct1Maps : ct4Maps) || {})[timeKey] || null;
+                    const winLabel = (ctWindow === '1hr') ? "1-hr" : "4-hr";
                     tr.innerHTML += `<td id="${hrefCellId}" class="href-interactive-col ${ctCls}" style="cursor:help; border-left: 2px solid #cbd5e1 !important;">${ctVal}%</td>`;
 
                     setTimeout(() => {
                         const hrefEl = document.getElementById(hrefCellId);
                         if(hrefEl) {
-                            hrefEl.onmouseenter = (e) => showCtMapPopup(e, ctVal, ct4Map, timeKey, "4-hr");
+                            hrefEl.onmouseenter = (e) => showCtMapPopup(e, ctVal, ctMap, timeKey, winLabel);
                             hrefEl.onmousemove = movePopup;
                             hrefEl.onmouseleave = hidePopup;
                         }
@@ -532,6 +536,8 @@
             ];
 
             const grid = document.getElementById("href-slider-grid");
+            grid.style.gridTemplateColumns = "1fr 1fr";
+            grid.style.gridTemplateRows = "1fr 1fr";
             grid.innerHTML = thresholds.map(([key, label, pct]) => {
                 const src = (mapsData && mapsData[key]) ? mapsData[key] : hrefBlankMap;
                 const body = src
@@ -548,21 +554,23 @@
             const timeKey = hrefSliderTimes[idx];
 
             const cycle = historyRuns[activeRunIdx] || {};
-            const ct4Stn = (cycle.ct4_points && cycle.ct4_points[hrefStationFor(activeStn)]) || {};
-            let ctVal = ct4Stn[timeKey];
+            const ctStn = (cycle.ct1_points && cycle.ct1_points[hrefStationFor(activeStn)]) || {};
+            let ctVal = ctStn[timeKey];
             if (ctVal === undefined || ctVal === null) ctVal = 0;
             if (ctVal <= 1.0 && ctVal > 0) ctVal = Math.round(ctVal * 100);
-            const mapSrc = (ct4Maps || {})[timeKey] || hrefBlankMap;
+            const mapSrc = (ct1Maps || {})[timeKey] || hrefBlankMap;
 
             document.getElementById("href-slider-time").innerText = `${timeKey}Z`;
             document.getElementById("href-slider-input").value = idx;
             const ctTitle = document.getElementById("href-slider-title");
-            if (ctTitle) ctTitle.innerText = "HREF Calibrated Thunder (4-hr) — Florida Domain";
+            if (ctTitle) ctTitle.innerText = "HREF Calibrated Thunder (1-hr) — Florida Domain";
             const grid = document.getElementById("href-slider-grid");
-            grid.innerHTML = `<div class="href-slider-cell" style="grid-column: 1 / -1;">
+            grid.style.gridTemplateColumns = "1fr";
+            grid.style.gridTemplateRows = "1fr";
+            grid.innerHTML = `<div class="href-slider-cell">
                 ${mapSrc ? `<img src="${mapSrc}" alt="Calibrated thunder map" style="max-height: calc(100vh - 300px);" />`
                          : `<div class="href-slider-cell-empty">No spatial data<br>for this hour</div>`}
-                <div class="href-slider-cell-label">HREF Calibrated Thunder (4-hr) &mdash; ${ctVal}% at ${activeStn.toUpperCase()}</div>
+                <div class="href-slider-cell-label">HREF Calibrated Thunder (1-hr) &mdash; ${ctVal}% at ${activeStn.toUpperCase()}</div>
             </div>`;
         }
 
@@ -689,9 +697,11 @@
             } else {
                 popupCard.innerHTML = `
                     <div class="popup-header">${model.toUpperCase()} Thermodynamic Heights</div>
+                    • +5°C Height: <strong>${p.hght_p5c} kft</strong><br>
                     • 0°C Height: <strong>${p.hght_0c} kft</strong><br>
                     • -5°C Height: <strong>${p.hght_5c} kft</strong><br>
                     • -10°C Height: <strong>${p.hght_10c} kft</strong><br>
+                    • -15°C Height: <strong>${p.hght_15c} kft</strong><br>
                     • -20°C Height: <strong>${p.hght_20c} kft</strong><br>
                     • Highest Cloud Top: <strong>${p.cloud_top} kft</strong><br>
                     • Max Layer Thickness: <strong>${p.cloud_thick} kft</strong><br>
