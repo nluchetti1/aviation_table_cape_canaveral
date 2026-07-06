@@ -172,11 +172,20 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
                 arr = np.zeros_like(grid, dtype=float)
 
             scale = 100.0 if arr.max() <= 1.0 else 1.0
-            pixel_value = float(arr[y_idx, x_idx]) * scale
+            raw_cell = float(arr[y_idx, x_idx])
+            pixel_value = raw_cell * scale
             pixel_value = max(0.0, min(100.0, pixel_value))
             val = int(round(pixel_value))
 
             msg_str = str(grb).lower()
+
+            # Diagnostic: when a suspiciously high value appears, dump exactly what produced
+            # it (raw cell, grid max, scale, and the message identity) so a false 100% can be
+            # traced rather than guessed at. Gated to >=90% to keep the log readable.
+            if val >= 90:
+                logging.info(f"[LTG DIAG] {stn.upper()} msg#{msg_idx}: raw_cell={raw_cell:.6g} "
+                             f"grid_max={arr.max():.6g} grid_min={arr.min():.6g} scale={scale:g} "
+                             f"-> {val}% | {str(grb)[:110]}")
             
             if "upperlimit=25" in msg_str or "prob > 0.25" in msg_str or "probability=25" in msg_str:
                 threshold_results["p25"] = val
