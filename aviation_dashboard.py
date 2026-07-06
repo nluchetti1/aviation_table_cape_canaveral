@@ -160,8 +160,20 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
 
         grbs.seek(0)
         for msg_idx, grb in enumerate(grbs, start=1):
-            raw_val = grb.values[y_idx, x_idx]
-            pixel_value = 0.0 if np.isnan(float(raw_val)) else float(raw_val)
+            grid = grb.values
+
+            # Determine fraction-vs-percent from the WHOLE grid's max, exactly as the spatial
+            # map does — a per-cell test can't distinguish 0.6 ("0.6%" percent-stored) from
+            # 0.6 ("60%" fraction-stored). Also sanitize masked/fill/NaN before taking the max.
+            try:
+                arr = np.ma.filled(np.ma.masked_invalid(np.ma.asarray(grid, dtype=float)), 0.0)
+                arr = np.where((arr > 1e19) | (arr < 0), 0.0, arr)
+            except (TypeError, ValueError):
+                arr = np.zeros_like(grid, dtype=float)
+
+            scale = 100.0 if arr.max() <= 1.0 else 1.0
+            pixel_value = float(arr[y_idx, x_idx]) * scale
+            pixel_value = max(0.0, min(100.0, pixel_value))
             val = int(round(pixel_value))
 
             msg_str = str(grb).lower()
