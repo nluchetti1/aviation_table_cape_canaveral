@@ -394,6 +394,112 @@ def generate_spatial_threshold_maps(filepath, file_prefix):
     return maps
 
 
+def extract_hrefct_from_file(filepath, lat, lon, stn):
+    """Extract the single HREF Calibrated Thunder (HREFCT) probability value at a point.
+    HREFCT is one field per file (probability of >=1 CG flash within 20 km), unlike the
+    density product's four flash-count thresholds. Returns an int percent 0-100."""
+    global _GRID_INDEX_CACHE
+    result = 0
+    try:
+        grbs = pygrib.open(filepath)
+        cache_key = f"ct_{stn}"
+        if cache_key in _GRID_INDEX_CACHE:
+            y_idx, x_idx = _GRID_INDEX_CACHE[cache_key]
+        else:
+            sample = grbs[1]
+            lats, lons = sample.latlons()
+            lons_n = np.where(lons > 180, lons - 360.0, lons)
+            dist = (lats - lat) ** 2 + (lons_n - lon) ** 2
+            y_idx, x_idx = np.unravel_index(dist.argmin(), dist.shape)
+            _GRID_INDEX_CACHE[cache_key] = (y_idx, x_idx)
+
+        grbs.seek(0)
+        grb = grbs[1]  # single-field product; first message is the calibrated probability
+        grid = grb.values
+        arr = np.ma.filled(np.ma.masked_invalid(np.ma.asarray(grid, dtype=float)), 0.0)
+        arr = np.where((arr > 1e19) | (arr < 0), 0.0, arr)
+        scale = 100.0 if arr.max() <= 1.0 else 1.0
+        pv = float(arr[y_idx, x_idx]) * scale
+        result = int(round(max(0.0, min(100.0, pv))))
+        grbs.close()
+    except Exception as e:
+        logging.error(f"HREFCT extraction failed for {stn.upper()}: {e}")
+    return result
+
+
+def generate_hrefct_map(filepath, file_prefix, window_label):
+    """Render a single Florida-domain calibrated-thunder probability map (PNG) from one
+    HREFCT GRIB2 file. Returns the relative path, or None on failure."""
+    try:
+        grbs = pygrib.open(filepath)
+        sample = grbs[1]
+        lats, lons = sample.latlons()
+        lons_n = np.where(lons > 180, lons - 360.0, lons)
+
+        domain_mask = (
+            (lats >= FL_DOMAIN["lat_min"]) & (lats <= FL_DOMAIN["lat_max"]) &
+            (lons_n >= FL_DOMAIN["lon_min"]) & (lons_n <= FL_DOMAIN["lon_max"])
+        )
+        ys, xs = np.where(domain_mask)
+        if len(ys) == 0:
+            grbs.close()
+            return None
+        y0, y1 = ys.min(), ys.max()
+        x0, x1 = xs.min(), xs.max()
+        sub_lats = lats[y0:y1 + 1, x0:x1 + 1]
+        sub_lons = lons_n[y0:y1 + 1, x0:x1 + 1]
+
+        grbs.seek(0)
+        grb = grbs[1]
+        raw_vals = grb.values[y0:y1 + 1, x0:x1 + 1]
+        vals = np.nan_to_num(np.asarray(raw_vals, dtype=float), nan=0.0)
+        vals = np.where((vals > 1e19) | (vals < 0), 0.0, vals)
+        if vals.max() <= 1.0:
+            vals = vals * 100.0
+        grbs.close()
+
+        proj = ccrs.PlateCarree()
+        states_provinces = cfeature.NaturalEarthFeature(
+            category="cultural", name="admin_1_states_provinces_lines", scale="50m", facecolor="none")
+        counties = cfeature.NaturalEarthFeature(
+            category="cultural", name="admin_2_counties", scale="10m", facecolor="none")
+
+        fig = plt.figure(figsize=(5.5, 5.8), dpi=120)
+        ax = fig.add_subplot(1, 1, 1, projection=proj)
+        ax.set_extent([FL_DOMAIN["lon_min"], FL_DOMAIN["lon_max"],
+                       FL_DOMAIN["lat_min"], FL_DOMAIN["lat_max"]], crs=proj)
+        ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="#dbeafe", zorder=0)
+        ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#f1f5f9", zorder=0)
+        ax.add_feature(counties, edgecolor="#cbd5e1", linewidth=0.35, zorder=1)
+        ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="#1e293b", linewidth=0.9, zorder=3)
+        ax.add_feature(states_provinces, edgecolor="#475569", linewidth=0.8, zorder=3)
+        ax.add_feature(cfeature.BORDERS.with_scale("50m"), edgecolor="#1e293b", linewidth=0.8, zorder=3)
+
+        masked_vals = np.ma.masked_less_equal(vals, 0.0)
+        # Distinct colormap from the density product (which uses hot_r) so the two are
+        # visually separable at a glance.
+        mesh = ax.pcolormesh(sub_lons, sub_lats, masked_vals, cmap="YlGnBu", vmin=0, vmax=100,
+                             shading="auto", transform=proj, zorder=2, alpha=0.85)
+
+        for stn_id, coords in STN_COORDS.items():
+            ax.plot(coords["lon"], coords["lat"], marker="^", markersize=6, color="#b91c1c",
+                    markeredgecolor="white", markeredgewidth=0.8, transform=proj, zorder=5)
+            ax.text(coords["lon"] + 0.06, coords["lat"] + 0.05, stn_id.upper(), fontsize=6,
+                    fontweight="bold", color="#7f1d1d", transform=proj, zorder=6,
+                    bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.6, edgecolor="none"))
+
+        ax.gridlines(draw_labels=False, linewidth=0.4, color="#94a3b8", alpha=0.5, linestyle="--")
+        ax.set_title(f"HREF Calibrated Thunder ({window_label})", fontsize=9, fontweight="bold", color="#1e293b")
+        cbar = fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.03)
+        cbar.set_label("Probability of Lightning (%)", fontsize=7)
+        cbar.ax.tick_params(labelsize=6)
+
+        return _fig_to_png_file(fig, f"{file_prefix}.png")
+    except Exception as e:
+        logging.error(f"HREFCT map render failed for {filepath}: {e}")
+        return None
+
+
 def fetch_href_spatial_map(session, date_str, cycle, f_hour_int):
     """Downloads the HREF lightning GRIB2 once per forecast hour (domain-wide, not
     station-specific) and renders the Florida spatial threshold maps from it."""
@@ -449,6 +555,197 @@ def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour_i
         try: os.remove(local_path)
         except Exception: pass
     return stn, {"p25": 0, "p50": 0, "p100": 0, "p200": 0}
+
+
+def extract_ct_point(filepath, y_idx, x_idx):
+    """Extract the single calibrated-thunder probability (%) at a grid index from an
+    HREFCT GRIB2 file. Returns an int percent, or 0 on any failure. Uses the same
+    whole-grid fraction-vs-percent normalization and fill-value sanitizing as the
+    lightning-density extractor."""
+    try:
+        grbs = pygrib.open(filepath)
+        grbs.seek(0)
+        val = 0
+        for grb in grbs:
+            grid = grb.values
+            try:
+                arr = np.ma.filled(np.ma.masked_invalid(np.ma.asarray(grid, dtype=float)), 0.0)
+                arr = np.where((arr > 1e19) | (arr < 0), 0.0, arr)
+            except (TypeError, ValueError):
+                continue
+            scale = 100.0 if arr.max() <= 1.0 else 1.0
+            pv = max(0.0, min(100.0, float(arr[y_idx, x_idx]) * scale))
+            val = int(round(pv))
+            break  # HREFCT files carry a single probability message
+        grbs.close()
+        return val
+    except Exception as e:
+        logging.error(f"HREFCT extraction failed: {e}")
+        return 0
+
+
+def generate_ct_map(filepath, out_filename):
+    """Render a single Florida-domain spatial map of the calibrated-thunder probability
+    field (0-100%). Returns the relative maps/ path, or None on failure."""
+    try:
+        grbs = pygrib.open(filepath)
+        grb = grbs[1]
+        lats, lons = grb.latlons()
+        lons_n = np.where(lons > 180, lons - 360.0, lons)
+        vals = np.ma.filled(np.ma.masked_invalid(np.ma.asarray(grb.values, dtype=float)), 0.0)
+        vals = np.where((vals > 1e19) | (vals < 0), 0.0, vals)
+        if vals.max() <= 1.0:
+            vals = vals * 100.0
+        grbs.close()
+
+        domain_mask = (
+            (lats >= FL_DOMAIN["lat_min"]) & (lats <= FL_DOMAIN["lat_max"]) &
+            (lons_n >= FL_DOMAIN["lon_min"]) & (lons_n <= FL_DOMAIN["lon_max"])
+        )
+        ys, xs = np.where(domain_mask)
+        if len(ys) == 0:
+            return None
+        y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+        sub_lats = lats[y0:y1 + 1, x0:x1 + 1]
+        sub_lons = lons_n[y0:y1 + 1, x0:x1 + 1]
+        sub_vals = vals[y0:y1 + 1, x0:x1 + 1]
+
+        proj = ccrs.PlateCarree()
+        states = cfeature.NaturalEarthFeature(category="cultural",
+                    name="admin_1_states_provinces_lines", scale="50m", facecolor="none")
+        counties = cfeature.NaturalEarthFeature(category="cultural",
+                    name="admin_2_counties", scale="10m", facecolor="none")
+
+        fig = plt.figure(figsize=(5.5, 5.8), dpi=120)
+        ax = fig.add_subplot(1, 1, 1, projection=proj)
+        ax.set_extent([FL_DOMAIN["lon_min"], FL_DOMAIN["lon_max"],
+                       FL_DOMAIN["lat_min"], FL_DOMAIN["lat_max"]], crs=proj)
+        ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="#dbeafe", zorder=0)
+        ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#f1f5f9", zorder=0)
+        ax.add_feature(counties, edgecolor="#cbd5e1", linewidth=0.35, zorder=1)
+        ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="#1e293b", linewidth=0.9, zorder=3)
+        ax.add_feature(states, edgecolor="#475569", linewidth=0.8, zorder=3)
+        ax.add_feature(cfeature.BORDERS.with_scale("50m"), edgecolor="#1e293b", linewidth=0.8, zorder=3)
+
+        masked = np.ma.masked_less_equal(sub_vals, 0.0)
+        mesh = ax.pcolormesh(sub_lons, sub_lats, masked, cmap="plasma_r", vmin=0, vmax=100,
+                             shading="auto", transform=proj, zorder=2, alpha=0.85)
+        for sid, c in STN_COORDS.items():
+            ax.plot(c["lon"], c["lat"], marker="^", markersize=6, color="#2563eb",
+                    markeredgecolor="white", markeredgewidth=0.8, transform=proj, zorder=5)
+            ax.text(c["lon"] + 0.06, c["lat"] + 0.05, sid.upper(), fontsize=6,
+                    fontweight="bold", color="#1e3a5f", transform=proj, zorder=6,
+                    bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.6, edgecolor="none"))
+        ax.gridlines(draw_labels=False, linewidth=0.4, color="#94a3b8", alpha=0.5, linestyle="--")
+        ax.set_title("HREF Calibrated Thunder Probability", fontsize=9, fontweight="bold", color="#1e293b")
+        cbar = fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.03)
+        cbar.set_label("Thunder Probability (%)", fontsize=7)
+        cbar.ax.tick_params(labelsize=6)
+
+        os.makedirs(MAPS_DIR, exist_ok=True)
+        out_path = os.path.join(MAPS_DIR, out_filename)
+        fig.savefig(out_path, format="png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        return f"maps/{out_filename}"
+    except Exception as e:
+        logging.error(f"HREFCT map render failed: {e}")
+        return None
+
+
+def fetch_calibrated_thunder(window="4hr"):
+    """Fetch HREF Calibrated Thunder (HREFCT) for the given accumulation window ('1hr' or
+    '4hr') across the 1-48h forecast range. Returns (ct_points, ct_maps):
+      ct_points: {stn: {row_key: prob_pct}}
+      ct_maps:   {row_key: 'maps/....png' | None}
+    The product is a single ML-calibrated probability of >=1 CG flash within 20 km."""
+    ct_points = {stn: {} for stn in STATIONS}
+    ct_maps = {}
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    session = requests.Session()
+    session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=3))
+
+    active_cycle = active_date_str = None
+    for days_back in [0, 1]:
+        date_str = (now_utc - datetime.timedelta(days=days_back)).strftime("%Y%m%d")
+        for cycle in ["12", "00"]:
+            test_url = (f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/"
+                        f"spc_post.{date_str}/thunder/spc_post.t{cycle}z.hrefct_{window}.f004.grib2")
+            try:
+                if session.head(test_url, timeout=3).status_code == 200:
+                    active_cycle, active_date_str = cycle, date_str
+                    break
+            except Exception:
+                continue
+        if active_cycle:
+            break
+
+    if not active_cycle:
+        logging.warning(f"No active HREFCT {window} cycle found on NOMADS.")
+        return ct_points, ct_maps
+
+    logging.info(f"HREFCT {window}: targeting {active_date_str} {active_cycle}z")
+    cycle_init = datetime.datetime.strptime(f"{active_date_str}{active_cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
+
+    # Resolve each station's grid index once (cache keyed by a synthetic id per station).
+    def _ct_worker(f_hour_int, row_key):
+        base = (f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/"
+                f"spc_post.{active_date_str}/thunder")
+        fname = f"spc_post.t{active_cycle}z.hrefct_{window}.f{f_hour_int:03d}.grib2"
+        url = f"{base}/{fname}"
+        local_path = os.path.join(CACHE_DIR, f"ct_{window}_{fname}")
+        pts = {stn: 0 for stn in STATIONS}
+        map_rel = None
+        try:
+            with session.get(url, timeout=10, stream=True) as r:
+                if r.status_code != 200:
+                    return row_key, pts, None
+                with open(local_path, "wb") as fh:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        fh.write(chunk)
+            # Grid indices per station (reuse the density cache; same HREF grid).
+            grbs = pygrib.open(local_path)
+            sample = grbs[1]
+            lats, lons = sample.latlons()
+            lons_n = np.where(lons > 180, lons - 360.0, lons)
+            grbs.close()
+            for stn, c in STN_COORDS.items():
+                cache_key = f"ct_{stn}"
+                if cache_key in _GRID_INDEX_CACHE:
+                    yi, xi = _GRID_INDEX_CACHE[cache_key]
+                else:
+                    dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
+                    yi, xi = np.unravel_index(dist.argmin(), dist.shape)
+                    _GRID_INDEX_CACHE[cache_key] = (yi, xi)
+                pts[stn] = extract_ct_point(local_path, yi, xi)
+            # Spatial map (only for the window we use for the slider; caller decides).
+            map_rel = generate_ct_map(local_path, f"ct_{window}_{active_date_str}_{active_cycle}z_f{f_hour_int:03d}.png")
+        except Exception as e:
+            logging.debug(f"HREFCT {window} f{f_hour_int:03d} break: {e}")
+        finally:
+            if os.path.exists(local_path):
+                try: os.remove(local_path)
+                except Exception: pass
+        return row_key, pts, map_rel
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = []
+        for f_hour_int in range(1, 49):
+            valid_dt = cycle_init + datetime.timedelta(hours=f_hour_int)
+            row_key = f"{valid_dt.day:02d}/{valid_dt.hour:02d}"
+            futures.append(executor.submit(_ct_worker, f_hour_int, row_key))
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                row_key, pts, map_rel = fut.result()
+                for stn in STATIONS:
+                    ct_points[stn][row_key] = pts.get(stn, 0)
+                ct_maps[row_key] = map_rel
+            except Exception:
+                pass
+
+    n_maps = sum(1 for v in ct_maps.values() if v)
+    logging.info(f"HREFCT {window}: points for {len(ct_maps)} hours, {n_maps} maps rendered.")
+    return ct_points, ct_maps
 
 
 def fetch_href_lightning(time_keys):
@@ -1412,6 +1709,20 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
 def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_rows, pad_matrix=None):
     href_lightning, href_maps = fetch_href_lightning(time_rows)
 
+    # HREF Calibrated Thunder (HREFCT): ML-calibrated probability of >=1 CG flash within
+    # 20 km. Fetch both the 1-hour and 4-hour windows. The 4-hour field also drives the
+    # calibrated-thunder spatial slider; 1-hour supplies its own table column + maps.
+    try:
+        ct1_points, ct1_maps = fetch_calibrated_thunder(window="1hr")
+    except Exception as e:
+        logging.error(f"HREFCT 1hr fetch failed: {e}")
+        ct1_points, ct1_maps = {stn: {} for stn in STATIONS}, {}
+    try:
+        ct4_points, ct4_maps = fetch_calibrated_thunder(window="4hr")
+    except Exception as e:
+        logging.error(f"HREFCT 4hr fetch failed: {e}")
+        ct4_points, ct4_maps = {stn: {} for stn in STATIONS}, {}
+
     history_runs = []
     if os.path.exists(HISTORY_FILE):
         try:
@@ -1435,6 +1746,9 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         "data": combined_data,
         # HREF lightning point/percentage data DOES participate in dprog/dt history.
         "href_lightning": href_lightning,
+        # Calibrated-thunder point probabilities (1hr + 4hr) also participate in history.
+        "ct1_points": ct1_points,
+        "ct4_points": ct4_points,
     }
 
     if not history_runs or history_runs[0]["timestamp"] != current_timestamp:
@@ -1447,6 +1761,8 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     href_maps_latest = {
         "timestamp": current_timestamp,
         "href_maps": href_maps,
+        "ct1_maps": ct1_maps,
+        "ct4_maps": ct4_maps,
         "blank_map": blank_basemap_path,
     }
 
@@ -1457,7 +1773,13 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
 
     with open(HISTORY_FILE, "w") as f:
         json.dump(payload, f, indent=2)
-    prune_stale_maps(href_maps, blank_basemap_path)
+
+    # Preserve CT map PNGs alongside the density maps when pruning stale files.
+    ct_all_maps = {}
+    for rk, p in {**ct1_maps, **ct4_maps}.items():
+        if p:
+            ct_all_maps.setdefault(rk, {})["ct"] = p
+    prune_stale_maps({**href_maps, **ct_all_maps}, blank_basemap_path)
     logging.info("Dashboard matrix completely compiled and written to history.json.")
 
 
