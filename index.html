@@ -274,7 +274,8 @@
             if (metric === 'href_density') {
                 let p25 = val;
                 if (p25 === undefined || p25 === null) return { txt: "0%", cls: "ltg-none" };
-                if (p25 <= 1.0 && p25 > 0) p25 = Math.round(p25 * 100);
+                // Already an integer percent from the backend — no x100 rescale.
+                p25 = Math.max(0, Math.min(100, Math.round(p25)));
                 let cls = "ltg-none";
                 if (p25 > 0) {
                     if (p25 >= 30) cls = "ltg-high";
@@ -481,7 +482,9 @@
                     const ctStn = (ctRun[ctPointsKey] && ctRun[ctPointsKey][hrefStationFor(activeStn)]) || {};
                     let ctVal = ctStn[timeKey];
                     if (ctVal === undefined || ctVal === null) ctVal = 0;
-                    if (ctVal <= 1.0 && ctVal > 0) ctVal = Math.round(ctVal * 100);
+                    // Backend already returns an integer percent (0-100). Do NOT re-scale:
+                    // multiplying a genuine 1% by 100 was what showed a real ~0% as 100%.
+                    ctVal = Math.max(0, Math.min(100, Math.round(ctVal)));
 
                     let ctCls = "ltg-none";
                     if (ctVal > 0) {
@@ -557,7 +560,8 @@
             const ctStn = (cycle.ct1_points && cycle.ct1_points[hrefStationFor(activeStn)]) || {};
             let ctVal = ctStn[timeKey];
             if (ctVal === undefined || ctVal === null) ctVal = 0;
-            if (ctVal <= 1.0 && ctVal > 0) ctVal = Math.round(ctVal * 100);
+            // Already an integer percent from the backend — display as-is (no x100).
+            ctVal = Math.max(0, Math.min(100, Math.round(ctVal)));
             const mapSrc = (ct1Maps || {})[timeKey] || hrefBlankMap;
 
             document.getElementById("href-slider-time").innerText = `${timeKey}Z`;
@@ -713,7 +717,9 @@
         }
 
         function showLtgMapPopup(e, ltg, maps, timeKey) {
-            let formatPct = (v) => v !== undefined ? (v <= 1.0 && v > 0 ? Math.round(v * 100) : v) + '%' : '0%';
+            // Values arrive as integer percents (0-100) from the backend; display as-is.
+            // The old `v <= 1.0 ? v*100` guard turned a genuine 1% into 100%.
+            let formatPct = (v) => (v === undefined || v === null) ? '0%' : Math.max(0, Math.min(100, Math.round(v))) + '%';
 
             let tableHtml = `
                 <strong>Exceedance Strike Thresholds:</strong><br>
