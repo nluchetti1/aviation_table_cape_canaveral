@@ -33,6 +33,8 @@ STN_COORDS = {
 
 # Cape Canaveral / KSC launch pads. These are derived from raw model isobaric GRIB2
 # (GFS/RAP/HRRR) rather than BUFKIT, since the pads have no dedicated BUFKIT profiles.
+# KTTS (KSC Shuttle Landing Facility) and KCOF (Patrick SFB) are airfields handled the
+# same GRIB way; they inherit the KXMR HREF-lightning/CT proxy in the frontend.
 LAUNCH_PADS = {
     "lc39a": {"lat": 28.608, "lon": -80.604, "label": "LC-39A (KSC)"},
     "lc39b": {"lat": 28.627, "lon": -80.621, "label": "LC-39B (KSC)"},
@@ -40,6 +42,8 @@ LAUNCH_PADS = {
     "slc40": {"lat": 28.562, "lon": -80.577, "label": "SLC-40 (CCSFS)"},
     "slc41": {"lat": 28.583, "lon": -80.583, "label": "SLC-41 (CCSFS)"},
     "lc36":  {"lat": 28.470, "lon": -80.538, "label": "LC-36 (CCSFS)"},
+    "ktts":  {"lat": 28.615, "lon": -80.695, "label": "KTTS (KSC SLF)"},
+    "kcof":  {"lat": 28.235, "lon": -80.610, "label": "KCOF (Patrick SFB)"},
 }
 
 THRESHOLD_MAP = {25: "p25", 50: "p50", 100: "p100", 200: "p200"}
