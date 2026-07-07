@@ -90,23 +90,23 @@
     <div class="control-bar">
         <div class="nav-links">
             <span>Aviation:</span>
-            <a onmouseover="updateMetric('mom_mean')" class="active" id="nav-mom_mean">PBL Mom Mean</a>
-            <a onmouseover="updateMetric('mom_max')" id="nav-mom_max">PBL Mom Max</a>
-            <a onmouseover="updateMetric('ceiling')" id="nav-ceiling">Ceilings</a>
-            <a onmouseover="updateMetric('vis')" id="nav-vis">Visibility</a>
-            <a onmouseover="updateMetric('shear')" id="nav-shear">0-6 km Shear</a>
+            <a onclick="updateMetric('mom_mean')" class="active" id="nav-mom_mean">PBL Mom Mean</a>
+            <a onclick="updateMetric('mom_max')" id="nav-mom_max">PBL Mom Max</a>
+            <a onclick="updateMetric('ceiling')" id="nav-ceiling">Ceilings</a>
+            <a onclick="updateMetric('vis')" id="nav-vis">Visibility</a>
+            <a onclick="updateMetric('shear')" id="nav-shear">0-6 km Shear</a>
             | <span>Launch Variables (kft):</span>
-            <a onmouseover="updateMetric('hght_p5c')" id="nav-hght_p5c">+5°C Height</a>
-            <a onmouseover="updateMetric('hght_0c')" id="nav-hght_0c">0°C Height</a>
-            <a onmouseover="updateMetric('hght_5c')" id="nav-hght_5c">-5°C Height</a>
-            <a onmouseover="updateMetric('hght_10c')" id="nav-hght_10c">-10°C Height</a>
-            <a onmouseover="updateMetric('hght_15c')" id="nav-hght_15c">-15°C Height</a>
-            <a onmouseover="updateMetric('hght_20c')" id="nav-hght_20c">-20°C Height</a>
-            <a onmouseover="updateMetric('cloud_top')" id="nav-cloud_top">Highest Cloud Top</a>
-            <a onmouseover="updateMetric('cloud_thick')" id="nav-cloud_thick">Max Layer Thickness</a>
-            <a onmouseover="updateMetric('thick_layer')" id="nav-thick_layer">Thick Cloud Layer</a>
-            <a onmouseover="updateMetric('href_density')" id="nav-href_density">HREF Density Map</a>
-            <a onmouseover="updateMetric('ct_thunder')" id="nav-ct_thunder">Cal. Thunder Map</a>
+            <a onclick="updateMetric('hght_p5c')" id="nav-hght_p5c">+5°C Height</a>
+            <a onclick="updateMetric('hght_0c')" id="nav-hght_0c">0°C Height</a>
+            <a onclick="updateMetric('hght_5c')" id="nav-hght_5c">-5°C Height</a>
+            <a onclick="updateMetric('hght_10c')" id="nav-hght_10c">-10°C Height</a>
+            <a onclick="updateMetric('hght_15c')" id="nav-hght_15c">-15°C Height</a>
+            <a onclick="updateMetric('hght_20c')" id="nav-hght_20c">-20°C Height</a>
+            <a onclick="updateMetric('cloud_top')" id="nav-cloud_top">Highest Cloud Top</a>
+            <a onclick="updateMetric('cloud_thick')" id="nav-cloud_thick">Max Layer Thickness</a>
+            <a onclick="updateMetric('thick_layer')" id="nav-thick_layer">Thick Cloud Layer</a>
+            <a onclick="updateMetric('href_density')" id="nav-href_density">HREF Density Map</a>
+            <a onclick="updateMetric('ct_thunder')" id="nav-ct_thunder">Cal. Thunder Map</a>
         </div>
         <div class="station-selector">
             <label for="stn-dropdown">Station:</label>
@@ -125,6 +125,10 @@
                     <option value="slc40">SLC-40 (CCSFS)</option>
                     <option value="slc41">SLC-41 (CCSFS)</option>
                     <option value="lc36">LC-36 (CCSFS)</option>
+                </optgroup>
+                <optgroup label="Airfields (raw GRIB)">
+                    <option value="ktts">KTTS (KSC SLF)</option>
+                    <option value="kcof">KCOF (Patrick SFB)</option>
                 </optgroup>
             </select>
         </div>
@@ -180,9 +184,9 @@
         const aviationMetrics = ['mom_mean', 'mom_max', 'ceiling', 'vis', 'shear'];
         const launchMetrics = ['hght_p5c', 'hght_0c', 'hght_5c', 'hght_10c', 'hght_15c', 'hght_20c', 'cloud_top', 'cloud_thick', 'thick_layer', 'href_density', 'ct_thunder'];
 
-        // Launch pads have no dedicated HREF lightning point data; they all sit within a
-        // few km of the KXMR sampling point, so use KXMR's HREF density as their proxy.
-        const PAD_IDS = ['lc39a', 'lc39b', 'lc37', 'slc40', 'slc41', 'lc36'];
+        // Launch pads + the two GRIB airfields (KTTS, KCOF) have no dedicated HREF lightning
+        // point data; they use KXMR's HREF density / calibrated-thunder as a nearby proxy.
+        const PAD_IDS = ['lc39a', 'lc39b', 'lc37', 'slc40', 'slc41', 'lc36', 'ktts', 'kcof'];
         function hrefStationFor(stn) {
             return PAD_IDS.includes(stn.toLowerCase()) ? 'kxmr' : stn.toLowerCase();
         }
@@ -315,13 +319,15 @@
 
             // Isotherm Level evaluation (color cell if cloud top pushes through it)
             if (['hght_p5c', 'hght_0c', 'hght_5c', 'hght_10c', 'hght_15c', 'hght_20c'].includes(metric)) {
+                // Colder isotherm breached by the cloud top => more glaciated cloud => stronger
+                // triboelectric charging. Ramp light→dark with decreasing temperature.
+                const ISO_BREACH_CLS = {
+                    hght_p5c: 'ltg-vlow', hght_0c: 'ltg-low', hght_5c: 'ltg-low',
+                    hght_10c: 'ltg-med', hght_15c: 'ltg-high', hght_20c: 'ltg-high'
+                };
                 let cls = "cell-vfr";
                 if (profile && profile.cloud_top && profile.cloud_top >= val && val > 0) {
-                    // Deeper/colder isotherms imply a more glaciated, charge-favorable cloud.
-                    if (metric === 'hght_20c' || metric === 'hght_15c' || metric === 'hght_5c') cls = "cell-ifr";
-                    else if (metric === 'hght_10c') cls = "ltg-med";
-                    else if (metric === 'hght_0c') cls = "ltg-low";
-                    else if (metric === 'hght_p5c') cls = "ltg-vlow"; // +5C: cloud top merely above freezing-minus
+                    cls = ISO_BREACH_CLS[metric] || 'ltg-low';
                 }
                 return { txt: txt + " kft", cls: cls };
             }
@@ -430,6 +436,19 @@
                     return fda !== fdb ? fda - fdb : hourA - hourB;
                 });
                 if (hrefSliderIdx >= hrefSliderTimes.length) hrefSliderIdx = 0;
+                // Open on the first forecast hour that actually has a rendered map, so the
+                // panel never launches on a blank basemap (the first 1-2 density hours often
+                // fail to generate on NOMADS). Falls back to idx 0 if none have maps yet.
+                const hasMapAt = (tk) => {
+                    if (isCt) {
+                        const alt = ((ctWindow === '1hr') ? ct4Maps : ct1Maps) || {};
+                        return !!(activeCtMaps()[tk] || alt[tk]);
+                    }
+                    const m = (hrefMapsLatest || {})[tk];
+                    return !!(m && Object.values(m).some(Boolean));
+                };
+                const firstReal = hrefSliderTimes.findIndex(hasMapAt);
+                if (firstReal >= 0 && (hrefSliderIdx === 0)) hrefSliderIdx = firstReal;
                 const sliderInput = document.getElementById("href-slider-input");
                 sliderInput.max = Math.max(0, hrefSliderTimes.length - 1);
                 sliderInput.value = hrefSliderIdx;
@@ -702,15 +721,18 @@
                     <div class="legend-title">Matrix Threshold Criteria</div>
                     
                     <div class="legend-section-title">HREF Probability (Exceedance)</div>
-                    <div class="legend-item ltg-vlow"><span>Very Low Prob</span><span>&gt; 0% Strikes</span></div>
-                    <div class="legend-item ltg-low"><span>Low Probability</span><span>&gt; 5% Strikes</span></div>
-                    <div class="legend-item ltg-med"><span>Medium Probability</span><span>&gt; 15% Strikes</span></div>
-                    <div class="legend-item ltg-high"><span>High Probability</span><span>&gt; 30% Strikes</span></div>
+                    <div class="legend-item ltg-vlow"><span>Very Low Prob</span><span>&gt; 0% prob.</span></div>
+                    <div class="legend-item ltg-low"><span>Low Probability</span><span>≥ 5% prob.</span></div>
+                    <div class="legend-item ltg-med"><span>Medium Probability</span><span>≥ 15% prob.</span></div>
+                    <div class="legend-item ltg-high"><span>High Probability</span><span>≥ 30% prob.</span></div>
                     
                     <div class="legend-section-title">Isotherm Glaciation Intersects</div>
+                    <div class="legend-item ltg-vlow"><span>+5°C Breach</span><span>Cloud Top ≥ +5°C</span></div>
                     <div class="legend-item ltg-low"><span>0°C Breach</span><span>Cloud Top ≥ 0°C</span></div>
+                    <div class="legend-item ltg-low"><span>-5°C Breach</span><span>Cloud Top ≥ -5°C</span></div>
                     <div class="legend-item ltg-med"><span>-10°C Breach</span><span>Cloud Top ≥ -10°C</span></div>
-                    <div class="legend-item cell-ifr"><span>-20°C Breach</span><span>Cloud Top ≥ -20°C</span></div>
+                    <div class="legend-item ltg-high"><span>-15°C Breach</span><span>Cloud Top ≥ -15°C</span></div>
+                    <div class="legend-item ltg-high"><span>-20°C Breach</span><span>Cloud Top ≥ -20°C</span></div>
 
                     <div class="explanation-box">
                         <strong>Launch Commit Criteria (LCC) Guides &amp; Methodology:</strong><br><br>
