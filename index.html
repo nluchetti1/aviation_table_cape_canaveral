@@ -96,9 +96,11 @@
             <a onmouseover="updateMetric('vis')" id="nav-vis">Visibility</a>
             <a onmouseover="updateMetric('shear')" id="nav-shear">0-6 km Shear</a>
             | <span>Launch Variables (kft):</span>
+            <a onmouseover="updateMetric('hght_p5c')" id="nav-hght_p5c">+5°C Height</a>
             <a onmouseover="updateMetric('hght_0c')" id="nav-hght_0c">0°C Height</a>
             <a onmouseover="updateMetric('hght_5c')" id="nav-hght_5c">-5°C Height</a>
             <a onmouseover="updateMetric('hght_10c')" id="nav-hght_10c">-10°C Height</a>
+            <a onmouseover="updateMetric('hght_15c')" id="nav-hght_15c">-15°C Height</a>
             <a onmouseover="updateMetric('hght_20c')" id="nav-hght_20c">-20°C Height</a>
             <a onmouseover="updateMetric('cloud_top')" id="nav-cloud_top">Highest Cloud Top</a>
             <a onmouseover="updateMetric('cloud_thick')" id="nav-cloud_thick">Max Layer Thickness</a>
@@ -176,7 +178,7 @@
         const popupCard = document.getElementById("hover-popup-card");
 
         const aviationMetrics = ['mom_mean', 'mom_max', 'ceiling', 'vis', 'shear'];
-        const launchMetrics = ['hght_0c', 'hght_5c', 'hght_10c', 'hght_20c', 'cloud_top', 'cloud_thick', 'thick_layer', 'href_density', 'ct_thunder'];
+        const launchMetrics = ['hght_p5c', 'hght_0c', 'hght_5c', 'hght_10c', 'hght_15c', 'hght_20c', 'cloud_top', 'cloud_thick', 'thick_layer', 'href_density', 'ct_thunder'];
 
         // Launch pads have no dedicated HREF lightning point data; they all sit within a
         // few km of the KXMR sampling point, so use KXMR's HREF density as their proxy.
@@ -198,6 +200,15 @@
                 hrefBlankMap = (payload.href_maps_latest && payload.href_maps_latest.blank_map) || null;
                 ct1Maps = (payload.href_maps_latest && payload.href_maps_latest.ct1_maps) || null;
                 ct4Maps = (payload.href_maps_latest && payload.href_maps_latest.ct4_maps) || null;
+
+                // Diagnostic: count how many hours actually carry a real map path, so a blank
+                // slider can be told apart from "payload has no maps" vs "images 404".
+                const countReal = (o, nested) => !o ? 0 : Object.values(o).filter(v =>
+                    nested ? (v && typeof v === 'object' && Object.values(v).some(Boolean)) : !!v).length;
+                console.log('[maps loaded] density(hrs w/ ≥1 threshold):', countReal(hrefMapsLatest, true),
+                            '| ct1:', countReal(ct1Maps, false),
+                            '| ct4:', countReal(ct4Maps, false),
+                            '| blankBasemap:', hrefBlankMap || '(none)');
                 buildTimelineNav();
                 loadRunIndex(0); // index 0 is always the most recent run
             } catch(e) {
@@ -303,12 +314,14 @@
             }
 
             // Isotherm Level evaluation (color cell if cloud top pushes through it)
-            if (['hght_0c', 'hght_5c', 'hght_10c', 'hght_20c'].includes(metric)) {
+            if (['hght_p5c', 'hght_0c', 'hght_5c', 'hght_10c', 'hght_15c', 'hght_20c'].includes(metric)) {
                 let cls = "cell-vfr";
                 if (profile && profile.cloud_top && profile.cloud_top >= val && val > 0) {
-                    if (metric === 'hght_20c' || metric === 'hght_5c') cls = "cell-ifr"; 
+                    // Deeper/colder isotherms imply a more glaciated, charge-favorable cloud.
+                    if (metric === 'hght_20c' || metric === 'hght_15c' || metric === 'hght_5c') cls = "cell-ifr";
                     else if (metric === 'hght_10c') cls = "ltg-med";
                     else if (metric === 'hght_0c') cls = "ltg-low";
+                    else if (metric === 'hght_p5c') cls = "ltg-vlow"; // +5C: cloud top merely above freezing-minus
                 }
                 return { txt: txt + " kft", cls: cls };
             }
@@ -389,12 +402,20 @@
                 sliderPanel.style.display = "block";
                 mainLayout.style.display = "none";
                 const isCt = (activeMetric === 'ct_thunder');
-                // CT slider shows the HOURLY (1-hr) calibrated-thunder field.
-                const mapsRoot = isCt ? (ct1Maps || {}) : (hrefMapsLatest || {});
+                // CT slider now follows the SAME 1-hr/4-hr toggle as the table (ctWindow),
+                // instead of being hard-pinned to 1-hr. The 1-hr HREFCT field is posted less
+                // reliably on NOMADS than 4-hr, so pinning to 1-hr left the slider blank on the
+                // (default) 4-hr view even though the 4-hr PNGs existed on disk.
+                const mapsRoot = isCt ? activeCtMaps() : (hrefMapsLatest || {});
                 let keySet = new Set(Object.keys(mapsRoot));
                 if (isCt) {
+                    // Union keys from both windows' maps + point data so every forecast hour
+                    // that has ANY calibrated-thunder info gets a slider stop.
+                    Object.keys(ct1Maps || {}).forEach(k => keySet.add(k));
+                    Object.keys(ct4Maps || {}).forEach(k => keySet.add(k));
                     const ctRun = historyRuns[activeRunIdx] || {};
-                    const ctStn = (ctRun.ct1_points && ctRun.ct1_points[hrefStationFor(activeStn)]) || {};
+                    const ptsKey = (ctWindow === '1hr') ? 'ct1_points' : 'ct4_points';
+                    const ctStn = (ctRun[ptsKey] && ctRun[ptsKey][hrefStationFor(activeStn)]) || {};
                     Object.keys(ctStn).forEach(k => keySet.add(k));
                 } else {
                     const ltgRoot = (historyRuns[activeRunIdx] && historyRuns[activeRunIdx].href_lightning) || {};
@@ -513,6 +534,22 @@
             });
         }
 
+        // Which CT map set the slider should show, following the table's 1-hr/4-hr toggle.
+        function activeCtMaps() {
+            return ((ctWindow === '1hr') ? ct1Maps : ct4Maps) || {};
+        }
+
+        // <img> with a graceful fallback: if the PNG path 404s (e.g. a map that failed to
+        // generate this run), swap to the blank basemap and log the bad src to the console
+        // instead of showing a broken-image icon.
+        function imgTag(src, alt, extraStyle) {
+            if (!src) return `<div class="href-slider-cell-empty">No spatial data<br>for this hour</div>`;
+            const style = extraStyle ? ` style="${extraStyle}"` : "";
+            const fb = hrefBlankMap || "";
+            return `<img src="${src}" alt="${alt}"${style} ` +
+                   `onerror="if(this.dataset.fb!=='1'){this.dataset.fb='1';console.warn('slider map 404:', this.getAttribute('src'));this.src='${fb}';}" />`;
+        }
+
         function renderHrefSliderFrame(idx) {
             if (!hrefSliderTimes.length) return;
             idx = Math.max(0, Math.min(idx, hrefSliderTimes.length - 1));
@@ -543,9 +580,7 @@
             grid.style.gridTemplateRows = "1fr 1fr";
             grid.innerHTML = thresholds.map(([key, label, pct]) => {
                 const src = (mapsData && mapsData[key]) ? mapsData[key] : hrefBlankMap;
-                const body = src
-                    ? `<img src="${src}" alt="${label} spatial plot" />`
-                    : `<div class="href-slider-cell-empty">No spatial data<br>for this hour</div>`;
+                const body = imgTag(src, `${label} spatial plot`);
                 return `<div class="href-slider-cell">${body}<div class="href-slider-cell-label">${label} &mdash; ${pct}</div></div>`;
             }).join('');
         }
@@ -556,25 +591,34 @@
             hrefSliderIdx = idx;
             const timeKey = hrefSliderTimes[idx];
 
+            const winLabel = (ctWindow === '1hr') ? "1-hr" : "4-hr";
             const cycle = historyRuns[activeRunIdx] || {};
-            const ctStn = (cycle.ct1_points && cycle.ct1_points[hrefStationFor(activeStn)]) || {};
+            const ptsKey = (ctWindow === '1hr') ? 'ct1_points' : 'ct4_points';
+            const ctStn = (cycle[ptsKey] && cycle[ptsKey][hrefStationFor(activeStn)]) || {};
             let ctVal = ctStn[timeKey];
             if (ctVal === undefined || ctVal === null) ctVal = 0;
             // Already an integer percent from the backend — display as-is (no x100).
             ctVal = Math.max(0, Math.min(100, Math.round(ctVal)));
-            const mapSrc = (ct1Maps || {})[timeKey] || hrefBlankMap;
+
+            // Prefer the selected window's map; if that window has no map for this hour
+            // (the 1-hr field is often absent on NOMADS), fall back to the other window's map
+            // so the panel still shows a spatial picture rather than a blank basemap.
+            const primary = activeCtMaps()[timeKey];
+            const other = (((ctWindow === '1hr') ? ct4Maps : ct1Maps) || {})[timeKey];
+            const mapSrc = primary || other || hrefBlankMap;
+            const usedFallback = !primary && !!other;
 
             document.getElementById("href-slider-time").innerText = `${timeKey}Z`;
             document.getElementById("href-slider-input").value = idx;
             const ctTitle = document.getElementById("href-slider-title");
-            if (ctTitle) ctTitle.innerText = "HREF Calibrated Thunder (1-hr) — Florida Domain";
+            if (ctTitle) ctTitle.innerText = `HREF Calibrated Thunder (${winLabel}) — Florida Domain`;
             const grid = document.getElementById("href-slider-grid");
             grid.style.gridTemplateColumns = "1fr";
             grid.style.gridTemplateRows = "1fr";
+            const note = usedFallback ? ` <span style="font-weight:normal;color:#94a3b8;">(showing ${ctWindow === '1hr' ? '4-hr' : '1-hr'} map)</span>` : "";
             grid.innerHTML = `<div class="href-slider-cell">
-                ${mapSrc ? `<img src="${mapSrc}" alt="Calibrated thunder map" style="max-height: calc(100vh - 300px);" />`
-                         : `<div class="href-slider-cell-empty">No spatial data<br>for this hour</div>`}
-                <div class="href-slider-cell-label">HREF Calibrated Thunder (1-hr) &mdash; ${ctVal}% at ${activeStn.toUpperCase()}</div>
+                ${imgTag(mapSrc, "Calibrated thunder map", "max-height: calc(100vh - 300px);")}
+                <div class="href-slider-cell-label">HREF Calibrated Thunder (${winLabel}) &mdash; ${ctVal}% at ${activeStn.toUpperCase()}${note}</div>
             </div>`;
         }
 
@@ -671,7 +715,7 @@
                     <div class="explanation-box">
                         <strong>Launch Commit Criteria (LCC) Guides &amp; Methodology:</strong><br><br>
                         • <strong>HREF Lightning Density:</strong> A convection-allowing ensemble combining several high-resolution models, each giving a plausible storm evolution. Every member estimates lightning flashes from storm properties (updraft strength, mixed-phase microphysics, storm depth), calibrated by machine learning against observed lightning strikes, then accumulated over ~20 × 20 km grid boxes. The displayed value is the percentage of members exceeding each flash-count threshold over a <strong>4-hour window ending at the labeled forecast hour</strong>.<br><br>
-                        • <strong>Isotherm Profiles (0/-5/-10/-20°C Height):</strong> The profile is scanned for each target isotherm; the height (kft) is linearly interpolated between the two sounding levels that bracket that temperature. These delineate the charging zones where triboelectric (ice/graupel collision) charging and natural/triggered lightning are most favorable.<br><br>
+                        • <strong>Isotherm Profiles (+5/0/-5/-10/-15/-20°C Height):</strong> The profile is scanned for each target isotherm; the height (kft) is linearly interpolated between the two sounding levels that bracket that temperature. These delineate the charging zones where triboelectric (ice/graupel collision) charging and natural/triggered lightning are most favorable.<br><br>
                         • <strong>Highest Cloud Top:</strong> Height (kft) of the top of the highest layer meeting the dewpoint-depression criterion (T − Td ≤ 2°C), compared against the isotherm heights above to judge whether the flight path would pass through a glaciated (charge-bearing) cloud region.<br><br>
                         • <strong>Max Layer Thickness:</strong> Contiguous levels with dewpoint depression T − Td ≤ 2°C are grouped into discrete decks; this reports the depth (kft) of the single thickest continuous deck. (A more permissive criterion than the ceiling's, to better capture the full vertical extent of the moist layer.)<br><br>
                         • <strong>Thick Cloud Layer (LLCC #6):</strong> Flags <em>VIOLATED</em> when the thickest cloud deck is ≥ 4,500 ft thick <em>and</em> any part of it lies in the 0°C to −20°C charging band.<br><br>
