@@ -105,7 +105,6 @@
             <a onclick="updateMetric('cloud_top')" id="nav-cloud_top">Highest Cloud Top</a>
             <a onclick="updateMetric('cloud_thick')" id="nav-cloud_thick">Max Layer Thickness</a>
             <a onclick="updateMetric('thick_layer')" id="nav-thick_layer">Thick Cloud Layer</a>
-            <a onclick="updateMetric('href_density')" id="nav-href_density">HREF Density Map</a>
             <a onclick="updateMetric('ct_thunder')" id="nav-ct_thunder">Cal. Thunder Map</a>
         </div>
         <div class="station-selector">
@@ -182,7 +181,7 @@
         const popupCard = document.getElementById("hover-popup-card");
 
         const aviationMetrics = ['mom_mean', 'mom_max', 'ceiling', 'vis', 'shear'];
-        const launchMetrics = ['hght_p5c', 'hght_0c', 'hght_5c', 'hght_10c', 'hght_15c', 'hght_20c', 'cloud_top', 'cloud_thick', 'thick_layer', 'href_density', 'ct_thunder'];
+        const launchMetrics = ['hght_p5c', 'hght_0c', 'hght_5c', 'hght_10c', 'hght_15c', 'hght_20c', 'cloud_top', 'cloud_thick', 'thick_layer', 'ct_thunder'];
 
         // Launch pads + the two GRIB airfields (KTTS, KCOF) have no dedicated HREF lightning
         // point data; they use KXMR's HREF density / calibrated-thunder as a nearby proxy.
@@ -205,13 +204,10 @@
                 ct1Maps = (payload.href_maps_latest && payload.href_maps_latest.ct1_maps) || null;
                 ct4Maps = (payload.href_maps_latest && payload.href_maps_latest.ct4_maps) || null;
 
-                // Diagnostic: count how many hours actually carry a real map path, so a blank
-                // slider can be told apart from "payload has no maps" vs "images 404".
-                const countReal = (o, nested) => !o ? 0 : Object.values(o).filter(v =>
-                    nested ? (v && typeof v === 'object' && Object.values(v).some(Boolean)) : !!v).length;
-                console.log('[maps loaded] density(hrs w/ ≥1 threshold):', countReal(hrefMapsLatest, true),
-                            '| ct1:', countReal(ct1Maps, false),
-                            '| ct4:', countReal(ct4Maps, false),
+                // Diagnostic: how many hours carry a real calibrated-thunder map per window.
+                const countReal = (o) => !o ? 0 : Object.values(o).filter(Boolean).length;
+                console.log('[CT maps loaded] ct1:', countReal(ct1Maps),
+                            '| ct4:', countReal(ct4Maps),
                             '| blankBasemap:', hrefBlankMap || '(none)');
                 buildTimelineNav();
                 loadRunIndex(0); // index 0 is always the most recent run
@@ -236,6 +232,7 @@
 
         function loadRunIndex(idx) {
             activeRunIdx = idx;
+            pickDefaultCtWindow(); // prefer 4-hr, fall back to 1-hr if 4-hr isn't posted
             buildTimelineNav();
             renderMatrix();
         }
@@ -404,30 +401,18 @@
 
             const sliderPanel = document.getElementById("href-slider-panel");
             const mainLayout = document.querySelector(".main-layout");
-            if (activeMetric === 'href_density' || activeMetric === 'ct_thunder') {
+            if (activeMetric === 'ct_thunder') {
                 sliderPanel.style.display = "block";
                 mainLayout.style.display = "none";
-                const isCt = (activeMetric === 'ct_thunder');
-                // CT slider now follows the SAME 1-hr/4-hr toggle as the table (ctWindow),
-                // instead of being hard-pinned to 1-hr. The 1-hr HREFCT field is posted less
-                // reliably on NOMADS than 4-hr, so pinning to 1-hr left the slider blank on the
-                // (default) 4-hr view even though the 4-hr PNGs existed on disk.
-                const mapsRoot = isCt ? activeCtMaps() : (hrefMapsLatest || {});
-                let keySet = new Set(Object.keys(mapsRoot));
-                if (isCt) {
-                    // Union keys from both windows' maps + point data so every forecast hour
-                    // that has ANY calibrated-thunder info gets a slider stop.
-                    Object.keys(ct1Maps || {}).forEach(k => keySet.add(k));
-                    Object.keys(ct4Maps || {}).forEach(k => keySet.add(k));
-                    const ctRun = historyRuns[activeRunIdx] || {};
-                    const ptsKey = (ctWindow === '1hr') ? 'ct1_points' : 'ct4_points';
-                    const ctStn = (ctRun[ptsKey] && ctRun[ptsKey][hrefStationFor(activeStn)]) || {};
-                    Object.keys(ctStn).forEach(k => keySet.add(k));
-                } else {
-                    const ltgRoot = (historyRuns[activeRunIdx] && historyRuns[activeRunIdx].href_lightning) || {};
-                    const ltgAnyStn = ltgRoot[hrefStationFor(activeStn)] || {};
-                    Object.keys(ltgAnyStn).forEach(k => keySet.add(k));
-                }
+                // Slider follows the 1-hr/4-hr toggle (ctWindow) and unions keys from both
+                // windows so every forecast hour with any calibrated-thunder info gets a stop.
+                let keySet = new Set(Object.keys(activeCtMaps()));
+                Object.keys(ct1Maps || {}).forEach(k => keySet.add(k));
+                Object.keys(ct4Maps || {}).forEach(k => keySet.add(k));
+                const ctRun = historyRuns[activeRunIdx] || {};
+                const ptsKey = (ctWindow === '1hr') ? 'ct1_points' : 'ct4_points';
+                const ctStn = (ctRun[ptsKey] && ctRun[ptsKey][hrefStationFor(activeStn)]) || {};
+                Object.keys(ctStn).forEach(k => keySet.add(k));
                 hrefSliderTimes = Array.from(keySet).sort((a, b) => {
                     const [dayA, hourA] = a.split('/').map(Number);
                     const [dayB, hourB] = b.split('/').map(Number);
@@ -436,24 +421,18 @@
                     return fda !== fdb ? fda - fdb : hourA - hourB;
                 });
                 if (hrefSliderIdx >= hrefSliderTimes.length) hrefSliderIdx = 0;
-                // Open on the first forecast hour that actually has a rendered map, so the
-                // panel never launches on a blank basemap (the first 1-2 density hours often
-                // fail to generate on NOMADS). Falls back to idx 0 if none have maps yet.
+                // Open on the first forecast hour that actually has a rendered map (either
+                // window), so the panel never launches on a blank basemap.
                 const hasMapAt = (tk) => {
-                    if (isCt) {
-                        const alt = ((ctWindow === '1hr') ? ct4Maps : ct1Maps) || {};
-                        return !!(activeCtMaps()[tk] || alt[tk]);
-                    }
-                    const m = (hrefMapsLatest || {})[tk];
-                    return !!(m && Object.values(m).some(Boolean));
+                    const alt = ((ctWindow === '1hr') ? ct4Maps : ct1Maps) || {};
+                    return !!(activeCtMaps()[tk] || alt[tk]);
                 };
                 const firstReal = hrefSliderTimes.findIndex(hasMapAt);
                 if (firstReal >= 0 && (hrefSliderIdx === 0)) hrefSliderIdx = firstReal;
                 const sliderInput = document.getElementById("href-slider-input");
                 sliderInput.max = Math.max(0, hrefSliderTimes.length - 1);
                 sliderInput.value = hrefSliderIdx;
-                if (isCt) renderCtSliderFrame(hrefSliderIdx);
-                else renderHrefSliderFrame(hrefSliderIdx);
+                renderCtSliderFrame(hrefSliderIdx);
                 return; // skip table rendering entirely
             } else {
                 sliderPanel.style.display = "none";
@@ -468,29 +447,10 @@
                 let ltgRoot = cycle.href_lightning || {};
                 let ltgStation = ltgRoot[hrefStationFor(activeStn)] || {};
                 let ltgData = ltgStation[timeKey] || null;
-                let mapsRoot = hrefMapsLatest || {};
-                let mapsData = mapsRoot[timeKey] || null;
 
                 models.forEach(m => {
                     let mData = stationData[m] || stationData[m.toUpperCase()];
                     const profile = mData ? mData[timeKey] : null;
-
-                    if (activeMetric === 'href_density') {
-                        let val = ltgData ? ltgData.p25 : 0;
-                        let props = getCellProperties('href_density', val, null);
-                        let cellId = `c_${lowerStn}_${m}_${timeKey.replace('/','_')}`;
-                        tr.innerHTML += `<td id="${cellId}" class="${props.cls}" style="cursor:help;">${props.txt}</td>`;
-
-                        setTimeout(() => {
-                            const cellEl = document.getElementById(cellId);
-                            if (cellEl) {
-                                cellEl.onmouseenter = (e) => showLtgMapPopup(e, ltgData, mapsData, timeKey);
-                                cellEl.onmousemove = movePopup;
-                                cellEl.onmouseleave = hidePopup;
-                            }
-                        }, 0);
-                        return;
-                    }
 
                     if (!profile) {
                         tr.innerHTML += `<td>-</td>`;
@@ -516,14 +476,21 @@
                 if (isLaunchMode) {
                     // Persistent lightning column shows HREF Calibrated Thunder — the
                     // ML-calibrated probability of >=1 CG flash within 20 km. The window
-                    // (1-hr / 4-hr) is toggled via the clickable column header.
+                    // (1-hr / 4-hr) is toggled via the clickable column header, and falls back
+                    // per-hour to whichever window actually has a map/value this cycle.
                     const ctRun = historyRuns[activeRunIdx] || {};
-                    const ctPointsKey = (ctWindow === '1hr') ? 'ct1_points' : 'ct4_points';
+                    const selMaps = (ctWindow === '1hr' ? ct1Maps : ct4Maps) || {};
+                    const otherWin = (ctWindow === '1hr') ? '4hr' : '1hr';
+                    const otherMaps = (ctWindow === '1hr' ? ct4Maps : ct1Maps) || {};
+                    let shownWin = ctWindow;
+                    let ctMap = selMaps[timeKey] || null;
+                    if (!ctMap && otherMaps[timeKey]) { ctMap = otherMaps[timeKey]; shownWin = otherWin; }
+
+                    const ctPointsKey = (shownWin === '1hr') ? 'ct1_points' : 'ct4_points';
                     const ctStn = (ctRun[ctPointsKey] && ctRun[ctPointsKey][hrefStationFor(activeStn)]) || {};
                     let ctVal = ctStn[timeKey];
                     if (ctVal === undefined || ctVal === null) ctVal = 0;
-                    // Backend already returns an integer percent (0-100). Do NOT re-scale:
-                    // multiplying a genuine 1% by 100 was what showed a real ~0% as 100%.
+                    // Backend already returns an integer percent (0-100). Do NOT re-scale.
                     ctVal = Math.max(0, Math.min(100, Math.round(ctVal)));
 
                     let ctCls = "ltg-none";
@@ -535,8 +502,7 @@
                     }
 
                     let hrefCellId = `c_${lowerStn}_href_${timeKey.replace('/','_')}`;
-                    const ctMap = ((ctWindow === '1hr' ? ct1Maps : ct4Maps) || {})[timeKey] || null;
-                    const winLabel = (ctWindow === '1hr') ? "1-hr" : "4-hr";
+                    const winLabel = (shownWin === '1hr') ? "1-hr" : "4-hr";
                     tr.innerHTML += `<td id="${hrefCellId}" class="href-interactive-col ${ctCls}" style="cursor:help; border-left: 2px solid #cbd5e1 !important;">${ctVal}%</td>`;
 
                     setTimeout(() => {
@@ -556,6 +522,35 @@
         // Which CT map set the slider should show, following the table's 1-hr/4-hr toggle.
         function activeCtMaps() {
             return ((ctWindow === '1hr') ? ct1Maps : ct4Maps) || {};
+        }
+
+        // Does the active run actually carry calibrated-thunder point data for a window?
+        // (NOMADS frequently posts only the 1-hr HREFCT field, leaving 4-hr absent — in which
+        // case ct4_points is an empty {} per station and would render as a column of 0%.)
+        function ctWindowHasData(win) {
+            const key = (win === '1hr') ? 'ct1_points' : 'ct4_points';
+            const run = historyRuns[activeRunIdx] || historyRuns[0] || {};
+            const pts = run[key] || {};
+            return Object.values(pts).some(stnObj => stnObj && Object.keys(stnObj).length > 0);
+        }
+
+        // Pick a sensible default window for the current run: prefer 4-hr, fall back to 1-hr.
+        function pickDefaultCtWindow() {
+            if (ctWindowHasData('4hr')) ctWindow = '4hr';
+            else if (ctWindowHasData('1hr')) ctWindow = '1hr';
+        }
+
+        // Header click handler — toggles the calibrated-thunder accumulation window, but only
+        // to a window that actually has data this cycle (otherwise it would show all 0%).
+        function toggleCtWindow() {
+            const other = (ctWindow === '1hr') ? '4hr' : '1hr';
+            if (!ctWindowHasData(other)) {
+                alert(`Calibrated Thunder ${other.toUpperCase()} isn't posted on NOMADS for this cycle — only ${ctWindow.toUpperCase()} is available.`);
+                return;
+            }
+            ctWindow = other;
+            hrefSliderIdx = 0; // let the slider re-seek its first real map for the new window
+            renderMatrix();
         }
 
         // <img> with a graceful fallback: if the PNG path 404s (e.g. a map that failed to
@@ -609,23 +604,26 @@
             idx = Math.max(0, Math.min(idx, hrefSliderTimes.length - 1));
             hrefSliderIdx = idx;
             const timeKey = hrefSliderTimes[idx];
-
-            const winLabel = (ctWindow === '1hr') ? "1-hr" : "4-hr";
             const cycle = historyRuns[activeRunIdx] || {};
-            const ptsKey = (ctWindow === '1hr') ? 'ct1_points' : 'ct4_points';
-            const ctStn = (cycle[ptsKey] && cycle[ptsKey][hrefStationFor(activeStn)]) || {};
-            let ctVal = ctStn[timeKey];
+
+            // Pick the map first, then read the % from the SAME window so the readout can
+            // never disagree with the plot. Prefer the selected window; if it has no map for
+            // this hour (e.g. the 4-hr field isn't posted this cycle), fall back to the other.
+            const otherWin = (ctWindow === '1hr') ? '4hr' : '1hr';
+            const otherMaps = ((ctWindow === '1hr') ? ct4Maps : ct1Maps) || {};
+            let shownWin = ctWindow;
+            let mapSrc = activeCtMaps()[timeKey];
+            if (!mapSrc && otherMaps[timeKey]) { mapSrc = otherMaps[timeKey]; shownWin = otherWin; }
+            const usedFallback = (shownWin !== ctWindow);
+
+            const shownPtsKey = (shownWin === '1hr') ? 'ct1_points' : 'ct4_points';
+            const shownStn = (cycle[shownPtsKey] && cycle[shownPtsKey][hrefStationFor(activeStn)]) || {};
+            let ctVal = shownStn[timeKey];
             if (ctVal === undefined || ctVal === null) ctVal = 0;
-            // Already an integer percent from the backend — display as-is (no x100).
             ctVal = Math.max(0, Math.min(100, Math.round(ctVal)));
 
-            // Prefer the selected window's map; if that window has no map for this hour
-            // (the 1-hr field is often absent on NOMADS), fall back to the other window's map
-            // so the panel still shows a spatial picture rather than a blank basemap.
-            const primary = activeCtMaps()[timeKey];
-            const other = (((ctWindow === '1hr') ? ct4Maps : ct1Maps) || {})[timeKey];
-            const mapSrc = primary || other || hrefBlankMap;
-            const usedFallback = !primary && !!other;
+            const winLabel = (shownWin === '1hr') ? "1-hr" : "4-hr";
+            if (!mapSrc) mapSrc = hrefBlankMap;
 
             document.getElementById("href-slider-time").innerText = `${timeKey}Z`;
             document.getElementById("href-slider-input").value = idx;
@@ -634,17 +632,16 @@
             const grid = document.getElementById("href-slider-grid");
             grid.style.gridTemplateColumns = "1fr";
             grid.style.gridTemplateRows = "1fr";
-            const note = usedFallback ? ` <span style="font-weight:normal;color:#94a3b8;">(showing ${ctWindow === '1hr' ? '4-hr' : '1-hr'} map)</span>` : "";
+            const note = usedFallback ? ` <span style="font-weight:normal;color:#94a3b8;">(${ctWindow} unavailable — showing ${winLabel})</span>` : "";
             grid.innerHTML = `<div class="href-slider-cell">
                 ${imgTag(mapSrc, "Calibrated thunder map", "max-height: calc(100vh - 300px);")}
                 <div class="href-slider-cell-label">HREF Calibrated Thunder (${winLabel}) &mdash; ${ctVal}% at ${activeStn.toUpperCase()}${note}</div>
             </div>`;
         }
 
-        // Dispatch slider rendering to the active product's renderer.
+        // Slider only serves calibrated thunder now (density plots were retired).
         function renderActiveSliderFrame(idx) {
-            if (activeMetric === 'ct_thunder') renderCtSliderFrame(idx);
-            else renderHrefSliderFrame(idx);
+            renderCtSliderFrame(idx);
         }
 
         function updateHrefSliderFrame(idx) {
@@ -720,7 +717,7 @@
                 panel.innerHTML = `
                     <div class="legend-title">Matrix Threshold Criteria</div>
                     
-                    <div class="legend-section-title">HREF Probability (Exceedance)</div>
+                    <div class="legend-section-title">HREF Calibrated Thunder (Prob.)</div>
                     <div class="legend-item ltg-vlow"><span>Very Low Prob</span><span>&gt; 0% prob.</span></div>
                     <div class="legend-item ltg-low"><span>Low Probability</span><span>≥ 5% prob.</span></div>
                     <div class="legend-item ltg-med"><span>Medium Probability</span><span>≥ 15% prob.</span></div>
@@ -736,15 +733,13 @@
 
                     <div class="explanation-box">
                         <strong>Launch Commit Criteria (LCC) Guides &amp; Methodology:</strong><br><br>
-                        • <strong>HREF Lightning Density:</strong> A convection-allowing ensemble combining several high-resolution models, each giving a plausible storm evolution. Every member estimates lightning flashes from storm properties (updraft strength, mixed-phase microphysics, storm depth), calibrated by machine learning against observed lightning strikes, then accumulated over ~20 × 20 km grid boxes. The displayed value is the percentage of members exceeding each flash-count threshold over a <strong>4-hour window ending at the labeled forecast hour</strong>.<br><br>
                         • <strong>Isotherm Profiles (+5/0/-5/-10/-15/-20°C Height):</strong> The profile is scanned for each target isotherm; the height (kft) is linearly interpolated between the two sounding levels that bracket that temperature. These delineate the charging zones where triboelectric (ice/graupel collision) charging and natural/triggered lightning are most favorable.<br><br>
                         • <strong>Highest Cloud Top:</strong> Height (kft) of the top of the highest layer meeting the dewpoint-depression criterion (T − Td ≤ 2°C), compared against the isotherm heights above to judge whether the flight path would pass through a glaciated (charge-bearing) cloud region.<br><br>
                         • <strong>Max Layer Thickness:</strong> Contiguous levels with dewpoint depression T − Td ≤ 2°C are grouped into discrete decks; this reports the depth (kft) of the single thickest continuous deck. (A more permissive criterion than the ceiling's, to better capture the full vertical extent of the moist layer.)<br><br>
                         • <strong>Thick Cloud Layer (LLCC #6):</strong> Flags <em>VIOLATED</em> when the thickest cloud deck is ≥ 4,500 ft thick <em>and</em> any part of it lies in the 0°C to −20°C charging band.<br><br>
                         <span style="color:#64748b; font-size:0.92em;"><em>Note: the REFS ensemble-mean product carries only a single isobaric humidity level, so the moisture-based fields (ceiling, cloud top, layer thickness) cannot be reliably resolved on the REFS column and may read CLR/0. Its isotherm heights, PBL winds, and shear remain valid.</em></span><br><br>
                         • <strong>CT 4hr (table column):</strong> HREF Calibrated Thunder — the machine-learning-calibrated probability of at least one cloud-to-ground lightning flash within 20 km (12 mi) of the point over a 4-hour window, calibrated against observed NLDN strikes. This is the default lightning column; hover it for the spatial map.<br><br>
-                        • <strong>Cal. Thunder Map:</strong> Full Space-Coast-domain spatial view of the calibrated-thunder probability field with a time slider (1–48 h). A single ML-calibrated probability field, distinct from the multi-threshold flash-density product.<br><br>
-                        • <strong>HREF Density Map:</strong> Hover any cell (or the CT column) to view live Space-Coast-domain spatial plots of the HREF ensemble flash-density field for all four exceedance thresholds (≥25/50/100/200 flashes). All four panels share an identical 0–100% color scale for direct comparison.
+                        • <strong>Cal. Thunder Map:</strong> Full Space-Coast-domain spatial view of the calibrated-thunder probability field with a time slider (1–48 h). Hover the CT table column for the same map at a given hour. The window (1-hr / 4-hr) follows the toggle in the CT column header; if NOMADS posts only one window this cycle, the other is skipped automatically.
                     </div>
                 `;
             }
@@ -829,8 +824,9 @@
 
         function showCtMapPopup(e, ctVal, mapSrc, timeKey, windowLabel) {
             const src = mapSrc || hrefBlankMap;
+            const fb = hrefBlankMap || "";
             const mapHtml = src
-                ? `<div class="ltg-map-grid" style="grid-template-columns: 1fr;"><div class="ltg-map-cell"><img src="${src}" alt="Calibrated thunder map" /></div></div>`
+                ? `<div class="ltg-map-grid" style="grid-template-columns: 1fr;"><div class="ltg-map-cell"><img src="${src}" alt="Calibrated thunder map" onerror="if(this.dataset.fb!=='1'){this.dataset.fb='1';this.src='${fb}';}" /></div></div>`
                 : `<div class="ltg-map-empty-full">No spatial data for ${timeKey || 'this'}Z.</div>`;
             popupCard.classList.remove("popup-wide");
             popupCard.innerHTML = `
