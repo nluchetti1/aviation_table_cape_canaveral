@@ -953,7 +953,6 @@ def fetch_href_lightning(time_keys):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
         futures_map = {}
-        map_futures_map = {}
         for row_key, f_hour_int in all_href_time_keys.items():
             for stn, coords in STN_COORDS.items():
                 future = executor.submit(
@@ -963,12 +962,6 @@ def fetch_href_lightning(time_keys):
                 )
                 futures_map[future] = (stn, row_key)
 
-            # One spatial-map render per forecast hour (domain-wide, not per station)
-            map_future = executor.submit(
-                fetch_href_spatial_map, session, active_date_str, active_cycle, f_hour_int
-            )
-            map_futures_map[map_future] = row_key
-
         for future in concurrent.futures.as_completed(futures_map):
             stn, row_key = futures_map[future]
             try:
@@ -977,13 +970,10 @@ def fetch_href_lightning(time_keys):
             except Exception:
                 pass
 
-        href_maps = {}
-        for future in concurrent.futures.as_completed(map_futures_map):
-            row_key = map_futures_map[future]
-            try:
-                href_maps[row_key] = future.result()
-            except Exception:
-                href_maps[row_key] = {}
+    # NOTE: the HREF flash-density spatial PLOTS were retired (the calibrated-thunder maps
+    # replaced them). We keep the density POINT audit below for situational awareness, but no
+    # longer render or ship the multi-threshold density map PNGs.
+    href_maps = {}
 
     # Streamlined runner-safe Audit Log
     logging.info("=============================================")
@@ -1005,7 +995,6 @@ def fetch_href_lightning(time_keys):
             logging.info(f"  {stn.upper()} -> All 48 forecast intervals returned flat 0%")
             
     logging.info(f"Audit Complete: Cleanly tracked {total_signals} total non-zero cell vectors.")
-    logging.info(f"Spatial threshold maps rendered for {sum(1 for v in href_maps.values() if v)} of {len(href_maps)} forecast hours.")
     logging.info("=============================================")
 
     return href_data, href_maps
