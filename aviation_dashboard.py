@@ -108,22 +108,42 @@ def purge_workspace(cache_dir=CACHE_DIR):
     return cache_dir
 
 
-def prune_stale_maps(current_href_maps, blank_basemap_path=None, maps_dir=MAPS_DIR):
-    """Deletes spatial-map PNGs on disk that aren't part of the current run's href_maps
-    (the maps/ folder only ever needs to hold the latest run's images, plus the
-    always-present blank basemap fallback)."""
+def _collect_map_paths(*containers):
+    """Recursively pull every non-empty relative map path out of any mix of nested dicts
+    ({row: {thresh: path}}), flat dicts ({row: path}), lists, or bare strings. Used to
+    build the 'keep' set for pruning WITHOUT the lossy `{**a, **b}` merge that previously
+    let the CT maps clobber the density maps (and ct4 clobber ct1) on shared row keys."""
+    paths = set()
+
+    def walk(x):
+        if x is None:
+            return
+        if isinstance(x, str):
+            if x:
+                paths.add(x)
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, (list, tuple, set)):
+            for v in x:
+                walk(v)
+
+    for c in containers:
+        walk(c)
+    return paths
+
+
+def prune_stale_maps(referenced_paths, maps_dir=MAPS_DIR):
+    """Deletes spatial-map PNGs on disk that aren't in `referenced_paths` (the maps/ folder
+    only ever needs to hold the latest run's images plus the blank basemap fallback).
+    `referenced_paths` is any iterable of relative paths like 'maps/xyz.png'."""
     if not os.path.exists(maps_dir):
         return
 
-    referenced = set()
-    if blank_basemap_path:
-        referenced.add(os.path.basename(blank_basemap_path))
-    for row_maps in (current_href_maps or {}).values():
-        for rel_path in (row_maps or {}).values():
-            referenced.add(os.path.basename(rel_path))
+    keep = {os.path.basename(p) for p in referenced_paths if p}
 
     for f in os.listdir(maps_dir):
-        if f not in referenced:
+        if f not in keep:
             try:
                 os.unlink(os.path.join(maps_dir, f))
             except Exception:
@@ -663,6 +683,58 @@ def generate_ct_map(filepath, out_filename):
         return None
 
 
+def _sanitize_grid(grid):
+    """masked / NaN / huge-fill (>1e19) / negative values -> 0.0. Returns a float ndarray."""
+    try:
+        arr = np.ma.filled(np.ma.masked_invalid(np.ma.asarray(grid, dtype=float)), 0.0)
+    except (TypeError, ValueError):
+        arr = np.zeros_like(np.asarray(grid, dtype=float))
+    return np.where((arr > 1e19) | (arr < 0), 0.0, arr)
+
+
+def _render_ct_domain_map(sub_lons, sub_lats, sub_vals_pct, out_filename, window_label):
+    """Render an FL-domain calibrated-thunder map from an ALREADY percent-scaled (0-100)
+    subgrid. Kept separate from extraction so the exact same run-level scale drives both the
+    table numbers and the map colors. Returns 'maps/<out_filename>' or None."""
+    try:
+        proj = ccrs.PlateCarree()
+        states = cfeature.NaturalEarthFeature(category="cultural",
+                    name="admin_1_states_provinces_lines", scale="50m", facecolor="none")
+        counties = cfeature.NaturalEarthFeature(category="cultural",
+                    name="admin_2_counties", scale="10m", facecolor="none")
+
+        fig = plt.figure(figsize=(5.5, 5.8), dpi=120)
+        ax = fig.add_subplot(1, 1, 1, projection=proj)
+        ax.set_extent([FL_DOMAIN["lon_min"], FL_DOMAIN["lon_max"],
+                       FL_DOMAIN["lat_min"], FL_DOMAIN["lat_max"]], crs=proj)
+        ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="#dbeafe", zorder=0)
+        ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#f1f5f9", zorder=0)
+        ax.add_feature(counties, edgecolor="#cbd5e1", linewidth=0.35, zorder=1)
+        ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="#1e293b", linewidth=0.9, zorder=3)
+        ax.add_feature(states, edgecolor="#475569", linewidth=0.8, zorder=3)
+        ax.add_feature(cfeature.BORDERS.with_scale("50m"), edgecolor="#1e293b", linewidth=0.8, zorder=3)
+
+        masked = np.ma.masked_less_equal(sub_vals_pct, 0.0)
+        mesh = ax.pcolormesh(sub_lons, sub_lats, masked, cmap="YlGnBu", vmin=0, vmax=100,
+                             shading="auto", transform=proj, zorder=2, alpha=0.85)
+        for sid, c in STN_COORDS.items():
+            ax.plot(c["lon"], c["lat"], marker="^", markersize=6, color="#b91c1c",
+                    markeredgecolor="white", markeredgewidth=0.8, transform=proj, zorder=5)
+            ax.text(c["lon"] + 0.06, c["lat"] + 0.05, sid.upper(), fontsize=6,
+                    fontweight="bold", color="#7f1d1d", transform=proj, zorder=6,
+                    bbox=dict(boxstyle="round,pad=0.15", facecolor="white", alpha=0.6, edgecolor="none"))
+        ax.gridlines(draw_labels=False, linewidth=0.4, color="#94a3b8", alpha=0.5, linestyle="--")
+        ax.set_title(f"HREF Calibrated Thunder ({window_label})", fontsize=9, fontweight="bold", color="#1e293b")
+        cbar = fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.03)
+        cbar.set_label("Probability of Lightning (%)", fontsize=7)
+        cbar.ax.tick_params(labelsize=6)
+
+        return _fig_to_png_file(fig, out_filename)
+    except Exception as e:
+        logging.error(f"CT domain map render failed: {e}")
+        return None
+
+
 def fetch_calibrated_thunder(window="4hr"):
     """Fetch HREF Calibrated Thunder (HREFCT) for the given accumulation window ('1hr' or
     '4hr') across the 1-48h forecast range. Returns (ct_points, ct_maps):
@@ -698,28 +770,52 @@ def fetch_calibrated_thunder(window="4hr"):
     logging.info(f"HREFCT {window}: targeting {active_date_str} {active_cycle}z")
     cycle_init = datetime.datetime.strptime(f"{active_date_str}{active_cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
 
-    # Resolve each station's grid index once (cache keyed by a synthetic id per station).
-    def _ct_worker(f_hour_int, row_key):
+    window_label = "1-hr" if window == "1hr" else "4-hr"
+
+    # ---- PHASE A: download every hour, pull RAW (unscaled) FL-domain subgrid + point values.
+    # The fraction-vs-percent decision is deliberately NOT made per file. A quiet hour whose
+    # entire domain is < 1.0 (a genuine 0.8% field) is indistinguishable from a 0-1 fraction
+    # when looked at in isolation — that per-file guess is exactly what turned a real ~1% into
+    # a bogus 100%. We instead gather the raw maximum across ALL forecast hours and the whole
+    # CONUS grid, then decide the scale ONCE below.
+    def _dl_worker(f_hour_int, row_key):
         base = (f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/"
                 f"spc_post.{active_date_str}/thunder")
         fname = f"spc_post.t{active_cycle}z.hrefct_{window}.f{f_hour_int:03d}.grib2"
         url = f"{base}/{fname}"
         local_path = os.path.join(CACHE_DIR, f"ct_{window}_{fname}")
-        pts = {stn: 0 for stn in STATIONS}
-        map_rel = None
         try:
             with session.get(url, timeout=10, stream=True) as r:
                 if r.status_code != 200:
-                    return row_key, pts, None
+                    return row_key, None
                 with open(local_path, "wb") as fh:
                     for chunk in r.iter_content(chunk_size=8192):
                         fh.write(chunk)
-            # Grid indices per station (reuse the density cache; same HREF grid).
+
             grbs = pygrib.open(local_path)
-            sample = grbs[1]
-            lats, lons = sample.latlons()
+            grb = grbs[1]  # single-field product: message 1 is the calibrated probability
+            lats, lons = grb.latlons()
             lons_n = np.where(lons > 180, lons - 360.0, lons)
+            arr = _sanitize_grid(grb.values)
             grbs.close()
+
+            raw_max = float(arr.max()) if arr.size else 0.0
+
+            # FL-domain subset (indices depend only on the static grid geometry).
+            domain_mask = (
+                (lats >= FL_DOMAIN["lat_min"]) & (lats <= FL_DOMAIN["lat_max"]) &
+                (lons_n >= FL_DOMAIN["lon_min"]) & (lons_n <= FL_DOMAIN["lon_max"])
+            )
+            ys, xs = np.where(domain_mask)
+            sub_lats = sub_lons = sub_vals = None
+            if len(ys) > 0:
+                y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+                sub_lats = lats[y0:y1 + 1, x0:x1 + 1]
+                sub_lons = lons_n[y0:y1 + 1, x0:x1 + 1]
+                sub_vals = arr[y0:y1 + 1, x0:x1 + 1]
+
+            # Per-station RAW point value; neighborhood median rejects lone fill artifacts.
+            pts = {}
             for stn, c in STN_COORDS.items():
                 cache_key = f"ct_{stn}"
                 if cache_key in _GRID_INDEX_CACHE:
@@ -728,34 +824,72 @@ def fetch_calibrated_thunder(window="4hr"):
                     dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
                     yi, xi = np.unravel_index(dist.argmin(), dist.shape)
                     _GRID_INDEX_CACHE[cache_key] = (yi, xi)
-                pts[stn] = extract_ct_point(local_path, yi, xi)
-            # Spatial map (only for the window we use for the slider; caller decides).
-            map_rel = generate_ct_map(local_path, f"ct_{window}_{active_date_str}_{active_cycle}z_f{f_hour_int:03d}.png")
+                yy0 = max(0, yi - 1); yy1 = min(arr.shape[0], yi + 2)
+                xx0 = max(0, xi - 1); xx1 = min(arr.shape[1], xi + 2)
+                neigh = arr[yy0:yy1, xx0:xx1]
+                pts[stn] = float(np.median(neigh)) if neigh.size else float(arr[yi, xi])
+
+            return row_key, {"f": f_hour_int, "raw_max": raw_max, "points": pts,
+                             "sub_lats": sub_lats, "sub_lons": sub_lons, "sub_vals": sub_vals}
         except Exception as e:
             logging.debug(f"HREFCT {window} f{f_hour_int:03d} break: {e}")
+            return row_key, None
         finally:
             if os.path.exists(local_path):
                 try: os.remove(local_path)
                 except Exception: pass
-        return row_key, pts, map_rel
 
+    records = {}
+    global_raw_max = 0.0
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = []
         for f_hour_int in range(1, 49):
             valid_dt = cycle_init + datetime.timedelta(hours=f_hour_int)
             row_key = f"{valid_dt.day:02d}/{valid_dt.hour:02d}"
-            futures.append(executor.submit(_ct_worker, f_hour_int, row_key))
+            futures.append(executor.submit(_dl_worker, f_hour_int, row_key))
         for fut in concurrent.futures.as_completed(futures):
             try:
-                row_key, pts, map_rel = fut.result()
-                for stn in STATIONS:
-                    ct_points[stn][row_key] = pts.get(stn, 0)
-                ct_maps[row_key] = map_rel
+                row_key, rec = fut.result()
             except Exception:
-                pass
+                continue
+            if rec is None:
+                continue
+            records[row_key] = rec
+            if rec["raw_max"] > global_raw_max:
+                global_raw_max = rec["raw_max"]
+
+    # ---- Decide the scale ONCE for the whole run.
+    # If the raw max never exceeds 1.0 across the entire CONUS grid AND all 48 forecast hours,
+    # the product is a 0-1 fraction -> x100. Otherwise it is already stored as percent (0-100)
+    # and must NOT be rescaled. A true percent field essentially always tops 1% somewhere over
+    # 48h, so this cleanly separates the two encodings and kills the per-file 100% misfire.
+    run_scale = 100.0 if global_raw_max <= 1.0 else 1.0
+    logging.info(f"HREFCT {window}: global raw max={global_raw_max:.4g} -> applying x{run_scale:g}")
+
+    # ---- PHASE B: apply the single scale, populate points, and render maps.
+    render_futs = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as rex:
+        for row_key, rec in records.items():
+            for stn in STATIONS:
+                raw = rec["points"].get(stn, 0.0)
+                ct_points[stn][row_key] = int(round(max(0.0, min(100.0, raw * run_scale))))
+            if rec["sub_vals"] is not None:
+                sub_pct = np.clip(rec["sub_vals"] * run_scale, 0.0, 100.0)
+                out_name = f"ct_{window}_{active_date_str}_{active_cycle}z_f{rec['f']:03d}.png"
+                fut = rex.submit(_render_ct_domain_map, rec["sub_lons"], rec["sub_lats"],
+                                 sub_pct, out_name, window_label)
+                render_futs[fut] = row_key
+            else:
+                ct_maps[row_key] = None
+        for fut in concurrent.futures.as_completed(render_futs):
+            rk = render_futs[fut]
+            try:
+                ct_maps[rk] = fut.result()
+            except Exception:
+                ct_maps[rk] = None
 
     n_maps = sum(1 for v in ct_maps.values() if v)
-    logging.info(f"HREFCT {window}: points for {len(ct_maps)} hours, {n_maps} maps rendered.")
+    logging.info(f"HREFCT {window}: points for {len(records)} hours, {n_maps} maps rendered.")
     return ct_points, ct_maps
 
 
@@ -1795,12 +1929,13 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     with open(HISTORY_FILE, "w") as f:
         json.dump(payload, f, indent=2)
 
-    # Preserve CT map PNGs alongside the density maps when pruning stale files.
-    ct_all_maps = {}
-    for rk, p in {**ct1_maps, **ct4_maps}.items():
-        if p:
-            ct_all_maps.setdefault(rk, {})["ct"] = p
-    prune_stale_maps({**href_maps, **ct_all_maps}, blank_basemap_path)
+    # Keep EVERY current-run PNG: density thresholds (nested), 1-hr CT and 4-hr CT (flat),
+    # plus the blank basemap. Collected recursively so no map type gets dropped from the
+    # keep-set — the previous `{**href_maps, **ct_all_maps}` merge silently discarded density
+    # maps (and ct1 maps) wherever a row key was shared, so they were pruned right after
+    # being generated. That was why only a handful of density hours survived on disk.
+    referenced_paths = _collect_map_paths(href_maps, ct1_maps, ct4_maps, blank_basemap_path)
+    prune_stale_maps(referenced_paths)
     logging.info("Dashboard matrix completely compiled and written to history.json.")
 
 
