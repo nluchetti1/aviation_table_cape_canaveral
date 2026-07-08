@@ -105,6 +105,8 @@
             <a onclick="updateMetric('cloud_top')" id="nav-cloud_top">Highest Cloud Top</a>
             <a onclick="updateMetric('cloud_thick')" id="nav-cloud_thick">Max Layer Thickness</a>
             <a onclick="updateMetric('thick_layer')" id="nav-thick_layer">Thick Cloud Layer</a>
+            <a onclick="updateMetric('cuP_neg10_5nm')" id="nav-cuP_neg10_5nm">Cu P(top≥−10°C, 5nm)</a>
+            <a onclick="updateMetric('cuP_neg20_10nm')" id="nav-cuP_neg20_10nm">Cu P(top≥−20°C, 10nm)</a>
             <a onclick="updateMetric('ct_thunder')" id="nav-ct_thunder">Cal. Thunder Map</a>
         </div>
         <div class="station-selector">
@@ -181,7 +183,7 @@
         const popupCard = document.getElementById("hover-popup-card");
 
         const aviationMetrics = ['mom_mean', 'mom_max', 'ceiling', 'vis', 'shear'];
-        const launchMetrics = ['hght_p5c', 'hght_0c', 'hght_5c', 'hght_10c', 'hght_15c', 'hght_20c', 'cloud_top', 'cloud_thick', 'thick_layer', 'ct_thunder'];
+        const launchMetrics = ['hght_p5c', 'hght_0c', 'hght_5c', 'hght_10c', 'hght_15c', 'hght_20c', 'cloud_top', 'cloud_thick', 'thick_layer', 'cuP_neg10_5nm', 'cuP_neg20_10nm', 'ct_thunder'];
 
         // Launch pads + the two GRIB airfields (KTTS, KCOF) have no dedicated HREF lightning
         // point data; they use KXMR's HREF density / calibrated-thunder as a nearby proxy.
@@ -298,7 +300,21 @@
                 return { txt: Math.round(p25) + "%", cls: cls };
             }
 
-            // Thick Cloud Layer LLCC (#6): binary violation flag (deck >= 4500ft in 0/-20C band).
+            // REFS Cumulus Cloud standoff probabilities (only populated on the REFS column).
+            // Higher probability = higher go/no-go concern. A "floor" quality means the isotherm
+            // sat below the 20 kft echo-top floor so the value is a lower bound (shown with *).
+            if (metric === 'cuP_neg10_5nm' || metric === 'cuP_neg20_10nm') {
+                if (val === null || val === undefined) return { txt: "—", cls: "" };
+                const q = (metric === 'cuP_neg10_5nm') ? profile.cuP_neg10_5nm_q : profile.cuP_neg20_10nm_q;
+                const star = (q === 'floor') ? "*" : "";
+                let cls = "ltg-none";
+                if (val >= 50) cls = "ltg-high";
+                else if (val >= 25) cls = "ltg-med";
+                else if (val >= 10) cls = "ltg-low";
+                else if (val > 0) cls = "ltg-vlow";
+                return { txt: Math.round(val) + "%" + star, cls: cls };
+            }
+
             // Convective columns (per HRRR reflectivity) are governed by the Cumulus rule instead,
             // so we mask them rather than flag a stratiform bust.
             if (metric === 'thick_layer') {
@@ -788,7 +804,9 @@
                     • Highest Cloud Top: <strong>${p.cloud_top == null ? '—' : p.cloud_top + ' kft'}</strong><br>
                     • Max Layer Thickness: <strong>${p.cloud_thick == null ? '—' : p.cloud_thick + ' kft'}${p.convective ? ' (conv)' : ''}</strong><br>
                     • Thick Cloud Layer (LLCC): <strong>${p.convective ? 'CONV — see Cumulus rule' : (p.thick_layer === 1 ? 'VIOLATED' : (p.thick_layer === 0 ? 'OK' : '—'))}</strong><br>
-                    • Composite Refl (${p.convective ? 'convective' : 'nbr max'}): <strong>${p.refc_nbr == null ? '—' : p.refc_nbr + ' dBZ'}</strong>
+                    • Composite Refl (${p.convective ? 'convective' : 'nbr max'}): <strong>${p.refc_nbr == null ? '—' : p.refc_nbr + ' dBZ'}</strong><br>
+                    • Cu P(top≥−10°C, 5nm): <strong>${p.cuP_neg10_5nm == null ? '—' : Math.round(p.cuP_neg10_5nm) + '%' + (p.cuP_neg10_5nm_q === 'floor' ? '*' : '')}</strong><br>
+                    • Cu P(top≥−20°C, 10nm): <strong>${p.cuP_neg20_10nm == null ? '—' : Math.round(p.cuP_neg20_10nm) + '%' + (p.cuP_neg20_10nm_q === 'floor' ? '*' : '')}</strong> <span style="color:#94a3b8;font-size:0.85em;">(REFS)</span>
                 `;
             }
             popupCard.style.display = "block";
