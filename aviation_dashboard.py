@@ -1998,6 +1998,13 @@ def fetch_all_ecmwf_soundings():
             layers = _grib_levels_to_layers(levels)
             vars_dict = compute_profile_variables(layers) if layers else None
             if vars_dict:
+                # ECMWF's coarse 12-level grid + upper-level humidity reported relative to ICE
+                # make the moisture-based cloud detection unreliable — it can false-flag ~46 kft
+                # "cloud tops" from near-tropopause ice-saturation, and can't resolve low decks
+                # (no levels between 1000 and 925 hPa). Blank those fields so the column shows
+                # "-" instead of misleading values; isotherms, PBL winds and shear stay valid.
+                for mk in ("ceiling", "cloud_top", "cloud_thick", "thick_layer", "thick_layer_ft"):
+                    vars_dict[mk] = None
                 matrix[sid][row_key] = vars_dict
 
     n = sum(len(v) for v in matrix.values())
