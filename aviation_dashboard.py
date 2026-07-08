@@ -50,6 +50,18 @@ CONVECTIVE_MASK_ENABLED = True
 CONVECTIVE_DBZ = 40.0     # composite reflectivity (dBZ) at/above which a column is "convective"
 CONVECTIVE_NBR_NM = 5.0   # neighborhood radius (nautical miles) sampled around each site
 
+# ---- REFS Cumulus Cloud LLCC probabilities (durable ensemble-product path) ----
+# Uses the pre-computed REFS echo-top exceedance probabilities P(echo top > {6096,9144,10668,
+# 12192,15240} m) from the ensemble prob file, neighborhood-maxed within the LLCC radii and
+# interpolated at the REFS-mean isotherm heights, to express the Cumulus Cloud STANDOFF rules:
+#   Rule a: P(top >= -20C altitude) within 10 NM
+#   Rule b: P(top >= -10C altitude) within  5 NM
+# The flight-through rules (-5C / +5C) sit BELOW the lowest echo-top threshold (20 kft), so they
+# cannot be resolved from this product (only floored) and would need the individual members.
+REFS_CUMULUS_ENABLED = True
+REFS_ECHOTOP_THRESHOLDS_M = [6096, 9144, 10668, 12192, 15240]  # 20/30/35/40/50 kft
+REFS_CUMULUS_RADII_NM = {"neg10": 5.0, "neg20": 10.0}
+
 
 STN_COORDS = {
     "kxmr": {"lat": 28.468, "lon": -80.556},
@@ -2173,6 +2185,159 @@ def fetch_convective_reflectivity(time_keys):
     return matrix
 
 
+def _interp_exceedance(curve, height_m):
+    """curve: {threshold_m: prob_pct}. Linear interpolation of the echo-top exceedance
+    probability at height_m. Below the lowest threshold only a floor is known (the product is
+    blind below ~20 kft), so we return that with a 'floor' quality flag."""
+    if not curve:
+        return None, "no_data"
+    ths = sorted(curve.keys())
+    if height_m <= ths[0]:
+        return curve[ths[0]], "floor"
+    if height_m >= ths[-1]:
+        return curve[ths[-1]], "cap"
+    for i in range(len(ths) - 1):
+        lo, hi = ths[i], ths[i + 1]
+        if lo <= height_m <= hi:
+            f = (height_m - lo) / (hi - lo)
+            return round(curve[lo] + f * (curve[hi] - curve[lo]), 1), "interp"
+    return curve[ths[-1]], "cap"
+
+
+def fetch_refs_echotop_probs():
+    """Pull REFS pre-computed echo-top exceedance probabilities P(echo top > {6096..15240} m)
+    from the ensemble prob file, and return the neighborhood-max probability curve within 5 nm
+    and 10 nm of each site: {site_id: {row_key: {"c5": {thr_m: pct}, "c10": {thr_m: pct}}}}.
+    Durable (survives the Aug-2026 HREF->REFS cutover, products not members). Empty on failure."""
+    if not REFS_CUMULUS_ENABLED:
+        return {}
+    all_coords = {}
+    for pid, c in LAUNCH_PADS.items():
+        all_coords[pid] = {"lat": c["lat"], "lon": c["lon"]}
+    for sid, c in STN_COORDS.items():
+        all_coords[sid] = {"lat": c["lat"], "lon": c["lon"]}
+
+    session = requests.Session()
+    session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=3))
+    session.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"})
+
+    date_str, cycle = _rrfs_determine_cycle(session, "refs")
+    if not cycle:
+        logging.warning("REFS cumulus: no REFS cycle available on AWS.")
+        return {}
+    cycle_init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
+    logging.info(f"REFS cumulus: echo-top probs from {date_str} {cycle}z")
+
+    ncells5 = max(1, round((REFS_CUMULUS_RADII_NM['neg10'] * 1.852) / 3.0))   # ~3 cells (5 nm @ 3 km)
+    ncells10 = max(1, round((REFS_CUMULUS_RADII_NM['neg20'] * 1.852) / 3.0))  # ~6 cells (10 nm @ 3 km)
+    th_strs = [str(t) for t in REFS_ECHOTOP_THRESHOLDS_M]
+    logged_idx = {"done": False}
+
+    def _prob_url(fh):
+        return (f"{RRFS_AWS_ROOT}/rrfs_a/refs.{date_str}/{cycle}/enspost/"
+                f"refs.t{cycle}z.prob.f{fh:02d}.conus.grib2")
+
+    def _worker(fh, row_key):
+        url = _prob_url(fh)
+        local = os.path.join(CACHE_DIR, f"refs_prob_{cycle}z_f{fh:02d}.grib2")
+        try:
+            r = session.get(url + ".idx", timeout=15)
+            if r.status_code != 200:
+                return row_key, {}
+            entries = _parse_idx(r.text)
+            # Robust echo-top message match: the wgrib2 abbrev (RETOP/ETOP/echo) OR any idx line
+            # carrying one of the known threshold heights. pygrib's PDT-4.9 upperLimit is the
+            # authoritative threshold once downloaded, so a loose idx match is safe here.
+            cand = []
+            for e in entries:
+                blob = f"{e['short']} {e['level']}".upper()
+                if "RETOP" in blob or "ETOP" in blob or "ECHO" in blob or any(ts in blob for ts in th_strs):
+                    cand.append(e)
+            if not cand:
+                if not logged_idx["done"]:
+                    logged_idx["done"] = True
+                    sample = " | ".join(f"{e['short']}:{e['level']}" for e in entries[:12])
+                    logging.warning(f"[REFS CUMULUS DEBUG] no echo-top msgs matched in idx f{fh:02d}. "
+                                    f"First idx fields: {sample}")
+                return row_key, {}
+            with open(local, "wb") as fhh:
+                for e in cand:
+                    hdr = {"Range": f"bytes={e['start']}-{e['end'] if e['end'] is not None else ''}"}
+                    rr = session.get(url, headers=hdr, timeout=25)
+                    if rr.status_code in (200, 206):
+                        fhh.write(rr.content)
+            if os.path.getsize(local) == 0:
+                return row_key, {}
+            grbs = pygrib.open(local)
+            grids = {}
+            lats = lons = None
+            for grb in grbs:
+                nm = (getattr(grb, "name", "") or "").lower()
+                if "echo" not in nm and "top" not in nm and "retop" not in nm:
+                    continue
+                thr = None
+                for attr in ("upperLimit", "scaledValueOfUpperLimit"):
+                    try:
+                        thr = float(getattr(grb, attr))
+                        break
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                if thr is None:
+                    continue
+                thr_snap = min(REFS_ECHOTOP_THRESHOLDS_M, key=lambda t: abs(t - thr))
+                if abs(thr_snap - thr) > 250:  # not one of our thresholds
+                    continue
+                arr = _sanitize_grid(grb.values)
+                if arr.size and arr.max() <= 1.0:  # 0-1 fraction -> percent
+                    arr = arr * 100.0
+                grids[thr_snap] = arr
+                if lats is None:
+                    lats, lons = grb.latlons()
+            grbs.close()
+            if not grids or lats is None:
+                return row_key, {}
+            lons_n = np.where(lons > 180, lons - 360.0, lons)
+            out = {}
+            for sid, c in all_coords.items():
+                dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
+                iy, ix = np.unravel_index(np.argmin(dist), dist.shape)
+                c5, c10 = {}, {}
+                for th, arr in grids.items():
+                    y0, y1 = max(0, iy - ncells5), min(arr.shape[0], iy + ncells5 + 1)
+                    x0, x1 = max(0, ix - ncells5), min(arr.shape[1], ix + ncells5 + 1)
+                    c5[th] = round(float(np.max(arr[y0:y1, x0:x1])), 1)
+                    y0, y1 = max(0, iy - ncells10), min(arr.shape[0], iy + ncells10 + 1)
+                    x0, x1 = max(0, ix - ncells10), min(arr.shape[1], ix + ncells10 + 1)
+                    c10[th] = round(float(np.max(arr[y0:y1, x0:x1])), 1)
+                out[sid] = {"c5": c5, "c10": c10}
+            return row_key, out
+        except Exception as e:
+            logging.debug(f"REFS prob f{fh:02d} failed: {e}")
+            return row_key, {}
+        finally:
+            if os.path.exists(local):
+                try: os.remove(local)
+                except Exception: pass
+
+    matrix = {sid: {} for sid in all_coords}
+    tasks = []
+    for fh in range(1, 25):  # REFS runs to 60 h; the launch window here is ~24 h
+        valid = cycle_init + datetime.timedelta(hours=fh)
+        tasks.append((fh, f"{valid.day:02d}/{valid.hour:02d}"))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        futs = [ex.submit(_worker, fh, rk) for fh, rk in tasks]
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                rk, sv = fut.result()
+                for sid, v in sv.items():
+                    matrix[sid][rk] = v
+            except Exception:
+                pass
+    got = sum(len(v) for v in matrix.values())
+    logging.info(f"REFS cumulus: echo-top prob curves for {got} site-hours.")
+    return matrix
+
+
 def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_rows, pad_matrix=None):
     href_lightning, href_maps = fetch_href_lightning(time_rows)
 
@@ -2232,6 +2397,38 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
             logging.info(f"Convective mask applied: {tagged} site-hour-model cells tagged convective.")
         except Exception as e:
             logging.error(f"Convective mask failed, continuing without it: {e}")
+
+    # REFS Cumulus Cloud standoff probabilities: interpolate the REFS echo-top exceedance curves
+    # at each site's REFS-mean isotherm heights and store the go/no-go probabilities on the REFS
+    # profile. Rule a = P(top>=-20C within 10 nm); Rule b = P(top>=-10C within 5 nm). Both isotherms
+    # sit above the 20 kft echo-top floor in this environment, so they interpolate cleanly.
+    if REFS_CUMULUS_ENABLED:
+        try:
+            etop = fetch_refs_echotop_probs()
+            KFT_TO_M = 304.8
+            filled = 0
+            for sid, hours in (etop or {}).items():
+                refs_rows = (combined_data.get(sid, {}) or {}).get("refs")
+                if not isinstance(refs_rows, dict):
+                    continue
+                for row_key, curves in hours.items():
+                    p = refs_rows.get(row_key)
+                    if not isinstance(p, dict):
+                        continue
+                    h10 = p.get("hght_10c")  # kft, REFS-mean isotherm heights
+                    h20 = p.get("hght_20c")
+                    if h10:
+                        val, q = _interp_exceedance(curves.get("c5", {}), h10 * KFT_TO_M)
+                        p["cuP_neg10_5nm"] = val
+                        p["cuP_neg10_5nm_q"] = q
+                    if h20:
+                        val, q = _interp_exceedance(curves.get("c10", {}), h20 * KFT_TO_M)
+                        p["cuP_neg20_10nm"] = val
+                        p["cuP_neg20_10nm_q"] = q
+                    filled += 1
+            logging.info(f"REFS cumulus probabilities computed for {filled} REFS site-hours.")
+        except Exception as e:
+            logging.error(f"REFS cumulus probabilities failed, continuing without them: {e}")
 
     current_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     current_entry = {
