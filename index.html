@@ -773,9 +773,9 @@
                     • -10°C Height: <strong>${p.hght_10c} kft</strong><br>
                     • -15°C Height: <strong>${p.hght_15c} kft</strong><br>
                     • -20°C Height: <strong>${p.hght_20c} kft</strong><br>
-                    • Highest Cloud Top: <strong>${p.cloud_top} kft</strong><br>
-                    • Max Layer Thickness: <strong>${p.cloud_thick} kft</strong><br>
-                    • Thick Cloud Layer (LLCC): <strong>${p.thick_layer === 1 ? 'VIOLATED' : (p.thick_layer === 0 ? 'OK' : '-')}</strong>
+                    • Highest Cloud Top: <strong>${p.cloud_top == null ? '—' : p.cloud_top + ' kft'}</strong><br>
+                    • Max Layer Thickness: <strong>${p.cloud_thick == null ? '—' : p.cloud_thick + ' kft'}</strong><br>
+                    • Thick Cloud Layer (LLCC): <strong>${p.thick_layer === 1 ? 'VIOLATED' : (p.thick_layer === 0 ? 'OK' : '—')}</strong>
                 `;
             }
             popupCard.style.display = "block";
