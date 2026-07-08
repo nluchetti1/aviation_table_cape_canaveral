@@ -21,7 +21,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 CACHE_DIR = "./workspace_cache"
 HISTORY_FILE = "history.json"
 STATIONS = ["kdab", "kxmr", "kmlb", "kfpr", "kpbi"]
-MODELS = ["gfs", "rap", "hrrr"]
+# MODELS is the full display/column set. BUFKIT_MODELS is the subset that comes from PSU
+# BUFKIT + NOMADS grib (the airport soundings and NOMADS pad columns). ECMWF is additive and
+# point-extracted from ECMWF Open Data, so it must NOT be swept into the BUFKIT/NOMADS loops.
+MODELS = ["gfs", "rap", "hrrr", "ecmwf"]
+BUFKIT_MODELS = ["gfs", "rap", "hrrr"]
+
+# ---- ECMWF Open Data (IFS HRES 0.25°, CC-BY-4.0) additive global column ----
+ECMWF_ENABLED = True
+ECMWF_SOURCE = "ecmwf"    # ecmwf-opendata source: ecmwf | aws | azure | google
+ECMWF_MAX_FH = 48         # forecast hours to ingest (IFS open-data is 3-hourly to 144h)
+ECMWF_LEVELS_HPA = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100]
 
 STN_COORDS = {
     "kxmr": {"lat": 28.468, "lon": -80.556},
@@ -1346,6 +1356,37 @@ def _nomads_grib_url(model, date_str, cycle, f_hour_int):
     return f"{base}?file={f_name}{lev_params}{var_params}{region}{dir_part}"
 
 
+def _grib_levels_to_layers(levels):
+    """Convert a {pressure_hPa: {field: value}} dict (fields decoded from raw isobaric GRIB2:
+    t, rh, hgt, u, v) into the profile_layers schema consumed by compute_profile_variables().
+    Shared by the launch-pad NOMADS path and the ECMWF Open Data path so the math is identical."""
+    layers = []
+    for pres, f in levels.items():
+        if "t" not in f:
+            continue
+        tmpc = f["t"] - 273.15 if f["t"] > 100 else f["t"]  # K -> C guard
+        rh = f.get("rh")
+        dwpt = _rh_to_dewpoint_c(tmpc, rh)
+        u = f.get("u")
+        v = f.get("v")
+        sknt = math.hypot(u, v) * 1.943844 if (u is not None and v is not None) else 0.0
+        # GRIB geopotential height (gpm) -> feet if present, else barometric fallback.
+        hght_ft = f["hgt"] * 3.280839895 if "hgt" in f else pressure_to_height_ft(pres)
+        layers.append({
+            "pres": pres,
+            "hght": hght_ft,
+            "tmpc": tmpc,
+            "dwpt": dwpt,
+            "depr": tmpc - dwpt,
+            "rh": rh,  # native GRIB RH (%), used directly for RH>=95% cloud detection
+            "sknt": sknt,
+            "drct": None,
+            "u": u * 1.943844 if u is not None else None,  # m/s -> kt
+            "v": v * 1.943844 if v is not None else None,
+        })
+    return layers
+
+
 def build_pad_profiles_from_grib(filepath, pad_coords, debug=False):
     """
     Extract a vertical column at each pad's nearest grid cell from a raw isobaric
@@ -1425,30 +1466,7 @@ def build_pad_profiles_from_grib(filepath, pad_coords, debug=False):
 
     pad_profiles = {}
     for pid, levels in per_pad_levels.items():
-        layers = []
-        for pres, f in levels.items():
-            if "t" not in f:
-                continue
-            tmpc = f["t"] - 273.15 if f["t"] > 100 else f["t"]  # K -> C guard
-            rh = f.get("rh")
-            dwpt = _rh_to_dewpoint_c(tmpc, rh)
-            u = f.get("u")
-            v = f.get("v")
-            sknt = math.hypot(u, v) * 1.943844 if (u is not None and v is not None) else 0.0
-            # GRIB geopotential height (gpm) -> feet if present, else barometric fallback
-            hght_ft = f["hgt"] * 3.280839895 if "hgt" in f else pressure_to_height_ft(pres)
-            layers.append({
-                "pres": pres,
-                "hght": hght_ft,
-                "tmpc": tmpc,
-                "dwpt": dwpt,
-                "depr": tmpc - dwpt,
-                "rh": rh,  # native GRIB RH (%), used directly for RH>=95% cloud detection
-                "sknt": sknt,
-                "drct": None,
-                "u": u * 1.943844 if u is not None else None,  # m/s -> kt
-                "v": v * 1.943844 if v is not None else None,
-            })
+        layers = _grib_levels_to_layers(levels)
         if layers:
             pad_profiles[pid] = layers
     return pad_profiles
@@ -1541,7 +1559,7 @@ def fetch_all_pad_soundings():
     GFS and RAP are pulled here via the NOMADS grib-filter; HRRR is intentionally skipped
     (its NOMADS filter probe was unreliable) and instead sourced from AWS in the RRFS pass."""
     pad_matrix = {pid: {m: {} for m in MODELS} for pid in LAUNCH_PADS}
-    nomads_models = [m for m in MODELS if m != "hrrr"]  # HRRR comes from AWS instead
+    nomads_models = [m for m in BUFKIT_MODELS if m != "hrrr"]  # gfs, rap (HRRR + ECMWF fetched elsewhere)
 
     with requests.Session() as session:
         for model in nomads_models:
@@ -1854,6 +1872,139 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
     return matrix
 
 
+def fetch_all_ecmwf_soundings():
+    """Add an ECMWF IFS (HRES 0.25°) column, point-extracted for every launch pad + airport,
+    from the free ECMWF Open Data distribution (CC-BY-4.0). One multi-step GRIB2 file is
+    pulled via the ecmwf-opendata client (byte-range subset of pressure-level t/gh/r/u/v),
+    then grouped by valid time and run through the shared compute_profile_variables().
+
+    Vertical resolution is coarse (12 tropospheric levels) vs the CAMs, so isotherm heights,
+    PBL winds and shear are solid while the moisture-based LLCC fields (ceiling, cloud top,
+    layer thickness) are advisory. Returns {site_id: {row_key: variables}} (empty on any
+    failure — the column simply won't appear, the rest of the dashboard is unaffected)."""
+    if not ECMWF_ENABLED:
+        return {}
+    try:
+        from ecmwf.opendata import Client
+    except Exception as e:
+        logging.warning(f"ecmwf-opendata not installed; skipping ECMWF column ({e}).")
+        return {}
+
+    all_coords = {}
+    for pid, c in LAUNCH_PADS.items():
+        all_coords[pid] = {"lat": c["lat"], "lon": c["lon"]}
+    for sid, c in STN_COORDS.items():
+        all_coords[sid] = {"lat": c["lat"], "lon": c["lon"]}
+
+    steps = list(range(0, ECMWF_MAX_FH + 1, 3))  # IFS open-data cadence is 3-hourly
+    target = os.path.join(CACHE_DIR, "ecmwf_ifs_pl.grib2")
+    if os.path.exists(target):
+        try: os.remove(target)
+        except Exception: pass
+
+    try:
+        client = Client(source=ECMWF_SOURCE)
+        result = client.retrieve(
+            type="fc",
+            step=steps,
+            levtype="pl",
+            levelist=ECMWF_LEVELS_HPA,
+            param=["t", "gh", "r", "u", "v"],
+            target=target,
+        )
+        init_dt = getattr(result, "datetime", None)
+        size_kib = os.path.getsize(target) // 1024 if os.path.exists(target) else 0
+        logging.info(f"ECMWF IFS: retrieved {size_kib} KiB, init {init_dt}, {len(steps)} steps.")
+    except Exception as e:
+        logging.error(f"ECMWF Open Data retrieve failed, skipping column: {e}")
+        if os.path.exists(target):
+            try: os.remove(target)
+            except Exception: pass
+        return {}
+
+    # Parse the multi-step file: group messages by VALID time -> row_key, per site per level.
+    per = {}                                   # row_key -> sid -> {level: {field: val}}
+    seen = {}                                  # (shortName, typeOfLevel) -> count  [debug]
+    matched = {"t": 0, "rh": 0, "hgt": 0, "u": 0, "v": 0}
+    decode_errors = 0
+    try:
+        grbs = pygrib.open(target)
+        grid_lats = grid_lons = None
+        site_ij = {}
+        for grb in grbs:
+            try:
+                type_lvl = getattr(grb, "typeOfLevel", "")
+                short = getattr(grb, "shortName", "")
+            except Exception:
+                continue
+            seen[(short, type_lvl)] = seen.get((short, type_lvl), 0) + 1
+            if type_lvl != "isobaricInhPa":
+                continue
+            level = grb.level
+            if level not in ECMWF_LEVELS_HPA:
+                continue
+            field = None
+            if short in ("t", "TMP"): field = "t"
+            elif short in ("r", "RH"): field = "rh"
+            elif short in ("gh", "HGT"): field = "hgt"
+            elif short in ("u", "UGRD"): field = "u"
+            elif short in ("v", "VGRD"): field = "v"
+            if field is None:
+                continue
+            try:
+                vd = grb.validDate  # datetime of the valid time
+            except Exception:
+                continue
+            row_key = f"{vd.day:02d}/{vd.hour:02d}"
+            if grid_lats is None:
+                grid_lats, grid_lons = grb.latlons()
+                glons = np.where(grid_lons > 180, grid_lons - 360.0, grid_lons)
+                for sid, c in all_coords.items():
+                    dist = (grid_lats - c["lat"]) ** 2 + (glons - c["lon"]) ** 2
+                    site_ij[sid] = np.unravel_index(np.argmin(dist), dist.shape)
+            try:
+                vals = grb.values
+            except Exception as e:
+                # CCSDS decode failure surfaces here if eccodes lacks aec/libaec support.
+                decode_errors += 1
+                if decode_errors <= 3:
+                    logging.error(f"ECMWF GRIB value decode failed ({short}@{level}): {e}")
+                continue
+            matched[field] += 1
+            for sid, (iy, ix) in site_ij.items():
+                per.setdefault(row_key, {}).setdefault(sid, {}).setdefault(level, {})[field] = float(vals[iy, ix])
+        grbs.close()
+    except Exception as e:
+        logging.error(f"ECMWF GRIB parse failed: {e}")
+        return {}
+    finally:
+        if os.path.exists(target):
+            try: os.remove(target)
+            except Exception: pass
+
+    logging.info("[ECMWF DEBUG] shortName/typeOfLevel seen: "
+                 + ", ".join(f"{k[0]}/{k[1]}={v}" for k, v in sorted(seen.items())))
+    logging.info(f"[ECMWF DEBUG] fields matched to parser: {matched}"
+                 + (f" | {decode_errors} value-decode errors" if decode_errors else ""))
+    if sum(matched.values()) == 0:
+        logging.warning("[ECMWF DEBUG] ZERO isobaric fields matched. If shortNames above look right "
+                        "but decode errors are nonzero, eccodes likely lacks CCSDS/aec (libaec) support.")
+        return {}
+
+    # Build profiles + run the shared variable computation (same engine as pads/BUFKIT).
+    matrix = {sid: {} for sid in all_coords}
+    for row_key, sites in per.items():
+        for sid, levels in sites.items():
+            layers = _grib_levels_to_layers(levels)
+            vars_dict = compute_profile_variables(layers) if layers else None
+            if vars_dict:
+                matrix[sid][row_key] = vars_dict
+
+    n = sum(len(v) for v in matrix.values())
+    logging.info(f"ECMWF IFS soundings: {n} site-hours across {len(all_coords)} sites, {len(per)} valid times.")
+    return matrix
+
+
 def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_rows, pad_matrix=None):
     href_lightning, href_maps = fetch_href_lightning(time_rows)
 
@@ -1943,7 +2094,7 @@ def run_pipeline():
             futures = [
                 executor.submit(fetch_station_model, session, s, m)
                 for s in STATIONS
-                for m in MODELS
+                for m in BUFKIT_MODELS
             ]
             for future in concurrent.futures.as_completed(futures):
                 stn, model, data = future.result()
@@ -2001,6 +2152,27 @@ def run_pipeline():
             logging.info(f"AWS columns merged (RRFS {r_hours}, REFS {e_hours} site-hours; HRRR {h_hours} pad-hours).")
         except Exception as e:
             logging.error(f"AWS RRFS/REFS/HRRR fetch failed, continuing without them: {e}")
+
+    # Fetch the ECMWF IFS column (additive; point-extracted for pads + airports) from ECMWF
+    # Open Data. Merged under the "ecmwf" key exactly like the AWS columns; total isolation via
+    # try/except so any ECMWF outage or missing dependency leaves the rest of the run intact.
+    if ECMWF_ENABLED:
+        try:
+            ecmwf_matrix = fetch_all_ecmwf_soundings()
+            if ecmwf_matrix:
+                if pad_matrix is None:
+                    pad_matrix = {pid: {} for pid in LAUNCH_PADS}
+                for sid, rows in ecmwf_matrix.items():
+                    if not rows:
+                        continue
+                    is_pad = sid in LAUNCH_PADS
+                    target = pad_matrix if is_pad else sounding_matrix
+                    target.setdefault(sid, {})
+                    target[sid]["ecmwf"] = rows
+                merged = sum(len(r) for r in ecmwf_matrix.values())
+                logging.info(f"ECMWF column merged ({merged} site-hours).")
+        except Exception as e:
+            logging.error(f"ECMWF fetch failed, continuing without it: {e}")
 
     generate_aviation_dashboard(STATIONS, MODELS, sounding_matrix, time_rows, pad_matrix=pad_matrix)
 
