@@ -351,17 +351,21 @@
             // detect availability directly rather than gating on pad-vs-airport.
             const hasRrfs = !!(stationData["rrfs"] && Object.keys(stationData["rrfs"]).length);
             const hasRefs = !!(stationData["refs"] && Object.keys(stationData["refs"]).length);
+            const hasEcmwf = !!(stationData["ecmwf"] && Object.keys(stationData["ecmwf"]).length);
             const models = ["gfs", "rap", "hrrr"];
+            if (hasEcmwf) models.push("ecmwf");
             if (hasRrfs) models.push("rrfs");
             if (hasRefs) models.push("refs");
 
             const modelHeaders = {
                 gfs: "GFS", rap: "RAP", hrrr: "HRRR",
+                ecmwf: "ECMWF<br><span style='font-weight:normal;font-size:0.7em'>IFS 0.25°</span>",
                 rrfs: "RRFS", refs: "REFS<br><span style='font-weight:normal;font-size:0.7em'>avg</span>"
             };
             const modelThs = models.map(m => {
-                const extra = (m === "rrfs" || m === "refs")
-                    ? " style='background:#1e3a5f; color:white;'" : "";
+                let extra = "";
+                if (m === "rrfs" || m === "refs") extra = " style='background:#1e3a5f; color:white;'";
+                else if (m === "ecmwf") extra = " style='background:#5b21b6; color:white;'";
                 return `<th${extra}>${modelHeaders[m]}</th>`;
             }).join("");
 
@@ -738,6 +742,7 @@
                         • <strong>Max Layer Thickness:</strong> Contiguous levels with dewpoint depression T − Td ≤ 2°C are grouped into discrete decks; this reports the depth (kft) of the single thickest continuous deck. (A more permissive criterion than the ceiling's, to better capture the full vertical extent of the moist layer.)<br><br>
                         • <strong>Thick Cloud Layer (LLCC #6):</strong> Flags <em>VIOLATED</em> when the thickest cloud deck is ≥ 4,500 ft thick <em>and</em> any part of it lies in the 0°C to −20°C charging band.<br><br>
                         <span style="color:#64748b; font-size:0.92em;"><em>Note: the REFS ensemble-mean product carries only a single isobaric humidity level, so the moisture-based fields (ceiling, cloud top, layer thickness) cannot be reliably resolved on the REFS column and may read CLR/0. Its isotherm heights, PBL winds, and shear remain valid.</em></span><br><br>
+                        <span style="color:#64748b; font-size:0.92em;"><em>Note: the ECMWF column is the IFS HRES at 0.25° from ECMWF Open Data (CC-BY-4.0), point-extracted on a coarse 12-level pressure grid and posted 3-hourly. Isotherm heights, PBL winds, and 0–6 km shear are reliable; the moisture-based LLCC fields (ceiling, cloud top, layer thickness) are advisory only because the vertical humidity structure is under-resolved. Data © 2026 ECMWF.</em></span><br><br>
                         • <strong>CT 4hr (table column):</strong> HREF Calibrated Thunder — the machine-learning-calibrated probability of at least one cloud-to-ground lightning flash within 20 km (12 mi) of the point over a 4-hour window, calibrated against observed NLDN strikes. This is the default lightning column; hover it for the spatial map.<br><br>
                         • <strong>Cal. Thunder Map:</strong> Full Space-Coast-domain spatial view of the calibrated-thunder probability field with a time slider (1–48 h). Hover the CT table column for the same map at a given hour. The window (1-hr / 4-hr) follows the toggle in the CT column header; if NOMADS posts only one window this cycle, the other is skipped automatically.
                     </div>
