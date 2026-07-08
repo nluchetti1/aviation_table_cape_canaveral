@@ -23,10 +23,17 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update --fix-missing
-          sudo apt-get install -y libeccodes-dev libgeos-dev libproj-dev proj-bin
+          # libaec-dev provides CCSDS (AEC) decompression, which eccodes/pygrib needs to read
+          # ECMWF Open Data GRIB2 (CCSDS-packed since July 2023). Without it the ECMWF column
+          # decodes to zero fields (the [ECMWF DEBUG] log will flag it).
+          sudo apt-get install -y libeccodes-dev libaec-dev libgeos-dev libproj-dev proj-bin
 
       - name: Install Libraries
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          # ECMWF Open Data client (installed explicitly so the ECMWF column works even if it
+          # hasn't been added to requirements.txt yet).
+          pip install ecmwf-opendata
 
       - name: Run Script
         run: python aviation_dashboard.py
