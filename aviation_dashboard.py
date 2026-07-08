@@ -1,4 +1,5 @@
 import datetime
+import time
 import json
 import math
 import os
@@ -32,6 +33,23 @@ ECMWF_ENABLED = True
 ECMWF_SOURCE = "ecmwf"    # ecmwf-opendata source: ecmwf | aws | azure | google
 ECMWF_MAX_FH = 48         # forecast hours to ingest (IFS open-data is 3-hourly to 144h)
 ECMWF_LEVELS_HPA = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100]
+
+# ---- Convective (cumulus) mask for the Thick Cloud Layer / Max Layer Thickness LLCC ----
+# The Thick Cloud Layer rule targets STRATIFORM decks; cumulus is governed by its own LLCC rule.
+# We use HRRR composite reflectivity as a convection detector: where a convective core sits within
+# ~5 nm of a site, those hours are tagged 'convective' so the frontend marks the thick-layer /
+# max-thickness fields as convective rather than flagging a stratiform bust. The threshold is set
+# CONSERVATIVELY (40 dBZ) on purpose: in an LLCC context, hiding a real stratiform violation
+# (over-masking) is worse than leaving a cumulus core flagged (under-masking, which is safe and
+# redundant with the Cumulus rule). Raw thickness values are preserved; only the label changes.
+# NOTE: reflectivity catches convective *cumulus cores* well, but a thin/detached anvil is low-
+# reflectivity ice and won't trip this — anvil detection is a separate problem (high cold cloud +
+# upstream convection) not solved here. The ideal discriminator is derived reflectivity at the
+# -10C isotherm (above the melting-layer bright band); composite is used as a robust first cut.
+CONVECTIVE_MASK_ENABLED = True
+CONVECTIVE_DBZ = 40.0     # composite reflectivity (dBZ) at/above which a column is "convective"
+CONVECTIVE_NBR_NM = 5.0   # neighborhood radius (nautical miles) sampled around each site
+
 
 STN_COORDS = {
     "kxmr": {"lat": 28.468, "lon": -80.556},
@@ -762,19 +780,46 @@ def fetch_calibrated_thunder(window="4hr"):
     session = requests.Session()
     session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=3))
 
-    active_cycle = active_date_str = None
-    for days_back in [0, 1]:
-        date_str = (now_utc - datetime.timedelta(days=days_back)).strftime("%Y%m%d")
-        for cycle in ["12", "00"]:
-            test_url = (f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/"
-                        f"spc_post.{date_str}/thunder/spc_post.t{cycle}z.hrefct_{window}.f004.grib2")
+    # Robust cycle discovery. SPC HREFCT initializes at 00Z and 12Z. NOMADS frequently throttles
+    # a GitHub-Actions IP right after the HREF-lightning download burst that runs just before this,
+    # so a single 3-second HEAD is fragile: a throttled probe times out and the run looks "absent"
+    # even when it's on disk — and because every probe (today AND the older fallbacks) times out
+    # together, the whole product silently drops. Fix: browser User-Agent, longer timeout, retries
+    # with backoff, and a newest-first walk across 3 days so a valid fallback is always found.
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
+    })
+
+    def _probe_exists(url):
+        for attempt in range(3):
             try:
-                if session.head(test_url, timeout=3).status_code == 200:
-                    active_cycle, active_date_str = cycle, date_str
-                    break
+                r = session.head(url, timeout=12, allow_redirects=True)
+                if r.status_code == 200:
+                    return True
+                if r.status_code == 404:
+                    return False  # definitively absent — don't burn retries on it
             except Exception:
-                continue
-        if active_cycle:
+                pass
+            time.sleep(1.5 * (attempt + 1))  # brief backoff to ride out throttling
+        return False
+
+    active_cycle = active_date_str = None
+    candidates = []
+    for days_back in [0, 1, 2]:
+        d = (now_utc - datetime.timedelta(days=days_back)).strftime("%Y%m%d")
+        for cyc in ["12", "00"]:
+            init = datetime.datetime.strptime(f"{d}{cyc}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
+            if init <= now_utc:  # skip cycles that haven't run yet
+                candidates.append((init, d, cyc))
+    candidates.sort(key=lambda x: x[0], reverse=True)  # newest available cycle first
+
+    for _init, d, cyc in candidates:
+        # Probe f004: the first forecast hour valid for BOTH the 1-hr and 4-hr windows (a 4-hr
+        # accumulation can't end at f001), so it reliably signals "this cycle exists".
+        probe = (f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/"
+                 f"spc_post.{d}/thunder/spc_post.t{cyc}z.hrefct_{window}.f004.grib2")
+        if _probe_exists(probe):
+            active_cycle, active_date_str = cyc, d
             break
 
     if not active_cycle:
@@ -2012,6 +2057,122 @@ def fetch_all_ecmwf_soundings():
     return matrix
 
 
+def fetch_convective_reflectivity(time_keys):
+    """Detect convective cores near each site from HRRR composite reflectivity (REFC), so the
+    Thick Cloud Layer / Max Layer Thickness LLCC fields can be flagged as cu/anvil-governed
+    (which have their own rules) rather than a stratiform bust. One tiny Cape-box REFC subset is
+    pulled per forecast hour from the NOMADS HRRR 2-D grib filter; the neighborhood max within
+    ~10 nm of each site is returned as {site_id: {row_key: dBZ}}. Empty on any failure (the mask
+    simply won't apply — nothing else changes)."""
+    if not CONVECTIVE_MASK_ENABLED:
+        return {}
+
+    all_coords = {}
+    for pid, c in LAUNCH_PADS.items():
+        all_coords[pid] = {"lat": c["lat"], "lon": c["lon"]}
+    for sid, c in STN_COORDS.items():
+        all_coords[sid] = {"lat": c["lat"], "lon": c["lon"]}
+
+    session = requests.Session()
+    session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=3))
+    session.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"})
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+    def _url(cc, date_str, fh):
+        return (f"https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl?file=hrrr.t{cc}z.wrfsfcf{fh:02d}.grib2"
+                f"&var_REFC=on&lev_entire_atmosphere=on&subregion=&leftlon=-81.2&rightlon=-80.0"
+                f"&toplat=29.2&bottomlat=28.0&dir=%2Fhrrr.{date_str}%2Fconus")
+
+    def _probe(url):
+        for attempt in range(3):
+            try:
+                r = session.head(url, timeout=12, allow_redirects=True)
+                if r.status_code == 200: return True
+                if r.status_code == 404: return False
+            except Exception: pass
+            time.sleep(1.0 * (attempt + 1))
+        return False
+
+    # HRRR runs hourly; find the most recent cycle with f01 posted (probe back up to 6 h).
+    active_date = active_cycle = None
+    for back in range(0, 7):
+        t = now_utc - datetime.timedelta(hours=back)
+        d, cc = t.strftime("%Y%m%d"), t.strftime("%H")
+        if _probe(_url(cc, d, 1)):
+            active_date, active_cycle = d, cc
+            break
+    if not active_cycle:
+        logging.warning("Convective mask: no available HRRR REFC cycle found on NOMADS.")
+        return {}
+    cycle_init = datetime.datetime.strptime(f"{active_date}{active_cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
+    # HRRR forecast length: 48 h at the 00/06/12/18Z cycles, 18 h otherwise.
+    max_fh = 48 if active_cycle in ("00", "06", "12", "18") else 18
+    logging.info(f"Convective mask: HRRR REFC from {active_date} {active_cycle}z ({max_fh}-h).")
+
+    ncells = max(1, round((CONVECTIVE_NBR_NM * 1.852) / 3.0))  # ~10 nm at HRRR 3-km spacing
+
+    def _worker(fh, row_key):
+        url = _url(active_cycle, active_date, fh)
+        local = os.path.join(CACHE_DIR, f"refc_{active_cycle}z_f{fh:02d}.grib2")
+        out = {}
+        try:
+            with session.get(url, timeout=25, stream=True) as r:
+                if r.status_code != 200:
+                    return row_key, {}
+                with open(local, "wb") as fhh:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        fhh.write(chunk)
+            grbs = pygrib.open(local)
+            refc = lats = lons = None
+            for grb in grbs:
+                short = getattr(grb, "shortName", "")
+                nm = getattr(grb, "name", "") or ""
+                if short in ("refc", "REFC") or "reflectivity" in nm.lower():
+                    refc = _sanitize_grid(grb.values)
+                    lats, lons = grb.latlons()
+                    break
+            grbs.close()
+            if refc is None:
+                return row_key, {}
+            lons_n = np.where(lons > 180, lons - 360.0, lons)
+            for sid, c in all_coords.items():
+                dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
+                iy, ix = np.unravel_index(np.argmin(dist), dist.shape)
+                y0, y1 = max(0, iy - ncells), min(refc.shape[0], iy + ncells + 1)
+                x0, x1 = max(0, ix - ncells), min(refc.shape[1], ix + ncells + 1)
+                nb = refc[y0:y1, x0:x1]
+                out[sid] = round(float(np.max(nb)) if nb.size else float(refc[iy, ix]), 1)
+            return row_key, out
+        except Exception as e:
+            logging.debug(f"REFC f{fh:02d} failed: {e}")
+            return row_key, {}
+        finally:
+            if os.path.exists(local):
+                try: os.remove(local)
+                except Exception: pass
+
+    matrix = {sid: {} for sid in all_coords}
+    tasks = []
+    for fh in range(1, max_fh + 1):
+        valid = cycle_init + datetime.timedelta(hours=fh)
+        tasks.append((fh, f"{valid.day:02d}/{valid.hour:02d}"))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        futs = [ex.submit(_worker, fh, rk) for fh, rk in tasks]
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                rk, site_vals = fut.result()
+                for sid, v in site_vals.items():
+                    matrix[sid][rk] = v
+            except Exception:
+                pass
+
+    total = sum(len(v) for v in matrix.values())
+    hits = sum(1 for s in matrix.values() for v in s.values() if v is not None and v >= CONVECTIVE_DBZ)
+    logging.info(f"Convective mask: REFC for {total} site-hours; {hits} exceed {CONVECTIVE_DBZ:.0f} dBZ "
+                 f"(neighborhood {CONVECTIVE_NBR_NM:.0f} nm / {ncells} cells).")
+    return matrix
+
+
 def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_rows, pad_matrix=None):
     href_lightning, href_maps = fetch_href_lightning(time_rows)
 
@@ -2045,6 +2206,32 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     if pad_matrix:
         for pid, model_data in pad_matrix.items():
             combined_data[pid] = model_data
+
+    # Convective (cumulus/anvil) mask: tag site-hours where HRRR composite reflectivity shows a
+    # convective core within ~10 nm, so the Thick Cloud Layer / Max Layer Thickness fields read as
+    # cu/anvil-governed (their own LLCC rules) rather than a stratiform thick-cloud bust. HRRR is
+    # the convection truth source and the tag is applied across every model column for that
+    # site-hour; the underlying thickness values are preserved so nothing is lost.
+    if CONVECTIVE_MASK_ENABLED:
+        try:
+            refc = fetch_convective_reflectivity(time_rows)
+            tagged = 0
+            for sid, hours in (refc or {}).items():
+                site_models = combined_data.get(sid)
+                if not site_models:
+                    continue
+                for row_key, dbz in hours.items():
+                    conv = (dbz is not None and dbz >= CONVECTIVE_DBZ)
+                    for _model, mrows in site_models.items():
+                        p = mrows.get(row_key) if isinstance(mrows, dict) else None
+                        if isinstance(p, dict):
+                            p["refc_nbr"] = dbz
+                            if conv:
+                                p["convective"] = True
+                                tagged += 1
+            logging.info(f"Convective mask applied: {tagged} site-hour-model cells tagged convective.")
+        except Exception as e:
+            logging.error(f"Convective mask failed, continuing without it: {e}")
 
     current_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     current_entry = {
