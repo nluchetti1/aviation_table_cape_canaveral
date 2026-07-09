@@ -2269,21 +2269,24 @@ def fetch_refs_echotop_probs():
             r = session.get(url + ".idx", timeout=15)
             if r.status_code != 200:
                 return row_key, {}
-            entries = _parse_idx(r.text)
-            # Robust echo-top message match: the wgrib2 abbrev (RETOP/ETOP/echo) OR any idx line
-            # carrying one of the known threshold heights. pygrib's PDT-4.9 upperLimit is the
-            # authoritative threshold once downloaded, so a loose idx match is safe here.
+            entries = _parse_grib_idx(r.text)
+            # One-shot diagnostic: on the first hour that returns a populated idx, dump the field
+            # inventory so we can see the actual echo-top abbreviation/format instead of guessing.
+            if not logged_idx["done"]:
+                logged_idx["done"] = True
+                uniq = sorted({e["short"] for e in entries})
+                etlines = [f"{e['short']}:{e['level']}" for e in entries
+                           if "TOP" in e["short"].upper() or "ETOP" in e["short"].upper()
+                           or "ECHO" in f"{e['short']} {e['level']}".upper()]
+                logging.info(f"[REFS CUMULUS DEBUG] f{fh:02d} idx: {len(entries)} msgs; distinct shorts: {uniq[:40]}")
+                logging.info(f"[REFS CUMULUS DEBUG] echo-top-ish idx lines: {etlines[:12] or 'NONE'}")
+            # Match echo-top messages: wgrib2 abbrev (RETOP/ETOP/echo) in the short/level fields.
             cand = []
             for e in entries:
                 blob = f"{e['short']} {e['level']}".upper()
-                if "RETOP" in blob or "ETOP" in blob or "ECHO" in blob or any(ts in blob for ts in th_strs):
+                if "RETOP" in blob or "ETOP" in blob or "ECHO" in blob:
                     cand.append(e)
             if not cand:
-                if not logged_idx["done"]:
-                    logged_idx["done"] = True
-                    sample = " | ".join(f"{e['short']}:{e['level']}" for e in entries[:12])
-                    logging.warning(f"[REFS CUMULUS DEBUG] no echo-top msgs matched in idx f{fh:02d}. "
-                                    f"First idx fields: {sample}")
                 return row_key, {}
             with open(local, "wb") as fhh:
                 for e in cand:
@@ -2296,10 +2299,10 @@ def fetch_refs_echotop_probs():
             grbs = pygrib.open(local)
             grids = {}
             lats = lons = None
+            dbg_msgs = []
             for grb in grbs:
                 nm = (getattr(grb, "name", "") or "").lower()
-                if "echo" not in nm and "top" not in nm and "retop" not in nm:
-                    continue
+                sn = (getattr(grb, "shortName", "") or "").lower()
                 thr = None
                 for attr in ("upperLimit", "scaledValueOfUpperLimit"):
                     try:
@@ -2307,6 +2310,10 @@ def fetch_refs_echotop_probs():
                         break
                     except (TypeError, ValueError, AttributeError):
                         continue
+                if not logged_idx.get("parsed"):
+                    dbg_msgs.append(f"name='{nm}' short='{sn}' upperLimit={thr}")
+                if "echo" not in nm and "top" not in nm and "retop" not in sn and "retop" not in nm:
+                    continue
                 if thr is None:
                     continue
                 thr_snap = min(REFS_ECHOTOP_THRESHOLDS_M, key=lambda t: abs(t - thr))
@@ -2319,6 +2326,10 @@ def fetch_refs_echotop_probs():
                 if lats is None:
                     lats, lons = grb.latlons()
             grbs.close()
+            if not logged_idx.get("parsed"):
+                logged_idx["parsed"] = True
+                logging.info(f"[REFS CUMULUS DEBUG] f{fh:02d} downloaded {len(cand)} cand msgs; "
+                             f"parsed: {dbg_msgs[:8]}; matched thresholds: {sorted(grids.keys())}")
             if not grids or lats is None:
                 return row_key, {}
             lons_n = np.where(lons > 180, lons - 360.0, lons)
