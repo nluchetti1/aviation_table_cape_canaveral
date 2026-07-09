@@ -2221,9 +2221,34 @@ def fetch_refs_echotop_probs():
     session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=3))
     session.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"})
 
-    date_str, cycle = _rrfs_determine_cycle(session, "refs")
+    # Discover the newest cycle whose PROB files are actually posted. The ensemble prob products
+    # lag the ensemble mean, so we must NOT reuse the mean's cycle (that probed a not-yet-posted
+    # 12z prob and every .idx 404'd silently). Probe the prob .idx directly, newest-first, and log
+    # the outcome so a genuine "no .idx sidecar" case is distinguishable from "not posted yet".
+    now = datetime.datetime.now(datetime.timezone.utc)
+    date_str = cycle = None
+    for back in range(0, 48):
+        cand = now - datetime.timedelta(hours=back)
+        if cand.hour not in (0, 6, 12, 18):
+            continue
+        d, cc = cand.strftime("%Y%m%d"), f"{cand.hour:02d}"
+        for probe_fh in (4, 6, 8, 12):
+            purl = (f"{RRFS_AWS_ROOT}/rrfs_a/refs.{d}/{cc}/enspost/"
+                    f"refs.t{cc}z.prob.f{probe_fh:02d}.conus.grib2.idx")
+            try:
+                r = session.get(purl, timeout=12)
+                if r.status_code == 200 and len(r.text) > 50:
+                    date_str, cycle = d, cc
+                    logging.info(f"REFS cumulus: prob files resolved at {d} {cc}z (f{probe_fh:02d} .idx ok).")
+                    break
+                logging.debug(f"REFS cumulus probe {d} {cc}z f{probe_fh:02d}: HTTP {r.status_code}")
+            except Exception as e:
+                logging.debug(f"REFS cumulus probe {d} {cc}z f{probe_fh:02d} error: {e}")
+        if cycle:
+            break
     if not cycle:
-        logging.warning("REFS cumulus: no REFS cycle available on AWS.")
+        logging.warning("REFS cumulus: no REFS PROB cycle with an .idx found on AWS "
+                        "(prob files may not be posted yet, or lack .idx sidecars).")
         return {}
     cycle_init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
     logging.info(f"REFS cumulus: echo-top probs from {date_str} {cycle}z")
