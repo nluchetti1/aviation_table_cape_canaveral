@@ -2297,12 +2297,13 @@ def fetch_refs_echotop_probs():
             if os.path.getsize(local) == 0:
                 return row_key, {}
             grbs = pygrib.open(local)
-            grids = {}
+            raw_grids = {}
             lats = lons = None
             dbg_msgs = []
             for grb in grbs:
-                nm = (getattr(grb, "name", "") or "").lower()
-                sn = (getattr(grb, "shortName", "") or "").lower()
+                # We byte-ranged ONLY the RETOP echo-top messages, so every message here is echo
+                # top — pygrib reports RETOP's name/short as 'unknown' for this NCEP-local encoding,
+                # so we key purely off the PDT-4.9 upperLimit (which decodes correctly).
                 thr = None
                 for attr in ("upperLimit", "scaledValueOfUpperLimit"):
                     try:
@@ -2311,25 +2312,26 @@ def fetch_refs_echotop_probs():
                     except (TypeError, ValueError, AttributeError):
                         continue
                 if not logged_idx.get("parsed"):
-                    dbg_msgs.append(f"name='{nm}' short='{sn}' upperLimit={thr}")
-                if "echo" not in nm and "top" not in nm and "retop" not in sn and "retop" not in nm:
-                    continue
+                    dbg_msgs.append(f"upperLimit={thr}")
                 if thr is None:
                     continue
                 thr_snap = min(REFS_ECHOTOP_THRESHOLDS_M, key=lambda t: abs(t - thr))
                 if abs(thr_snap - thr) > 250:  # not one of our thresholds
                     continue
-                arr = _sanitize_grid(grb.values)
-                if arr.size and arr.max() <= 1.0:  # 0-1 fraction -> percent
-                    arr = arr * 100.0
-                grids[thr_snap] = arr
+                raw_grids[thr_snap] = _sanitize_grid(grb.values)
                 if lats is None:
                     lats, lons = grb.latlons()
             grbs.close()
+            # Decide fraction-vs-percent once across all thresholds (a genuinely low field would
+            # trip a per-grid max<=1 test), then clamp to 0-100.
+            gmax = max((g.max() for g in raw_grids.values() if g.size), default=0.0)
+            scale = 100.0 if gmax <= 1.0 else 1.0
+            grids = {th: np.clip(g * scale, 0.0, 100.0) for th, g in raw_grids.items()}
             if not logged_idx.get("parsed"):
                 logged_idx["parsed"] = True
                 logging.info(f"[REFS CUMULUS DEBUG] f{fh:02d} downloaded {len(cand)} cand msgs; "
-                             f"parsed: {dbg_msgs[:8]}; matched thresholds: {sorted(grids.keys())}")
+                             f"parsed: {dbg_msgs[:8]}; matched thresholds: {sorted(grids.keys())}; "
+                             f"raw max={gmax:.4g} -> scale x{scale:g}")
             if not grids or lats is None:
                 return row_key, {}
             lons_n = np.where(lons > 180, lons - 360.0, lons)
