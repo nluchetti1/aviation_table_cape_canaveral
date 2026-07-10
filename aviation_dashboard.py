@@ -6,6 +6,7 @@ import os
 import re
 import requests
 import concurrent.futures
+import threading
 import logging
 import pygrib
 import numpy as np
@@ -2298,6 +2299,15 @@ def fetch_refs_echotop_probs():
     ncells10 = max(1, round((REFS_CUMULUS_RADII_NM['neg20'] * 1.852) / 3.0))  # ~6 cells (10 nm @ 3 km)
     logged_idx = {"done": False}
 
+    # Spread accumulator for the reducer-choice diagnostic. We record (point, p90, max) at the
+    # 20-kft threshold for EVERY site-hour, then summarize once after the run. A single one-shot
+    # sample is useless here: it tends to land on an early-morning hour with no convection where
+    # every reducer reads 0. The aggregate below instead answers "is the field spiky (max >> point
+    # -> keep p90) or already smooth/NMEP (all close -> switch reducer to 'point')?" using the
+    # afternoon boxes that actually carry signal.
+    nbr_spread = []            # list of (sid, row_key, point, p90, mx, ncells)
+    nbr_lock = threading.Lock()
+
     def _prob_url(fh):
         return (f"{RRFS_AWS_ROOT}/rrfs_a/refs.{date_str}/{cycle}/enspost/"
                 f"refs.t{cycle}z.prob.f{fh:02d}.conus.grib2")
@@ -2380,20 +2390,19 @@ def fetch_refs_echotop_probs():
                 dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
                 iy, ix = np.unravel_index(np.argmin(dist), dist.shape)
 
-                # One-shot: show the point-vs-neighborhood spread at the 20-kft threshold so the
-                # reducer choice (point vs p90 vs max) can be made from real numbers, not a guess.
-                # If point ~= p90 ~= max, the field is already smooth/NMEP -> switch reducer to
-                # 'point'. If point << max, the spatial max was the inflator and p90 tames it.
-                if not logged_idx.get("nbr") and 6096 in grids:
-                    logged_idx["nbr"] = True
+                # Record the point-vs-neighborhood spread at the 20-kft threshold for this
+                # site-hour so the reducer choice can be made from the aggregate after the run,
+                # rather than from whichever hour happens to finish first (usually a 0-convection
+                # morning box where every reducer reads 0 and tells us nothing).
+                if 6096 in grids:
                     a = grids[6096]
                     yy0, yy1 = max(0, iy - ncells5), min(a.shape[0], iy + ncells5 + 1)
                     xx0, xx1 = max(0, ix - ncells5), min(a.shape[1], ix + ncells5 + 1)
                     b = a[yy0:yy1, xx0:xx1]
-                    logging.info(f"[REFS CUMULUS DEBUG] {sid} 5nm box P(top>20kft): "
-                                 f"point={float(a[iy, ix]):.0f} p50={np.percentile(b, 50):.0f} "
-                                 f"p90={np.percentile(b, 90):.0f} max={np.max(b):.0f} "
-                                 f"({b.size} cells) -> using '{REFS_CUMULUS_NBR_REDUCER}'")
+                    if b.size:
+                        with nbr_lock:
+                            nbr_spread.append((sid, row_key, float(a[iy, ix]),
+                                               float(np.percentile(b, 90)), float(np.max(b)), b.size))
 
                 c5, c10 = {}, {}
                 for th, arr in grids.items():
@@ -2425,6 +2434,25 @@ def fetch_refs_echotop_probs():
                 pass
     got = sum(len(v) for v in matrix.values())
     logging.info(f"REFS cumulus: echo-top prob curves for {got} site-hours.")
+
+    # Reducer-choice diagnostic. Summarize the point-vs-max spread over site-hours that actually
+    # carry convective signal (max>0). If mean(max) sits well above mean(point), the old spatial
+    # MAX was inflating and 'p90' is the right robust middle. If point ~= p90 ~= max on the active
+    # boxes, the field is already smooth/NMEP -> flip REFS_CUMULUS_NBR_REDUCER to 'point'.
+    active = [row for row in nbr_spread if row[4] > 0]
+    if active:
+        n = len(active)
+        mp = sum(r[2] for r in active) / n
+        m9 = sum(r[3] for r in active) / n
+        mx = sum(r[4] for r in active) / n
+        worst = max(active, key=lambda r: r[4] - r[2])   # biggest max-minus-point gap
+        logging.info(f"[REFS CUMULUS DEBUG] 20kft spread over {n}/{len(nbr_spread)} active boxes "
+                     f"(max>0): mean point={mp:.0f} p90={m9:.0f} max={mx:.0f}; "
+                     f"widest gap {worst[0]} {worst[1]} point={worst[2]:.0f} "
+                     f"p90={worst[3]:.0f} max={worst[4]:.0f} -> reducer='{REFS_CUMULUS_NBR_REDUCER}'")
+    else:
+        logging.info(f"[REFS CUMULUS DEBUG] no active (max>0) 20kft boxes across "
+                     f"{len(nbr_spread)} site-hours this cycle; nothing convective to sample.")
     return matrix
 
 
