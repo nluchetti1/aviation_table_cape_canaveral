@@ -52,7 +52,7 @@ CONVECTIVE_NBR_NM = 5.0   # neighborhood radius (nautical miles) sampled around 
 
 # ---- REFS Cumulus Cloud LLCC probabilities (durable ensemble-product path) ----
 # Uses the pre-computed REFS echo-top exceedance probabilities P(echo top > {6096,9144,10668,
-# 12192,15240} m) from the ensemble prob file, neighborhood-maxed within the LLCC radii and
+# 12192,15240} m) from the ensemble prob file, neighborhood-reduced within the LLCC radii and
 # interpolated at the REFS-mean isotherm heights, to express the Cumulus Cloud STANDOFF rules:
 #   Rule a: P(top >= -20C altitude) within 10 NM
 #   Rule b: P(top >= -10C altitude) within  5 NM
@@ -61,6 +61,18 @@ CONVECTIVE_NBR_NM = 5.0   # neighborhood radius (nautical miles) sampled around 
 REFS_CUMULUS_ENABLED = True
 REFS_ECHOTOP_THRESHOLDS_M = [6096, 9144, 10668, 12192, 15240]  # 20/30/35/40/50 kft
 REFS_CUMULUS_RADII_NM = {"neg10": 5.0, "neg20": 10.0}
+
+# How to collapse the echo-top exceedance probability over the standoff box. The RETOP prob grid
+# is ALREADY a REFS ensemble exceedance probability P(top > H) per gridpoint (member fraction),
+# so a spatial MAX does NOT give "probability within the radius" — it returns the single hottest
+# cell in the box, which saturates to ~100% on any convective Florida afternoon (this was the
+# "values far too high" bug). Options:
+#   "point"     : site gridpoint only (correct if the field is already NMEP — radius baked in)
+#   "p90"/"p75" : that percentile over the standoff box (robust stand-in for "widespread high
+#                 probability within the radius" when the field is a POINT probability / NEP)
+#   "mean"      : neighborhood-average probability
+#   "max"       : legacy behavior, kept for comparison only (over-states — do not ship)
+REFS_CUMULUS_NBR_REDUCER = "p90"
 
 
 STN_COORDS = {
@@ -208,7 +220,7 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
 
     try:
         grbs = pygrib.open(filepath)
-        
+
         # Grid Point Index Optimization
         if stn in _GRID_INDEX_CACHE:
             y_idx, x_idx = _GRID_INDEX_CACHE[stn]
@@ -257,7 +269,7 @@ def extract_lightning_from_file(filepath, lat, lon, stn):
                 logging.info(f"[LTG DIAG] {stn.upper()} msg#{msg_idx}: median_cell={raw_cell:.6g} "
                              f"single_cell={float(arr[y_idx, x_idx]):.6g} grid_max={arr.max():.6g} "
                              f"scale={scale:g} -> {val}% | {str(grb)[:100]}")
-            
+
             if "upperlimit=25" in msg_str or "prob > 0.25" in msg_str or "probability=25" in msg_str:
                 threshold_results["p25"] = val
             elif "upperlimit=50" in msg_str or "prob > 0.50" in msg_str or "probability=50" in msg_str:
@@ -615,7 +627,7 @@ def fetch_href_lightning_point(session, stn, lat, lon, date_str, cycle, f_hour_i
                         f.write(chunk)
 
                 vals = extract_lightning_from_file(local_path, lat, lon, stn)
-                
+
                 if os.path.exists(local_path):
                     os.remove(local_path)
                 return stn, vals
@@ -982,7 +994,7 @@ def fetch_href_lightning(time_keys):
     for days_back in [0, 1]:
         check_date = now_utc - datetime.timedelta(days=days_back)
         date_str = check_date.strftime("%Y%m%d")
-        
+
         for cycle in ["12", "00"]:
             test_url = (
                 f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/spc_post/prod/"
@@ -1055,12 +1067,12 @@ def fetch_href_lightning(time_keys):
                 stn_hits += 1
                 total_signals += 1
                 max_p25 = max(max_p25, thresh_vals["p25"])
-        
+
         if stn_hits > 0:
             logging.info(f"  {stn.upper()} -> Processed {stn_hits} intervals with active lightning signals (Max p25: {max_p25}%)")
         else:
             logging.info(f"  {stn.upper()} -> All 48 forecast intervals returned flat 0%")
-            
+
     logging.info(f"Audit Complete: Cleanly tracked {total_signals} total non-zero cell vectors.")
     logging.info("=============================================")
 
@@ -2204,11 +2216,39 @@ def _interp_exceedance(curve, height_m):
     return curve[ths[-1]], "cap"
 
 
+def _reduce_neighborhood(arr, iy, ix, ncells, method):
+    """Collapse a probability grid over a (2*ncells+1)^2 box centered on (iy, ix) using the
+    configured reducer. The RETOP prob grid is ALREADY a REFS ensemble exceedance probability
+    per gridpoint, so a spatial MAX doesn't mean "probability within the radius" — it just
+    returns the single hottest cell, which saturates to ~100% on convective days. A high
+    percentile (p90) is a robust stand-in for "widespread high probability within the radius".
+    Falls back to the point value on an empty box or a bad method string."""
+    y0, y1 = max(0, iy - ncells), min(arr.shape[0], iy + ncells + 1)
+    x0, x1 = max(0, ix - ncells), min(arr.shape[1], ix + ncells + 1)
+    box = arr[y0:y1, x0:x1]
+    if box.size == 0:
+        return round(float(arr[iy, ix]), 1)
+    if method == "point":
+        return round(float(arr[iy, ix]), 1)
+    if method == "mean":
+        return round(float(np.mean(box)), 1)
+    if method == "max":
+        return round(float(np.max(box)), 1)
+    if method.startswith("p"):
+        try:
+            return round(float(np.percentile(box, float(method[1:]))), 1)
+        except (ValueError, IndexError):
+            pass
+    return round(float(arr[iy, ix]), 1)
+
+
 def fetch_refs_echotop_probs():
     """Pull REFS pre-computed echo-top exceedance probabilities P(echo top > {6096..15240} m)
-    from the ensemble prob file, and return the neighborhood-max probability curve within 5 nm
-    and 10 nm of each site: {site_id: {row_key: {"c5": {thr_m: pct}, "c10": {thr_m: pct}}}}.
-    Durable (survives the Aug-2026 HREF->REFS cutover, products not members). Empty on failure."""
+    from the ensemble prob file. The RETOP messages ARE the ensemble member-fraction already;
+    we collapse them over the LLCC standoff radii (5 nm / 10 nm) with a configurable reducer
+    (REFS_CUMULUS_NBR_REDUCER) rather than a spatial MAX, which saturated to ~100% on any
+    convective afternoon (the "values far too high" bug).
+    Returns {site_id: {row_key: {"c5": {thr_m: pct}, "c10": {thr_m: pct}}}}. Empty on failure."""
     if not REFS_CUMULUS_ENABLED:
         return {}
     all_coords = {}
@@ -2251,11 +2291,11 @@ def fetch_refs_echotop_probs():
                         "(prob files may not be posted yet, or lack .idx sidecars).")
         return {}
     cycle_init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
-    logging.info(f"REFS cumulus: echo-top probs from {date_str} {cycle}z")
+    logging.info(f"REFS cumulus: echo-top probs from {date_str} {cycle}z "
+                 f"(neighborhood reducer = '{REFS_CUMULUS_NBR_REDUCER}')")
 
     ncells5 = max(1, round((REFS_CUMULUS_RADII_NM['neg10'] * 1.852) / 3.0))   # ~3 cells (5 nm @ 3 km)
     ncells10 = max(1, round((REFS_CUMULUS_RADII_NM['neg20'] * 1.852) / 3.0))  # ~6 cells (10 nm @ 3 km)
-    th_strs = [str(t) for t in REFS_ECHOTOP_THRESHOLDS_M]
     logged_idx = {"done": False}
 
     def _prob_url(fh):
@@ -2339,14 +2379,26 @@ def fetch_refs_echotop_probs():
             for sid, c in all_coords.items():
                 dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
                 iy, ix = np.unravel_index(np.argmin(dist), dist.shape)
+
+                # One-shot: show the point-vs-neighborhood spread at the 20-kft threshold so the
+                # reducer choice (point vs p90 vs max) can be made from real numbers, not a guess.
+                # If point ~= p90 ~= max, the field is already smooth/NMEP -> switch reducer to
+                # 'point'. If point << max, the spatial max was the inflator and p90 tames it.
+                if not logged_idx.get("nbr") and 6096 in grids:
+                    logged_idx["nbr"] = True
+                    a = grids[6096]
+                    yy0, yy1 = max(0, iy - ncells5), min(a.shape[0], iy + ncells5 + 1)
+                    xx0, xx1 = max(0, ix - ncells5), min(a.shape[1], ix + ncells5 + 1)
+                    b = a[yy0:yy1, xx0:xx1]
+                    logging.info(f"[REFS CUMULUS DEBUG] {sid} 5nm box P(top>20kft): "
+                                 f"point={float(a[iy, ix]):.0f} p50={np.percentile(b, 50):.0f} "
+                                 f"p90={np.percentile(b, 90):.0f} max={np.max(b):.0f} "
+                                 f"({b.size} cells) -> using '{REFS_CUMULUS_NBR_REDUCER}'")
+
                 c5, c10 = {}, {}
                 for th, arr in grids.items():
-                    y0, y1 = max(0, iy - ncells5), min(arr.shape[0], iy + ncells5 + 1)
-                    x0, x1 = max(0, ix - ncells5), min(arr.shape[1], ix + ncells5 + 1)
-                    c5[th] = round(float(np.max(arr[y0:y1, x0:x1])), 1)
-                    y0, y1 = max(0, iy - ncells10), min(arr.shape[0], iy + ncells10 + 1)
-                    x0, x1 = max(0, ix - ncells10), min(arr.shape[1], ix + ncells10 + 1)
-                    c10[th] = round(float(np.max(arr[y0:y1, x0:x1])), 1)
+                    c5[th] = _reduce_neighborhood(arr, iy, ix, ncells5, REFS_CUMULUS_NBR_REDUCER)
+                    c10[th] = _reduce_neighborhood(arr, iy, ix, ncells10, REFS_CUMULUS_NBR_REDUCER)
                 out[sid] = {"c5": c5, "c10": c10}
             return row_key, out
         except Exception as e:
@@ -2537,7 +2589,7 @@ def run_pipeline():
     for row in time_rows:
         try:
             d_part, h_part = map(int, row.split("/"))
-            if d_part < now_utc.day and now_utc.day - d_part < 25: 
+            if d_part < now_utc.day and now_utc.day - d_part < 25:
                 continue
             if d_part == now_utc.day and h_part < now_utc.hour:
                 continue
