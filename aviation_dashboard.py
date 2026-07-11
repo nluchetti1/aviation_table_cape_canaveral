@@ -68,12 +68,18 @@ REFS_CUMULUS_RADII_NM = {"neg10": 5.0, "neg20": 10.0}
 # so a spatial MAX does NOT give "probability within the radius" — it returns the single hottest
 # cell in the box, which saturates to ~100% on any convective Florida afternoon (this was the
 # "values far too high" bug). Options:
-#   "point"     : site gridpoint only (correct if the field is already NMEP — radius baked in)
-#   "p90"/"p75" : that percentile over the standoff box (robust stand-in for "widespread high
-#                 probability within the radius" when the field is a POINT probability / NEP)
-#   "mean"      : neighborhood-average probability
-#   "max"       : legacy behavior, kept for comparison only (over-states — do not ship)
-REFS_CUMULUS_NBR_REDUCER = "p90"
+# How to collapse the echo-top exceedance probability over the standoff RING (a true circular
+# radius, not a square box — see _ring_reduce). The RETOP prob grid is a REFS ensemble exceedance
+# probability P(top > H) per gridpoint; the LLCC Cumulus rule cares whether a qualifying cloud
+# top exists ANYWHERE within the standoff radius, so 'max' is the literal operation. (An earlier
+# worry that 'max' saturates to ~100% did not hold up: the field is well-behaved — cross-checked
+# against NOAA/GSL DESI REFS-CONUS echo-top prob, the Cape reads nil-to-low when it should, and
+# the in-ring max peaked near 58% on a convective afternoon, not 100%.) Options:
+#   "max"       : highest P(top > H) anywhere in the ring — the LCC "within X nm" operation
+#   "point"     : pad gridpoint only (ignores the radius; use only to match a point viewer)
+#   "mean"      : areal-average exceedance in the ring (less conservative than a go/no-go wants)
+#   "p90"/"p75" : percentile in the ring (reads above the pad point on convective days)
+REFS_CUMULUS_NBR_REDUCER = "max"
 
 
 STN_COORDS = {
@@ -2217,30 +2223,40 @@ def _interp_exceedance(curve, height_m):
     return curve[ths[-1]], "cap"
 
 
-def _reduce_neighborhood(arr, iy, ix, ncells, method):
-    """Collapse a probability grid over a (2*ncells+1)^2 box centered on (iy, ix) using the
-    configured reducer. The RETOP prob grid is ALREADY a REFS ensemble exceedance probability
-    per gridpoint, so a spatial MAX doesn't mean "probability within the radius" — it just
-    returns the single hottest cell, which saturates to ~100% on convective days. A high
-    percentile (p90) is a robust stand-in for "widespread high probability within the radius".
-    Falls back to the point value on an empty box or a bad method string."""
-    y0, y1 = max(0, iy - ncells), min(arr.shape[0], iy + ncells + 1)
-    x0, x1 = max(0, ix - ncells), min(arr.shape[1], ix + ncells + 1)
-    box = arr[y0:y1, x0:x1]
-    if box.size == 0:
+def _ring_reduce(arr, lats, lons_n, clat, clon, iy, ix, radius_nm, method, half=18):
+    """Collapse a probability grid over all cells within radius_nm of (clat, clon) — a TRUE
+    circular ring, not a square box. This is the literal LCC "within X nm" operation: for the
+    default 'max' it answers "does ANY cell within the standoff radius carry a high echo-top
+    probability." A cropped (2*half+1) window around the nearest cell keeps it cheap, and the
+    ring is defined by actual great-circle-ish distance so it does NOT assume a 3 km grid — if
+    the enspost prob grid is a different spacing, the radius stays honest.
+    method: 'max' (default LCC operation) | 'point' | 'mean' | 'p90'/'p75' | ...
+    Falls back to the point value if no cell lands inside the radius."""
+    y0, y1 = max(0, iy - half), min(arr.shape[0], iy + half + 1)
+    x0, x1 = max(0, ix - half), min(arr.shape[1], ix + half + 1)
+    sub = arr[y0:y1, x0:x1]
+    slat = lats[y0:y1, x0:x1]
+    slon = lons_n[y0:y1, x0:x1]
+    # equirectangular km distance — accurate to well under a cell at 5-10 nm scales
+    dx = (slon - clon) * 111.320 * math.cos(math.radians(clat))
+    dy = (slat - clat) * 110.574
+    dkm = np.sqrt(dx * dx + dy * dy)
+    ring = dkm <= (radius_nm * 1.852)
+    if not ring.any():
         return round(float(arr[iy, ix]), 1)
+    vals = sub[ring]
     if method == "point":
         return round(float(arr[iy, ix]), 1)
     if method == "mean":
-        return round(float(np.mean(box)), 1)
+        return round(float(np.mean(vals)), 1)
     if method == "max":
-        return round(float(np.max(box)), 1)
+        return round(float(np.max(vals)), 1)
     if method.startswith("p"):
         try:
-            return round(float(np.percentile(box, float(method[1:]))), 1)
+            return round(float(np.percentile(vals, float(method[1:]))), 1)
         except (ValueError, IndexError):
             pass
-    return round(float(arr[iy, ix]), 1)
+    return round(float(np.max(vals)), 1)
 
 
 def fetch_refs_echotop_probs():
@@ -2295,17 +2311,17 @@ def fetch_refs_echotop_probs():
     logging.info(f"REFS cumulus: echo-top probs from {date_str} {cycle}z "
                  f"(neighborhood reducer = '{REFS_CUMULUS_NBR_REDUCER}')")
 
-    ncells5 = max(1, round((REFS_CUMULUS_RADII_NM['neg10'] * 1.852) / 3.0))   # ~3 cells (5 nm @ 3 km)
-    ncells10 = max(1, round((REFS_CUMULUS_RADII_NM['neg20'] * 1.852) / 3.0))  # ~6 cells (10 nm @ 3 km)
+    r5_nm = REFS_CUMULUS_RADII_NM['neg10']    # 5 nm standoff ring for the -10C column
+    r10_nm = REFS_CUMULUS_RADII_NM['neg20']   # 10 nm standoff ring for the -20C column
     logged_idx = {"done": False}
 
-    # Spread accumulator for the reducer-choice diagnostic. We record (point, p90, max) at the
-    # 20-kft threshold for EVERY site-hour, then summarize once after the run. A single one-shot
-    # sample is useless here: it tends to land on an early-morning hour with no convection where
-    # every reducer reads 0. The aggregate below instead answers "is the field spiky (max >> point
-    # -> keep p90) or already smooth/NMEP (all close -> switch reducer to 'point')?" using the
-    # afternoon boxes that actually carry signal.
-    nbr_spread = []            # list of (sid, row_key, point, p90, mx, ncells)
+    # Spread accumulator for the reducer/verification diagnostic. For every site-hour we record
+    # the pad point value and the in-ring max at the 20-kft threshold (5 nm ring), then summarize
+    # once after the run. This lets the dashboard be cross-checked against the DESI REFS-CONUS
+    # echo-top prob field: at a known valid time the in-ring max at the Cape should track what
+    # DESI shows within ~5 nm. point vs max also shows how much the "within X nm" ring is adding
+    # over the bare pad value.
+    nbr_spread = []            # list of (sid, row_key, point, ring_p90, ring_max, ncells)
     nbr_lock = threading.Lock()
 
     def _prob_url(fh):
@@ -2390,24 +2406,24 @@ def fetch_refs_echotop_probs():
                 dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
                 iy, ix = np.unravel_index(np.argmin(dist), dist.shape)
 
-                # Record the point-vs-neighborhood spread at the 20-kft threshold for this
-                # site-hour so the reducer choice can be made from the aggregate after the run,
-                # rather than from whichever hour happens to finish first (usually a 0-convection
-                # morning box where every reducer reads 0 and tells us nothing).
+                # Record pad-point vs in-ring stats at the 20-kft threshold (5 nm ring) for this
+                # site-hour, for the post-run summary and DESI cross-check. Uses the same true
+                # circular ring as the actual columns, so the diagnostic and the shipped value
+                # agree by construction.
                 if 6096 in grids:
                     a = grids[6096]
-                    yy0, yy1 = max(0, iy - ncells5), min(a.shape[0], iy + ncells5 + 1)
-                    xx0, xx1 = max(0, ix - ncells5), min(a.shape[1], ix + ncells5 + 1)
-                    b = a[yy0:yy1, xx0:xx1]
-                    if b.size:
-                        with nbr_lock:
-                            nbr_spread.append((sid, row_key, float(a[iy, ix]),
-                                               float(np.percentile(b, 90)), float(np.max(b)), b.size))
+                    pt = _ring_reduce(a, lats, lons_n, c["lat"], c["lon"], iy, ix, r5_nm, "point")
+                    rp90 = _ring_reduce(a, lats, lons_n, c["lat"], c["lon"], iy, ix, r5_nm, "p90")
+                    rmax = _ring_reduce(a, lats, lons_n, c["lat"], c["lon"], iy, ix, r5_nm, "max")
+                    with nbr_lock:
+                        nbr_spread.append((sid, row_key, pt, rp90, rmax, 0))
 
                 c5, c10 = {}, {}
                 for th, arr in grids.items():
-                    c5[th] = _reduce_neighborhood(arr, iy, ix, ncells5, REFS_CUMULUS_NBR_REDUCER)
-                    c10[th] = _reduce_neighborhood(arr, iy, ix, ncells10, REFS_CUMULUS_NBR_REDUCER)
+                    c5[th] = _ring_reduce(arr, lats, lons_n, c["lat"], c["lon"], iy, ix,
+                                          r5_nm, REFS_CUMULUS_NBR_REDUCER)
+                    c10[th] = _ring_reduce(arr, lats, lons_n, c["lat"], c["lon"], iy, ix,
+                                           r10_nm, REFS_CUMULUS_NBR_REDUCER)
                 out[sid] = {"c5": c5, "c10": c10}
             return row_key, out
         except Exception as e:
@@ -2435,24 +2451,30 @@ def fetch_refs_echotop_probs():
     got = sum(len(v) for v in matrix.values())
     logging.info(f"REFS cumulus: echo-top prob curves for {got} site-hours.")
 
-    # Reducer-choice diagnostic. Summarize the point-vs-max spread over site-hours that actually
-    # carry convective signal (max>0). If mean(max) sits well above mean(point), the old spatial
-    # MAX was inflating and 'p90' is the right robust middle. If point ~= p90 ~= max on the active
-    # boxes, the field is already smooth/NMEP -> flip REFS_CUMULUS_NBR_REDUCER to 'point'.
+    # Verification diagnostic. Summarize pad-point vs in-ring stats at 20 kft over the site-hours
+    # that carry signal (ring max > 0), so the shipped 'max' column can be cross-checked against
+    # DESI at a known valid time. Also surface the KXMR (Cape) ring max explicitly, since that's
+    # the site being compared against the DESI echo-top prob field.
     active = [row for row in nbr_spread if row[4] > 0]
     if active:
         n = len(active)
         mp = sum(r[2] for r in active) / n
         m9 = sum(r[3] for r in active) / n
         mx = sum(r[4] for r in active) / n
-        worst = max(active, key=lambda r: r[4] - r[2])   # biggest max-minus-point gap
-        logging.info(f"[REFS CUMULUS DEBUG] 20kft spread over {n}/{len(nbr_spread)} active boxes "
-                     f"(max>0): mean point={mp:.0f} p90={m9:.0f} max={mx:.0f}; "
-                     f"widest gap {worst[0]} {worst[1]} point={worst[2]:.0f} "
-                     f"p90={worst[3]:.0f} max={worst[4]:.0f} -> reducer='{REFS_CUMULUS_NBR_REDUCER}'")
+        hottest = max(active, key=lambda r: r[4])   # single hottest in-ring max, with its hour
+        logging.info(f"[REFS CUMULUS DEBUG] 20kft over {n}/{len(nbr_spread)} active site-hours "
+                     f"(ring max>0): mean point={mp:.0f} p90={m9:.0f} ring-max={mx:.0f}; "
+                     f"hottest {hottest[0]} {hottest[1]} point={hottest[2]:.0f} "
+                     f"ring-max={hottest[4]:.0f} -> shipping reducer='{REFS_CUMULUS_NBR_REDUCER}'")
+        cape = sorted([r for r in active if r[0] == "KXMR"], key=lambda r: r[4], reverse=True)
+        if cape:
+            top = cape[0]
+            logging.info(f"[REFS CUMULUS DEBUG] KXMR peak 5nm-ring P(top>20kft): "
+                         f"{top[1]} point={top[2]:.0f} ring-max={top[4]:.0f} "
+                         f"(compare to DESI echo-top prob at the Cape for this valid time)")
     else:
-        logging.info(f"[REFS CUMULUS DEBUG] no active (max>0) 20kft boxes across "
-                     f"{len(nbr_spread)} site-hours this cycle; nothing convective to sample.")
+        logging.info(f"[REFS CUMULUS DEBUG] no active (ring max>0) 20kft site-hours across "
+                     f"{len(nbr_spread)} sampled; nothing convective to compare against DESI.")
     return matrix
 
 
