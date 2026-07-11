@@ -2355,7 +2355,7 @@ def _render_refs_echotop_debug_map(row_key, sub_lons, sub_lats, sub_vals, cycle,
         out_path = os.path.join(out_dir, out_name)
         fig.savefig(out_path, format="png", dpi=120, bbox_inches="tight")
         plt.close(fig)
-        return out_path
+        return f"maps/refs_debug/{out_name}"
     except Exception as e:
         logging.error(f"REFS echo-top debug map render failed for {row_key}: {e}")
         try:
@@ -2373,7 +2373,7 @@ def fetch_refs_echotop_probs():
     convective afternoon (the "values far too high" bug).
     Returns {site_id: {row_key: {"c5": {thr_m: pct}, "c10": {thr_m: pct}}}}. Empty on failure."""
     if not REFS_CUMULUS_ENABLED:
-        return {}
+        return {}, {}
     all_coords = {}
     for pid, c in LAUNCH_PADS.items():
         all_coords[pid] = {"lat": c["lat"], "lon": c["lon"]}
@@ -2438,7 +2438,7 @@ def fetch_refs_echotop_probs():
     if not cycle:
         logging.warning("REFS cumulus: no REFS PROB cycle with an .idx found on AWS "
                         "(prob files may not be posted yet, or lack .idx sidecars).")
-        return {}
+        return {}, {}
     cycle_init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
     logging.info(f"REFS cumulus: echo-top probs from {date_str} {cycle}z "
                  f"(neighborhood reducer = '{REFS_CUMULUS_NBR_REDUCER}')")
@@ -2667,18 +2667,28 @@ def fetch_refs_echotop_probs():
                      f"{len(nbr_spread)} sampled; nothing convective to compare against DESI.")
 
     # Diagnostic render pass (single-threaded; matplotlib isn't thread safe). One PNG per
-    # forecast hour of the raw P(top>20kft) field to maps/refs_debug/, for eyeball comparison
-    # against DESI. Not wired into history.json, so prune_stale_maps (top-level only) leaves it.
+    # forecast hour of the raw P(top>20kft) field to maps/refs_debug/, now also surfaced as a
+    # hover popup on the REFS cumulus cells (paths returned to the caller -> history.json).
+    debug_map_paths = {}   # {row_key: "maps/refs_debug/....png"}
     if REFS_CUMULUS_DEBUG_MAPS and debug_crops:
-        rendered = 0
+        # Wipe last run's PNGs so this subfolder doesn't accumulate stale valid-times across
+        # cycles (prune_stale_maps only sweeps the top-level maps/ dir, not this subfolder).
+        dbg_dir = os.path.join(MAPS_DIR, "refs_debug")
+        if os.path.isdir(dbg_dir):
+            for old in os.listdir(dbg_dir):
+                if old.endswith(".png"):
+                    try:
+                        os.remove(os.path.join(dbg_dir, old))
+                    except Exception:
+                        pass
         for row_key, slons, slats, svals in sorted(debug_crops, key=lambda r: r[0]):
             p = _render_refs_echotop_debug_map(row_key, slons, slats, svals, cycle, "20kft")
             if p:
-                rendered += 1
-        logging.info(f"[REFS CUMULUS DEBUG] wrote {rendered}/{len(debug_crops)} echo-top debug "
-                     f"maps to {os.path.join(MAPS_DIR, 'refs_debug')}/ (P(top>20kft), one per hour).")
+                debug_map_paths[row_key] = p
+        logging.info(f"[REFS CUMULUS DEBUG] wrote {len(debug_map_paths)}/{len(debug_crops)} echo-top "
+                     f"debug maps to {os.path.join(MAPS_DIR, 'refs_debug')}/ (P(top>20kft), one per hour).")
 
-    return matrix
+    return matrix, debug_map_paths
 
 
 def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_rows, pad_matrix=None):
@@ -2745,9 +2755,10 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     # at each site's REFS-mean isotherm heights and store the go/no-go probabilities on the REFS
     # profile. Rule a = P(top>=-20C within 10 nm); Rule b = P(top>=-10C within 5 nm). Both isotherms
     # sit above the 20 kft echo-top floor in this environment, so they interpolate cleanly.
+    refs_cumulus_maps = {}
     if REFS_CUMULUS_ENABLED:
         try:
-            etop = fetch_refs_echotop_probs()
+            etop, refs_cumulus_maps = fetch_refs_echotop_probs()
             KFT_TO_M = 304.8
             filled = 0
             for sid, hours in (etop or {}).items():
@@ -2796,6 +2807,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         "href_maps": href_maps,
         "ct1_maps": ct1_maps,
         "ct4_maps": ct4_maps,
+        "refs_cumulus_maps": refs_cumulus_maps,
         "blank_map": blank_basemap_path,
     }
 
