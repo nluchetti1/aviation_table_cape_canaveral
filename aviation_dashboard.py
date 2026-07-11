@@ -2367,6 +2367,26 @@ def fetch_refs_echotop_probs():
             lats = lons = None
             dbg_msgs = []
             for grb in grbs:
+                # One-shot: dump the probability-message metadata. If these RETOP probs are a
+                # neighborhood-max product (NMEP) with a baked-in radius, our point sample is
+                # already spatially smeared and can read high where DESI's point field is nil.
+                # PDT 4.9 is a plain probability template; a spatial/neighborhood product would
+                # show up as PDT 4.15 or via a spatialProcessing / typeOfSpatialProcessing key.
+                if not logged_idx.get("meta"):
+                    logged_idx["meta"] = True
+                    meta = {}
+                    for k in ("productDefinitionTemplateNumber", "probabilityType",
+                              "typeOfProcessedData", "numberOfForecastsInEnsemble",
+                              "typeOfSpatialProcessing", "numberOfPointsUsed",
+                              "scaledValueOfLowerLimit", "scaledValueOfUpperLimit",
+                              "typeOfFirstFixedSurface", "localDefinitionNumber"):
+                        try:
+                            meta[k] = getattr(grb, k)
+                        except Exception:
+                            pass
+                    logging.info(f"[REFS CUMULUS DEBUG] RETOP msg meta: {meta} "
+                                 f"(PDT 4.15 or a typeOfSpatialProcessing/numberOfPointsUsed key "
+                                 f"=> baked-in neighborhood; PDT 4.9 with none => point field)")
                 # We byte-ranged ONLY the RETOP echo-top messages, so every message here is echo
                 # top — pygrib reports RETOP's name/short as 'unknown' for this NCEP-local encoding,
                 # so we key purely off the PDT-4.9 upperLimit (which decodes correctly).
@@ -2405,6 +2425,19 @@ def fetch_refs_echotop_probs():
             for sid, c in all_coords.items():
                 dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
                 iy, ix = np.unravel_index(np.argmin(dist), dist.shape)
+
+                # One-shot: confirm the nearest REFS cell for the Cape is actually on the Cape and
+                # not snapped inland into the convective wash. If this is >3-4 km inland it alone
+                # could explain elevated values vs DESI at the coastline.
+                if sid.lower() == "kxmr" and not logged_idx.get("kxmr_cell"):
+                    logged_idx["kxmr_cell"] = True
+                    clat_cell, clon_cell = float(lats[iy, ix]), float(lons_n[iy, ix])
+                    ddx = (clon_cell - c["lon"]) * 111.320 * math.cos(math.radians(c["lat"]))
+                    ddy = (clat_cell - c["lat"]) * 110.574
+                    dkm = (ddx * ddx + ddy * ddy) ** 0.5
+                    logging.info(f"[REFS CUMULUS DEBUG] KXMR nearest cell grid[{iy},{ix}] = "
+                                 f"({clat_cell:.3f},{clon_cell:.3f}) vs true "
+                                 f"({c['lat']:.3f},{c['lon']:.3f}) -> {dkm:.1f} km off")
 
                 # Record pad-point vs in-ring stats at the 20-kft threshold (5 nm ring) for this
                 # site-hour, for the post-run summary and DESI cross-check. Uses the same true
@@ -2466,12 +2499,15 @@ def fetch_refs_echotop_probs():
                      f"(ring max>0): mean point={mp:.0f} p90={m9:.0f} ring-max={mx:.0f}; "
                      f"hottest {hottest[0]} {hottest[1]} point={hottest[2]:.0f} "
                      f"ring-max={hottest[4]:.0f} -> shipping reducer='{REFS_CUMULUS_NBR_REDUCER}'")
-        cape = sorted([r for r in active if r[0] == "KXMR"], key=lambda r: r[4], reverse=True)
+        cape = sorted([r for r in active if r[0].lower() == "kxmr"], key=lambda r: r[1])
         if cape:
-            top = cape[0]
-            logging.info(f"[REFS CUMULUS DEBUG] KXMR peak 5nm-ring P(top>20kft): "
-                         f"{top[1]} point={top[2]:.0f} ring-max={top[4]:.0f} "
-                         f"(compare to DESI echo-top prob at the Cape for this valid time)")
+            ringser = " ".join(f"{r[1]}={r[4]:.0f}" for r in cape)
+            ptser = " ".join(f"{r[1]}={r[2]:.0f}" for r in cape)
+            logging.info(f"[REFS CUMULUS DEBUG] KXMR 20kft ring-max by valid time: {ringser}")
+            logging.info(f"[REFS CUMULUS DEBUG] KXMR 20kft POINT by valid time:   {ptser}")
+            logging.info("[REFS CUMULUS DEBUG] ^ compare KXMR 11/21 above to the DESI F15 "
+                         "(21Z) echo-top-prob pixel at the Cape; if ours >> DESI-at-Cape, the "
+                         "grib is pre-neighborhooded (see RETOP msg meta) and needs a point source.")
     else:
         logging.info(f"[REFS CUMULUS DEBUG] no active (ring max>0) 20kft site-hours across "
                      f"{len(nbr_spread)} sampled; nothing convective to compare against DESI.")
