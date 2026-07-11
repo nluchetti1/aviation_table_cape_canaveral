@@ -81,6 +81,11 @@ REFS_CUMULUS_RADII_NM = {"neg10": 5.0, "neg20": 10.0}
 #   "p90"/"p75" : percentile in the ring (reads above the pad point on convective days)
 REFS_CUMULUS_NBR_REDUCER = "max"
 
+# When True, also render the raw P(echo top > 20 kft) grid we ingest to maps/refs_debug/ (one
+# PNG per forecast hour, NOT wired into the web page) so it can be eyeballed against the DESI
+# REFS-CONUS echo-top-prob plot. Purely diagnostic; set False for normal operational runs.
+REFS_CUMULUS_DEBUG_MAPS = True
+
 
 STN_COORDS = {
     "kxmr": {"lat": 28.468, "lon": -80.556},
@@ -2259,6 +2264,69 @@ def _ring_reduce(arr, lats, lons_n, clat, clon, iy, ix, radius_nm, method, half=
     return round(float(np.max(vals)), 1)
 
 
+def _render_refs_echotop_debug_map(row_key, sub_lons, sub_lats, sub_vals, cycle, thr_label):
+    """Render one diagnostic PNG of the raw REFS P(echo top > thr) field over the Florida domain,
+    styled like DESI (inferno on a dark base, low values transparent so the coastline shows) with
+    the launch pads + stations marked. Writes to maps/refs_debug/. Returns the path or None.
+    This is deliberately NOT added to history.json / the web page — it's for eyeball comparison."""
+    try:
+        out_dir = os.path.join(MAPS_DIR, "refs_debug")
+        os.makedirs(out_dir, exist_ok=True)
+        proj = ccrs.PlateCarree()
+        counties = cfeature.NaturalEarthFeature(
+            category="cultural", name="admin_2_counties", scale="10m", facecolor="none")
+        states = cfeature.NaturalEarthFeature(
+            category="cultural", name="admin_1_states_provinces_lines", scale="50m", facecolor="none")
+
+        fig = plt.figure(figsize=(5.5, 5.8), dpi=120)
+        ax = fig.add_subplot(1, 1, 1, projection=proj)
+        ax.set_extent([FL_DOMAIN["lon_min"], FL_DOMAIN["lon_max"],
+                       FL_DOMAIN["lat_min"], FL_DOMAIN["lat_max"]], crs=proj)
+        # Dark base so it reads like the DESI satellite backdrop; low prob stays dark.
+        ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="#0b1020", zorder=0)
+        ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#141a24", zorder=0)
+        ax.add_feature(counties, edgecolor="#334155", linewidth=0.3, zorder=1)
+        ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="#94a3b8", linewidth=0.8, zorder=3)
+        ax.add_feature(states, edgecolor="#94a3b8", linewidth=0.6, zorder=3)
+
+        # Mask <=2% so the geography shows through in quiet areas (matches DESI's dark low end).
+        masked = np.ma.masked_less_equal(sub_vals, 2.0)
+        mesh = ax.pcolormesh(sub_lons, sub_lats, masked, cmap="inferno", vmin=0, vmax=100,
+                             shading="auto", transform=proj, zorder=2)
+
+        for pid, c in LAUNCH_PADS.items():
+            ax.plot(c["lon"], c["lat"], marker="o", markersize=4, color="#38bdf8",
+                    markeredgecolor="white", markeredgewidth=0.6, transform=proj, zorder=5)
+        for sid, c in STN_COORDS.items():
+            hot = sid.lower() == "kxmr"
+            ax.plot(c["lon"], c["lat"], marker="^", markersize=7 if hot else 5,
+                    color="#22c55e" if hot else "#e2e8f0", markeredgecolor="black",
+                    markeredgewidth=0.7, transform=proj, zorder=6)
+            ax.text(c["lon"] + 0.06, c["lat"] + 0.04, sid.upper(), fontsize=6, fontweight="bold",
+                    color="#f8fafc", transform=proj, zorder=7,
+                    bbox=dict(boxstyle="round,pad=0.12", facecolor="#0f172a", alpha=0.6, edgecolor="none"))
+
+        ax.set_title(f"REFS P(echo top > {thr_label}) — valid {row_key}Z (from {cycle}z)",
+                     fontsize=8.5, fontweight="bold", color="#0f172a")
+        cbar = fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.03)
+        cbar.set_label("Exceedance probability (%)", fontsize=7)
+        cbar.ax.tick_params(labelsize=6)
+
+        safe_key = row_key.replace("/", "")
+        out_name = f"refs_echotop_{thr_label.replace(' ', '')}_{cycle}z_{safe_key}z.png"
+        out_path = os.path.join(out_dir, out_name)
+        fig.savefig(out_path, format="png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        return out_path
+    except Exception as e:
+        logging.error(f"REFS echo-top debug map render failed for {row_key}: {e}")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
+
+
 def fetch_refs_echotop_probs():
     """Pull REFS pre-computed echo-top exceedance probabilities P(echo top > {6096..15240} m)
     from the ensemble prob file. The RETOP messages ARE the ensemble member-fraction already;
@@ -2348,6 +2416,7 @@ def fetch_refs_echotop_probs():
     # DESI shows within ~5 nm. point vs max also shows how much the "within X nm" ring is adding
     # over the bare pad value.
     nbr_spread = []            # list of (sid, row_key, point, ring_p90, ring_max, ncells)
+    debug_crops = []           # list of (row_key, sub_lons, sub_lats, sub_vals) for debug maps
     nbr_lock = threading.Lock()
 
     def _prob_url(fh):
@@ -2447,6 +2516,24 @@ def fetch_refs_echotop_probs():
             if not grids or lats is None:
                 return row_key, {}
             lons_n = np.where(lons > 180, lons - 360.0, lons)
+
+            # Diagnostic: stash the Florida-domain crop of the 20-kft field for this forecast hour
+            # so it can be rendered to maps/refs_debug/ after the pool (matplotlib isn't thread
+            # safe, so we only COLLECT here and draw single-threaded later).
+            if REFS_CUMULUS_DEBUG_MAPS and 6096 in grids:
+                inbox = ((lats >= FL_DOMAIN["lat_min"]) & (lats <= FL_DOMAIN["lat_max"]) &
+                         (lons_n >= FL_DOMAIN["lon_min"]) & (lons_n <= FL_DOMAIN["lon_max"]))
+                if inbox.any():
+                    yy, xx = np.where(inbox)
+                    yy0, yy1, xx0, xx1 = yy.min(), yy.max() + 1, xx.min(), xx.max() + 1
+                    with nbr_lock:
+                        debug_crops.append((
+                            row_key,
+                            np.array(lons_n[yy0:yy1, xx0:xx1]),
+                            np.array(lats[yy0:yy1, xx0:xx1]),
+                            np.array(grids[6096][yy0:yy1, xx0:xx1]),
+                        ))
+
             out = {}
             for sid, c in all_coords.items():
                 dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
@@ -2537,6 +2624,19 @@ def fetch_refs_echotop_probs():
     else:
         logging.info(f"[REFS CUMULUS DEBUG] no active (ring max>0) 20kft site-hours across "
                      f"{len(nbr_spread)} sampled; nothing convective to compare against DESI.")
+
+    # Diagnostic render pass (single-threaded; matplotlib isn't thread safe). One PNG per
+    # forecast hour of the raw P(top>20kft) field to maps/refs_debug/, for eyeball comparison
+    # against DESI. Not wired into history.json, so prune_stale_maps (top-level only) leaves it.
+    if REFS_CUMULUS_DEBUG_MAPS and debug_crops:
+        rendered = 0
+        for row_key, slons, slats, svals in sorted(debug_crops, key=lambda r: r[0]):
+            p = _render_refs_echotop_debug_map(row_key, slons, slats, svals, cycle, "20kft")
+            if p:
+                rendered += 1
+        logging.info(f"[REFS CUMULUS DEBUG] wrote {rendered}/{len(debug_crops)} echo-top debug "
+                     f"maps to {os.path.join(MAPS_DIR, 'refs_debug')}/ (P(top>20kft), one per hour).")
+
     return matrix
 
 
