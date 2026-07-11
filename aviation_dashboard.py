@@ -79,12 +79,21 @@ REFS_CUMULUS_RADII_NM = {"neg10": 5.0, "neg20": 10.0}
 #   "point"     : pad gridpoint only (ignores the radius; use only to match a point viewer)
 #   "mean"      : areal-average exceedance in the ring (less conservative than a go/no-go wants)
 #   "p90"/"p75" : percentile in the ring (reads above the pad point on convective days)
-REFS_CUMULUS_NBR_REDUCER = "max"
+# NOTE: the enspost 'prob' RETOP field is confirmed (by DESI slider comparison) to be a ~40 km
+# NEIGHBORHOOD-MAX ensemble probability, NOT a point field — our debug map matched DESI at 40 km,
+# not 10 km. The 40 km smoothing is baked into the data, so every reducer below inherits it; none
+# can recover the 5/10 nm LCC standoff. Until we replace this source with a member-based NMEP at
+# the true radii, 'point' is the honest read: the pad value already means "within 40 km", so an
+# extra ring-max would just double-count. (max/p90/mean kept for reference only.)
+REFS_CUMULUS_NBR_REDUCER = "point"
 
 # When True, also render the raw P(echo top > 20 kft) grid we ingest to maps/refs_debug/ (one
 # PNG per forecast hour, NOT wired into the web page) so it can be eyeballed against the DESI
 # REFS-CONUS echo-top-prob plot. Purely diagnostic; set False for normal operational runs.
-REFS_CUMULUS_DEBUG_MAPS = True
+# When True, one-shot: list the REFS S3 prefix for the resolved cycle and log the file-name
+# patterns present, so we can locate the member-level RETOP files needed to build a real 5/10 nm
+# neighborhood-max ensemble probability (replacing the 40 km enspost 'prob' product). Diagnostic.
+REFS_MEMBER_PROBE = True
 
 
 STN_COORDS = {
@@ -2264,6 +2273,35 @@ def _ring_reduce(arr, lats, lons_n, clat, clon, iy, ix, radius_nm, method, half=
     return round(float(np.max(vals)), 1)
 
 
+def probe_refs_member_layout(session, date_str, cycle):
+    """One-shot discovery: list the REFS S3 prefix for this cycle (anonymous ListObjectsV2) and
+    log the directory structure + file-name templates, so we can find the member RETOP files.
+    The enspost 'prob' RETOP is a 40 km NMEP; to get the 5/10 nm LCC standoff we need to compute
+    our own NMEP from the members, and this reveals exactly how they're named on the bucket."""
+    import re as _re
+    # delimiter=/ makes S3 return CommonPrefixes (subdirs like mem01/) so we see the layout.
+    for pref in (f"rrfs_a/refs.{date_str}/{cycle}/",
+                 f"rrfs_a/refs.{date_str}/{cycle}/mem01/",
+                 f"rrfs_a/refs.{date_str}/{cycle}/enspost/"):
+        url = f"{RRFS_AWS_ROOT}/?list-type=2&prefix={pref}&delimiter=/&max-keys=500"
+        try:
+            r = session.get(url, timeout=20)
+            if r.status_code != 200:
+                logging.info(f"[REFS MEMBER PROBE] {pref} -> HTTP {r.status_code}")
+                continue
+            subdirs = [p.split("/")[-2] + "/" for p in _re.findall(r"<Prefix>([^<]+)</Prefix>", r.text)]
+            keys = _re.findall(r"<Key>([^<]+)</Key>", r.text)
+            templates = sorted({_re.sub(r"\d+", "#", os.path.basename(k)) for k in keys})
+            logging.info(f"[REFS MEMBER PROBE] {pref}: {len(subdirs)} subdirs={sorted(set(subdirs))[:24]}")
+            if templates:
+                logging.info(f"[REFS MEMBER PROBE] {pref}: file templates={templates[:24]}")
+            retop_keys = [k for k in keys if "retop" in k.lower() or "prslev" in k.lower()]
+            if retop_keys:
+                logging.info(f"[REFS MEMBER PROBE] {pref}: sample keys={[os.path.basename(k) for k in retop_keys[:5]]}")
+        except Exception as e:
+            logging.info(f"[REFS MEMBER PROBE] {pref} error: {e}")
+
+
 def _render_refs_echotop_debug_map(row_key, sub_lons, sub_lats, sub_vals, cycle, thr_label):
     """Render one diagnostic PNG of the raw REFS P(echo top > thr) field over the Florida domain,
     styled like DESI (inferno on a dark base, low values transparent so the coastline shows) with
@@ -2404,6 +2442,9 @@ def fetch_refs_echotop_probs():
     cycle_init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
     logging.info(f"REFS cumulus: echo-top probs from {date_str} {cycle}z "
                  f"(neighborhood reducer = '{REFS_CUMULUS_NBR_REDUCER}')")
+
+    if REFS_MEMBER_PROBE:
+        probe_refs_member_layout(session, date_str, cycle)
 
     r5_nm = REFS_CUMULUS_RADII_NM['neg10']    # 5 nm standoff ring for the -10C column
     r10_nm = REFS_CUMULUS_RADII_NM['neg20']   # 10 nm standoff ring for the -20C column
