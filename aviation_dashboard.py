@@ -2284,25 +2284,51 @@ def fetch_refs_echotop_probs():
     # the outcome so a genuine "no .idx sidecar" case is distinguishable from "not posted yet".
     now = datetime.datetime.now(datetime.timezone.utc)
     date_str = cycle = None
+    WINDOW_FH = 24  # end of the launch-planning window; also the tasks-loop depth below
+
+    def _probe(d, cc, fh):
+        purl = (f"{RRFS_AWS_ROOT}/rrfs_a/refs.{d}/{cc}/enspost/"
+                f"refs.t{cc}z.prob.f{fh:02d}.conus.grib2.idx")
+        try:
+            r = session.get(purl, timeout=12)
+            return r.status_code == 200 and len(r.text) > 50
+        except Exception as e:
+            logging.debug(f"REFS cumulus probe {d} {cc}z f{fh:02d} error: {e}")
+            return False
+
+    # Pass 1: newest cycle that has FINISHED posting the full window (deep hour present).
+    # Committing the moment an early hour (f04) appeared truncated the matrix to ~4 hours
+    # when a fresh cycle was only partially posted -- a 2h-old 12z with just f01-f04 up would
+    # win over a complete 06z. Requiring f24 trades ~6h of latency for a full 24-hour column.
     for back in range(0, 48):
         cand = now - datetime.timedelta(hours=back)
         if cand.hour not in (0, 6, 12, 18):
             continue
         d, cc = cand.strftime("%Y%m%d"), f"{cand.hour:02d}"
-        for probe_fh in (4, 6, 8, 12):
-            purl = (f"{RRFS_AWS_ROOT}/rrfs_a/refs.{d}/{cc}/enspost/"
-                    f"refs.t{cc}z.prob.f{probe_fh:02d}.conus.grib2.idx")
-            try:
-                r = session.get(purl, timeout=12)
-                if r.status_code == 200 and len(r.text) > 50:
-                    date_str, cycle = d, cc
-                    logging.info(f"REFS cumulus: prob files resolved at {d} {cc}z (f{probe_fh:02d} .idx ok).")
-                    break
-                logging.debug(f"REFS cumulus probe {d} {cc}z f{probe_fh:02d}: HTTP {r.status_code}")
-            except Exception as e:
-                logging.debug(f"REFS cumulus probe {d} {cc}z f{probe_fh:02d} error: {e}")
-        if cycle:
+        if _probe(d, cc, WINDOW_FH):
+            date_str, cycle = d, cc
+            logging.info(f"REFS cumulus: prob files resolved at {d} {cc}z "
+                         f"(full window; f{WINDOW_FH:02d} .idx present).")
             break
+
+    # Pass 2 (fallback): nothing has the full window yet -> take the newest cycle with any
+    # early hour so we still ship a (short) column rather than an empty one.
+    if not cycle:
+        for back in range(0, 48):
+            cand = now - datetime.timedelta(hours=back)
+            if cand.hour not in (0, 6, 12, 18):
+                continue
+            d, cc = cand.strftime("%Y%m%d"), f"{cand.hour:02d}"
+            for probe_fh in (4, 6, 8, 12):
+                if _probe(d, cc, probe_fh):
+                    date_str, cycle = d, cc
+                    logging.warning(f"REFS cumulus: no cycle with a full f{WINDOW_FH:02d} window "
+                                    f"posted; falling back to {d} {cc}z (only f{probe_fh:02d} up, "
+                                    f"column will be short this run).")
+                    break
+            if cycle:
+                break
+
     if not cycle:
         logging.warning("REFS cumulus: no REFS PROB cycle with an .idx found on AWS "
                         "(prob files may not be posted yet, or lack .idx sidecars).")
@@ -2469,7 +2495,7 @@ def fetch_refs_echotop_probs():
 
     matrix = {sid: {} for sid in all_coords}
     tasks = []
-    for fh in range(1, 25):  # REFS runs to 60 h; the launch window here is ~24 h
+    for fh in range(1, WINDOW_FH + 1):  # REFS runs to 60 h; the launch window here is ~24 h
         valid = cycle_init + datetime.timedelta(hours=fh)
         tasks.append((fh, f"{valid.day:02d}/{valid.hour:02d}"))
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
