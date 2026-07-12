@@ -87,9 +87,11 @@ REFS_CUMULUS_RADII_NM = {"neg10": 5.0, "neg20": 10.0}
 # extra ring-max would just double-count. (max/p90/mean kept for reference only.)
 REFS_CUMULUS_NBR_REDUCER = "point"
 
-# When True, also render the raw P(echo top > 20 kft) grid we ingest to maps/refs_debug/ (one
-# PNG per forecast hour, NOT wired into the web page) so it can be eyeballed against the DESI
-# REFS-CONUS echo-top-prob plot. Purely diagnostic; set False for normal operational runs.
+# When True, render the raw P(echo top > 20 kft) grid we ingest to maps/refs_debug/ (one PNG per
+# forecast hour) AND surface them as hover popups on the REFS cumulus cells. Now a feature, not a
+# one-off diagnostic — leave True or the popups go blank.
+REFS_CUMULUS_DEBUG_MAPS = True
+
 # When True, one-shot: list the REFS S3 prefix for the resolved cycle and log the file-name
 # patterns present, so we can locate the member-level RETOP files needed to build a real 5/10 nm
 # neighborhood-max ensemble probability (replacing the 40 km enspost 'prob' product). Diagnostic.
@@ -2274,32 +2276,58 @@ def _ring_reduce(arr, lats, lons_n, clat, clon, iy, ix, radius_nm, method, half=
 
 
 def probe_refs_member_layout(session, date_str, cycle):
-    """One-shot discovery: list the REFS S3 prefix for this cycle (anonymous ListObjectsV2) and
-    log the directory structure + file-name templates, so we can find the member RETOP files.
-    The enspost 'prob' RETOP is a 40 km NMEP; to get the 5/10 nm LCC standoff we need to compute
-    our own NMEP from the members, and this reveals exactly how they're named on the bucket."""
+    """One-shot discovery: determine whether individual REFS members (each carrying its own RETOP)
+    are published on the bucket, or only post-processed ensemble products (avrg/eas/prob). The
+    enspost 'prob' RETOP is a ~40 km NMEP; a true 5/10 nm LCC standoff needs member-level RETOP.
+    Emits ONE decisive VERDICT line so it survives log/paste truncation."""
     import re as _re
-    # delimiter=/ makes S3 return CommonPrefixes (subdirs like mem01/) so we see the layout.
-    for pref in (f"rrfs_a/refs.{date_str}/{cycle}/",
-                 f"rrfs_a/refs.{date_str}/{cycle}/mem01/",
-                 f"rrfs_a/refs.{date_str}/{cycle}/enspost/"):
-        url = f"{RRFS_AWS_ROOT}/?list-type=2&prefix={pref}&delimiter=/&max-keys=500"
+    base = f"rrfs_a/refs.{date_str}/{cycle}/"
+
+    # (a) subdirs directly under the cycle root — members would appear as mem01/, m01/, ...
+    subdirs = []
+    try:
+        r = session.get(f"{RRFS_AWS_ROOT}/?list-type=2&prefix={base}&delimiter=/&max-keys=1000", timeout=20)
+        if r.status_code == 200:
+            subdirs = sorted({p.rstrip("/").split("/")[-1] for p in _re.findall(r"<Prefix>([^<]+)</Prefix>", r.text)})
+    except Exception as e:
+        logging.info(f"[REFS MEMBER PROBE] subdir list error: {e}")
+
+    # (b) flat listing (no delimiter, paginated) to catch member FILES like refs.tCCz.m01... or
+    #     refs.tCCz.mem01... The token right after 'refs.tCCz.' names the product/member.
+    prods, token, pages = set(), None, 0
+    while pages < 8:
+        pages += 1
+        url = f"{RRFS_AWS_ROOT}/?list-type=2&prefix={base}&max-keys=1000"
+        if token:
+            url += f"&continuation-token={requests.utils.quote(token, safe='')}"
         try:
-            r = session.get(url, timeout=20)
+            r = session.get(url, timeout=25)
             if r.status_code != 200:
-                logging.info(f"[REFS MEMBER PROBE] {pref} -> HTTP {r.status_code}")
-                continue
-            subdirs = [p.split("/")[-2] + "/" for p in _re.findall(r"<Prefix>([^<]+)</Prefix>", r.text)]
-            keys = _re.findall(r"<Key>([^<]+)</Key>", r.text)
-            templates = sorted({_re.sub(r"\d+", "#", os.path.basename(k)) for k in keys})
-            logging.info(f"[REFS MEMBER PROBE] {pref}: {len(subdirs)} subdirs={sorted(set(subdirs))[:24]}")
-            if templates:
-                logging.info(f"[REFS MEMBER PROBE] {pref}: file templates={templates[:24]}")
-            retop_keys = [k for k in keys if "retop" in k.lower() or "prslev" in k.lower()]
-            if retop_keys:
-                logging.info(f"[REFS MEMBER PROBE] {pref}: sample keys={[os.path.basename(k) for k in retop_keys[:5]]}")
+                logging.info(f"[REFS MEMBER PROBE] flat list -> HTTP {r.status_code}")
+                break
+            for k in _re.findall(r"<Key>([^<]+)</Key>", r.text):
+                mm = _re.match(rf"refs\.t{cycle}z\.([a-z0-9]+)\.", os.path.basename(k))
+                if mm:
+                    prods.add(mm.group(1))
+            m = _re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", r.text)
+            token = m.group(1) if m else None
+            if not token:
+                break
         except Exception as e:
-            logging.info(f"[REFS MEMBER PROBE] {pref} error: {e}")
+            logging.info(f"[REFS MEMBER PROBE] flat list error: {e}")
+            break
+
+    # Member indicators from either the subdir layout or the flat filename tokens.
+    member_tokens = sorted(t for t in (set(subdirs) | prods) if _re.fullmatch(r"m(em)?\d+", t))
+    logging.info(f"[REFS MEMBER PROBE] cycle {date_str} {cycle}z: subdirs={subdirs[:20]}; "
+                 f"product/member tokens={sorted(prods)[:30]}")
+    if member_tokens:
+        logging.info(f"[REFS MEMBER PROBE] VERDICT: MEMBERS FOUND -> {member_tokens[:40]} "
+                     f"(a true 5/10 nm member NMEP is buildable from these).")
+    else:
+        logging.info(f"[REFS MEMBER PROBE] VERDICT: NO MEMBER FILES — bucket publishes only ensemble "
+                     f"products {sorted(prods)[:15]}. A 5/10 nm NMEP is NOT buildable here; the 40 km "
+                     f"'prob' field is the only echo-top probability NOAA posts on this bucket.")
 
 
 def _render_refs_echotop_debug_map(row_key, sub_lons, sub_lats, sub_vals, cycle, thr_label):
