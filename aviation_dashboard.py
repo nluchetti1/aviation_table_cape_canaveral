@@ -110,6 +110,10 @@ REFS_MEMBER_TLE = True
 # 5/10 nm signal toward climatology. It degrades gracefully if an older cycle isn't posted deep
 # enough (needs f(24 + 6*k)), so a too-large value simply uses as many cycles as are available.
 REFS_MEMBER_LAG_CYCLES = 1
+# Forecast-hour cap for the member ensemble. The rest of the dashboard spans 48 h, so match it.
+# The fetch auto-discovers how deep the cycle actually posted and fetches out to the deepest hour
+# at or below this cap; deep hours the +6 h lag cycle doesn't reach fall back to 5 members.
+REFS_MEMBER_WINDOW_FH = 48
 
 
 STN_COORDS = {
@@ -2453,7 +2457,7 @@ def fetch_rrfsens_member_nmep():
     Returns ({sid: {row_key: {"et5":[m...], "et10":[m...]}}}, {row_key: map_path}); empty on
     failure so the caller falls back to the enspost method."""
     if not REFS_MEMBER_NMEP_ENABLED:
-        return {}, {}
+        return {}, {}, {}
 
     all_coords = {}
     for pid, c in LAUNCH_PADS.items():
@@ -2465,7 +2469,8 @@ def fetch_rrfsens_member_nmep():
     session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=3))
     session.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"})
 
-    WINDOW_FH = 24
+    ACCEPT_FH = 24                       # min depth to accept a cycle as meaningfully complete
+    WINDOW_FH = REFS_MEMBER_WINDOW_FH     # target cap; actual depth discovered below
     LAG_HOURS = 6
     tmpl = "rrfs_a/rrfsens.{d}/{cc}/{mem}/rrfs.t{cc}z.{mem}.2dfld.3km.f{fh:03d}.conus.grib2"
 
@@ -2477,7 +2482,22 @@ def fetch_rrfsens_member_nmep():
         except Exception:
             return False
 
-    # --- newest cycle with m001 2dfld through the full window ---
+    def _max_fh(d, cc, target):
+        """Deepest posted m001 2dfld forecast hour <= target (descending 6 h checkpoints, then
+        refine upward by 1 h). Returns 0 if nothing at/under target is posted."""
+        base = 0
+        for f in range(target - (target % 6), 5, -6):
+            if _idx_ok(d, cc, "m001", f):
+                base = f
+                break
+        if base == 0:
+            return 0
+        f = base
+        while f < target and _idx_ok(d, cc, "m001", f + 1):
+            f += 1
+        return f
+
+    # --- newest cycle with m001 2dfld at least through ACCEPT_FH (freshest usable cycle) ---
     now = datetime.datetime.now(datetime.timezone.utc)
     date_str = cycle = None
     cyc_dt = None
@@ -2486,12 +2506,15 @@ def fetch_rrfsens_member_nmep():
         if cand.hour not in (0, 6, 12, 18):
             continue
         d, cc = cand.strftime("%Y%m%d"), f"{cand.hour:02d}"
-        if _idx_ok(d, cc, "m001", WINDOW_FH):
+        if _idx_ok(d, cc, "m001", ACCEPT_FH):
             date_str, cycle, cyc_dt = d, cc, cand.replace(minute=0, second=0, microsecond=0)
             break
     if not cycle:
-        logging.warning("REFS member NMEP: no rrfsens cycle with m001 2dfld f24; falling back to enspost.")
-        return {}, {}
+        logging.warning(f"REFS member NMEP: no rrfsens cycle with m001 2dfld f{ACCEPT_FH}; falling back to enspost.")
+        return {}, {}, {}
+
+    # actual depth of this cycle, up to the target cap
+    WINDOW_FH = max(ACCEPT_FH, _max_fh(date_str, cycle, WINDOW_FH))
 
     # --- member discovery (m001.. until a gap) ---
     members = []
@@ -2504,22 +2527,27 @@ def fetch_rrfsens_member_nmep():
     if not members:
         members = ["m001"]
 
-    # --- time-lag: prior cycle members, valid-time aligned via fh+LAG ---
+    # --- time-lag: prior cycle members, bounded by the lag cycle's own posted depth ---
     lag_date = lag_cycle = None
     lag_members = []
+    lag_fh_cap = 0   # deepest CURRENT-cycle fh the lag cycle can cover (fh + LAG <= lag depth)
     if REFS_MEMBER_TLE:
         prior = cyc_dt - datetime.timedelta(hours=LAG_HOURS)
         dp, ccp = prior.strftime("%Y%m%d"), f"{prior.hour:02d}"
-        if _idx_ok(dp, ccp, "m001", WINDOW_FH + LAG_HOURS):
+        lag_depth = _max_fh(dp, ccp, WINDOW_FH + LAG_HOURS)
+        if lag_depth >= 1 + LAG_HOURS:
             lag_date, lag_cycle = dp, ccp
+            lag_fh_cap = min(WINDOW_FH, lag_depth - LAG_HOURS)
             for mem in members:
-                if _idx_ok(dp, ccp, mem, WINDOW_FH + LAG_HOURS):
+                if _idx_ok(dp, ccp, mem, 1 + LAG_HOURS):
                     lag_members.append(mem)
     n_total = len(members) + len(lag_members)
-    logging.info("REFS member NMEP: cycle %s %sz (%d members)%s -> %d-member ensemble." % (
-        date_str, cycle, len(members),
-        (f" + lag {lag_date} {lag_cycle}z ({len(lag_members)})" if lag_members else " (no time-lag)"),
-        n_total))
+    logging.info("REFS member NMEP: cycle %s %sz (%d members, f1-f%d)%s -> %d-member%s." % (
+        date_str, cycle, len(members), WINDOW_FH,
+        (f" + lag {lag_date} {lag_cycle}z ({len(lag_members)}, covers f1-f{lag_fh_cap})"
+         if lag_members else " (no time-lag)"),
+        n_total,
+        (f"; f{lag_fh_cap + 1}-f{WINDOW_FH} are {len(members)}-member" if lag_members and lag_fh_cap < WINDOW_FH else "")))
 
     r5_nm = REFS_CUMULUS_RADII_NM["neg10"]
     r10_nm = REFS_CUMULUS_RADII_NM["neg20"]
@@ -2531,8 +2559,9 @@ def fetch_rrfsens_member_nmep():
         rk = f"{valid.day:02d}/{valid.hour:02d}"
         for mem in members:
             tasks.append((rk, f"cur-{mem}", date_str, cycle, fh))
-        for mem in lag_members:
-            tasks.append((rk, f"lag-{mem}", lag_date, lag_cycle, fh + LAG_HOURS))
+        if lag_members and fh <= lag_fh_cap:
+            for mem in lag_members:
+                tasks.append((rk, f"lag-{mem}", lag_date, lag_cycle, fh + LAG_HOURS))
 
     sanity = {"done": False}
 
@@ -2613,7 +2642,7 @@ def fetch_rrfsens_member_nmep():
 
     if not by_rk:
         logging.warning("REFS member NMEP: no member RETOP crops fetched; falling back to enspost.")
-        return {}, {}
+        return {}, {}, {}
 
     # --- aggregate: per site per row_key -> per-member in-ring max echo top (m) ---
     matrix = {sid: {} for sid in all_coords}
