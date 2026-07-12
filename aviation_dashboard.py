@@ -104,6 +104,12 @@ REFS_MEMBER_NMEP_ENABLED = True
 # Time-lag the prior cycle's members (+6 h, valid-time aligned) to double the ensemble size
 # (5 -> 10 members), taking probability granularity from 20% steps to 10%.
 REFS_MEMBER_TLE = True
+# How many prior cycles to fold in when REFS_MEMBER_TLE is on. 1 = the -6 h cycle only (10
+# members, the validated sweet spot). 2 = also the -12 h cycle (15 members, ~6.7% steps) — more
+# sampling but the oldest members are stale for convective *placement* and can smear the sharp
+# 5/10 nm signal toward climatology. It degrades gracefully if an older cycle isn't posted deep
+# enough (needs f(24 + 6*k)), so a too-large value simply uses as many cycles as are available.
+REFS_MEMBER_LAG_CYCLES = 1
 
 
 STN_COORDS = {
@@ -2611,7 +2617,15 @@ def fetch_rrfsens_member_nmep():
 
     # --- aggregate: per site per row_key -> per-member in-ring max echo top (m) ---
     matrix = {sid: {} for sid in all_coords}
-    debug_field = {}
+    debug_field5 = {}    # P(top>20kft) at ~5 nm  -> hovers on the -10C / 5 nm column
+    debug_field10 = {}   # P(top>25kft) at ~10 nm -> hovers on the -20C / 10 nm column
+
+    def _nmep_field(stk, ncell, thr_m):
+        ex = np.zeros(stk.shape[1:], dtype=float)
+        for mi in range(stk.shape[0]):
+            ex += (_neighborhood_max(stk[mi], ncell) > thr_m)
+        return 100.0 * ex / stk.shape[0]
+
     for rk, memmap in by_rk.items():
         if not memmap:
             continue
@@ -2633,19 +2647,20 @@ def fetch_rrfsens_member_nmep():
             matrix[sid][rk] = {"et5": et5, "et10": et10}
         stack = np.stack([vals for (la, lo, vals) in aligned]) if aligned else None
         if stack is not None and stack.shape[0]:
-            nc = 3
-            exceed = np.zeros(stack.shape[1:], dtype=float)
-            for mi in range(stack.shape[0]):
-                exceed += (_neighborhood_max(stack[mi], nc) > 6096.0)
-            debug_field[rk] = (ref_lons, ref_lats, 100.0 * exceed / stack.shape[0])
+            # ~5 nm and ~10 nm square neighborhoods on the 3 km grid (9.3 km -> 3 cells,
+            # 18.5 km -> 6 cells). Diagnostic only; the table columns use the exact circular ring.
+            debug_field5[rk] = (ref_lons, ref_lats, _nmep_field(stack, 3, 6096.0))    # 20 kft
+            debug_field10[rk] = (ref_lons, ref_lats, _nmep_field(stack, 6, 7620.0))   # 25 kft
 
     got = sum(len(v) for v in matrix.values())
     logging.info(f"REFS member NMEP: {got} site-hours from a {n_total}-member ensemble "
                  f"({len(by_rk)} valid hours fetched).")
 
-    # --- diagnostic maps (member NMEP P(top>20kft) at ~5 nm; compare DESI at ~10 km) ---
-    debug_paths = {}
-    if REFS_CUMULUS_DEBUG_MAPS and debug_field:
+    # --- diagnostic maps: two thresholds/radii, one per column ---
+    #   maps5  = P(top>20 kft) at ~5 nm  -> -10C / 5 nm cell hover
+    #   maps10 = P(top>25 kft) at ~10 nm -> -20C / 10 nm cell hover
+    maps5, maps10 = {}, {}
+    if REFS_CUMULUS_DEBUG_MAPS and (debug_field5 or debug_field10):
         dbg_dir = os.path.join(MAPS_DIR, "refs_debug")
         if os.path.isdir(dbg_dir):
             for old in os.listdir(dbg_dir):
@@ -2654,17 +2669,21 @@ def fetch_rrfsens_member_nmep():
                         os.remove(os.path.join(dbg_dir, old))
                     except Exception:
                         pass
-        drawn = 0
-        for rk in sorted(debug_field):
-            lo, la, fld = debug_field[rk]
-            p = _render_refs_echotop_debug_map(rk, lo, la, fld, f"{cycle}z-m{n_total}", "20kft")
+        cyc_tag = f"{cycle}z-m{n_total}"
+        for rk in sorted(debug_field5):
+            lo, la, fld = debug_field5[rk]
+            p = _render_refs_echotop_debug_map(rk, lo, la, fld, cyc_tag, "20kft")
             if p:
-                debug_paths[rk] = p
-                drawn += 1
-        logging.info(f"[REFS MEMBER NMEP] wrote {drawn}/{len(debug_field)} member-NMEP debug maps "
-                     f"(P(top>20kft) ~5nm) to maps/refs_debug/.")
+                maps5[rk] = p
+        for rk in sorted(debug_field10):
+            lo, la, fld = debug_field10[rk]
+            p = _render_refs_echotop_debug_map(rk, lo, la, fld, cyc_tag, "25kft")
+            if p:
+                maps10[rk] = p
+        logging.info(f"[REFS MEMBER NMEP] wrote {len(maps5)} x 20kft(~5nm) + {len(maps10)} x "
+                     f"25kft(~10nm) member-NMEP debug maps to maps/refs_debug/.")
 
-    return matrix, debug_paths
+    return matrix, maps5, maps10
 
 
 def fetch_refs_echotop_probs():
@@ -3058,19 +3077,21 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     # profile. Rule a = P(top>=-20C within 10 nm); Rule b = P(top>=-10C within 5 nm). Both isotherms
     # sit above the 20 kft echo-top floor in this environment, so they interpolate cleanly.
     refs_cumulus_maps = {}
+    refs_cumulus_maps10 = {}
     if REFS_CUMULUS_ENABLED:
         try:
             KFT_TO_M = 304.8
             filled = 0
-            member_matrix, member_maps = ({}, {})
+            member_matrix, member_maps5, member_maps10 = ({}, {}, {})
             if REFS_MEMBER_NMEP_ENABLED:
-                member_matrix, member_maps = fetch_rrfsens_member_nmep()
+                member_matrix, member_maps5, member_maps10 = fetch_rrfsens_member_nmep()
 
             if member_matrix:
                 # TRUE member time-lagged NMEP at the real 5/10 nm radius. For each site-hour count
                 # the fraction of members whose in-ring MAX echo top reaches the isotherm height —
                 # a direct height comparison, so there is no fixed-knot 20 kft floor (no '*').
-                refs_cumulus_maps = member_maps
+                refs_cumulus_maps = member_maps5      # -10C/5nm hover -> P(top>20kft) ~5nm
+                refs_cumulus_maps10 = member_maps10    # -20C/10nm hover -> P(top>25kft) ~10nm
                 for sid, hours in member_matrix.items():
                     refs_rows = (combined_data.get(sid, {}) or {}).get("refs")
                     if not isinstance(refs_rows, dict):
@@ -3099,6 +3120,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
                 # Fallback: the 40 km enspost exceedance-curve method (interpolate P(top>H) at the
                 # isotherm height). Kept so the column never goes dark if members are unavailable.
                 etop, refs_cumulus_maps = fetch_refs_echotop_probs()
+                refs_cumulus_maps10 = refs_cumulus_maps  # fallback has only the one 40 km field
                 for sid, hours in (etop or {}).items():
                     refs_rows = (combined_data.get(sid, {}) or {}).get("refs")
                     if not isinstance(refs_rows, dict):
@@ -3146,6 +3168,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         "ct1_maps": ct1_maps,
         "ct4_maps": ct4_maps,
         "refs_cumulus_maps": refs_cumulus_maps,
+        "refs_cumulus_maps10": refs_cumulus_maps10,
         "blank_map": blank_basemap_path,
     }
 
