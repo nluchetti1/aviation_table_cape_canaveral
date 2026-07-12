@@ -177,7 +177,8 @@
         let hrefBlankMap = null;
         let ct1Maps = null;
         let ct4Maps = null;
-        let refsCumulusMaps = null;  // {row_key: "maps/refs_debug/....png"} — REFS P(top>20kft)
+        let refsCumulusMaps = null;  // {row_key: "maps/refs_debug/....png"} — REFS P(top>20kft) ~5nm (-10C)
+        let refsCumulusMaps10 = null; // {row_key: "..."} — REFS P(top>25kft) ~10nm (-20C)
         let ctWindow = '4hr';  // toggles between '4hr' and '1hr' for the persistent CT column
         let activeMetric = 'mom_mean';
         let activeStn = 'kxmr';
@@ -207,12 +208,14 @@
                 ct1Maps = (payload.href_maps_latest && payload.href_maps_latest.ct1_maps) || null;
                 ct4Maps = (payload.href_maps_latest && payload.href_maps_latest.ct4_maps) || null;
                 refsCumulusMaps = (payload.href_maps_latest && payload.href_maps_latest.refs_cumulus_maps) || null;
+                refsCumulusMaps10 = (payload.href_maps_latest && payload.href_maps_latest.refs_cumulus_maps10) || null;
 
                 // Diagnostic: how many hours carry a real calibrated-thunder map per window.
                 const countReal = (o) => !o ? 0 : Object.values(o).filter(Boolean).length;
                 console.log('[CT maps loaded] ct1:', countReal(ct1Maps),
                             '| ct4:', countReal(ct4Maps),
                             '| refsCumulus:', countReal(refsCumulusMaps),
+                            '| refsCumulus10:', countReal(refsCumulusMaps10),
                             '| blankBasemap:', hrefBlankMap || '(none)');
                 buildTimelineNav();
                 loadRunIndex(0); // index 0 is always the most recent run
@@ -507,7 +510,10 @@
                             const isRefsCu = (m === 'refs' &&
                                 (activeMetric === 'cuP_neg10_5nm' || activeMetric === 'cuP_neg20_10nm'));
                             if (isRefsCu) {
-                                const mapSrc = (refsCumulusMaps || {})[timeKey] || null;
+                                // -10C/5nm hovers the 20 kft/~5nm field; -20C/10nm hovers 25 kft/~10nm.
+                                const mapDict = (activeMetric === 'cuP_neg20_10nm')
+                                    ? (refsCumulusMaps10 || {}) : (refsCumulusMaps || {});
+                                const mapSrc = mapDict[timeKey] || null;
                                 cellEl.onmouseenter = (ev) => showRefsCumulusMapPopup(ev, profile, mapSrc, timeKey, activeMetric);
                             } else {
                                 cellEl.onmouseenter = (e) => showPopup(e, m, profile);
@@ -888,10 +894,10 @@
             movePopup(e);
         }
 
-        // Hover popup for the REFS Cumulus-standoff cells: shows the P(echo top > 20 kft) spatial
-        // map for that valid hour (the field the REFS ensemble prob is built on), so it can be
-        // eyeballed against DESI. Mirrors showCtMapPopup. NOTE: one map (P>20 kft) is rendered per
-        // hour; it's the exact field for the −10°C(5 nm) rule and a close proxy for −20°C(10 nm).
+        // Hover popup for the REFS Cumulus-standoff cells: shows the member-NMEP echo-top
+        // probability map for that valid hour, so it can be eyeballed against DESI. The threshold
+        // and neighborhood differ per column: −10°C/5 nm shows P(top>20 kft) at ~5 nm; −20°C/10 nm
+        // shows P(top>25 kft) at ~10 nm. Mirrors showCtMapPopup.
         function showRefsCumulusMapPopup(e, profile, mapSrc, timeKey, metric) {
             const src = mapSrc || hrefBlankMap;
             const fb = hrefBlankMap || "";
@@ -901,6 +907,7 @@
             const star = (q === 'floor') ? '*' : '';
             const valTxt = (val == null) ? '—' : Math.round(val) + '%' + star;
             const label = isNeg10 ? 'Cu P(top≥−10°C, 5 nm)' : 'Cu P(top≥−20°C, 10 nm)';
+            const mapThr = isNeg10 ? '20 kft &middot; ~5 nm' : '25 kft &middot; ~10 nm';
             const mapHtml = src
                 ? `<div class="ltg-map-grid" style="grid-template-columns: 1fr;"><div class="ltg-map-cell"><img src="${src}" alt="REFS echo-top probability map" onerror="if(this.dataset.fb!=='1'){this.dataset.fb='1';this.src='${fb}';}" /></div></div>`
                 : `<div class="ltg-map-empty-full">No spatial map for ${timeKey || 'this'}Z.</div>`;
@@ -908,7 +915,7 @@
             popupCard.innerHTML = `
                 <div class="popup-header">REFS Echo-Top Probability</div>
                 <strong>${label}: ${valTxt}</strong><br>
-                <span style="font-size:0.8rem; color:#64748b;">Map: P(echo top &gt; 20 kft) &middot; valid ${timeKey}Z</span>
+                <span style="font-size:0.8rem; color:#64748b;">Map: P(echo top &gt; ${mapThr}) &middot; valid ${timeKey}Z</span>
                 ${mapHtml}
             `;
             popupCard.style.display = "block";
