@@ -97,6 +97,14 @@ REFS_CUMULUS_DEBUG_MAPS = True
 # neighborhood-max ensemble probability (replacing the 40 km enspost 'prob' product). Diagnostic.
 REFS_MEMBER_PROBE = True
 
+# Compute the Cumulus echo-top standoff probability as a TRUE neighborhood-max ensemble
+# probability (NMEP) from the individual RRFS ensemble members at the real 5/10 nm radius,
+# instead of the 40 km enspost 'prob' product. Falls back to enspost if members are unavailable.
+REFS_MEMBER_NMEP_ENABLED = True
+# Time-lag the prior cycle's members (+6 h, valid-time aligned) to double the ensemble size
+# (5 -> 10 members), taking probability granularity from 20% steps to 10%.
+REFS_MEMBER_TLE = True
+
 
 STN_COORDS = {
     "kxmr": {"lat": 28.468, "lon": -80.556},
@@ -2411,6 +2419,254 @@ def _render_refs_echotop_debug_map(row_key, sub_lons, sub_lats, sub_vals, cycle,
         return None
 
 
+def _neighborhood_max(grid, nc):
+    """Non-wrapping square neighborhood max (radius nc cells). Used ONLY for the diagnostic NMEP
+    map; the table columns use the accurate circular ring via _ring_reduce."""
+    ny, nx = grid.shape
+    out = np.array(grid, dtype=float)
+    for dy in range(-nc, nc + 1):
+        for dx in range(-nc, nc + 1):
+            if dy == 0 and dx == 0:
+                continue
+            ys0, ys1 = max(0, dy), ny + min(0, dy)
+            yd0, yd1 = max(0, -dy), ny + min(0, -dy)
+            xs0, xs1 = max(0, dx), nx + min(0, dx)
+            xd0, xd1 = max(0, -dx), nx + min(0, -dx)
+            if ys1 <= ys0 or xs1 <= xs0:
+                continue
+            np.maximum(out[yd0:yd1, xd0:xd1], grid[ys0:ys1, xs0:xs1], out=out[yd0:yd1, xd0:xd1])
+    return out
+
+
+def fetch_rrfsens_member_nmep():
+    """TRUE 5/10 nm neighborhood-max ensemble probability (NMEP) of the Cumulus echo-top standoff,
+    from the individual RRFS ensemble members (rrfs_a/rrfsens.DATE/CC/mNNN/) instead of the 40 km
+    enspost 'prob' product. Optionally time-lags the prior cycle's members (+6 h, valid-time
+    aligned) for a 10-member ensemble. Per member we take the MAX echo top inside the real circular
+    ring; the caller counts the fraction whose in-ring max reaches the -10C / -20C height.
+    Returns ({sid: {row_key: {"et5":[m...], "et10":[m...]}}}, {row_key: map_path}); empty on
+    failure so the caller falls back to the enspost method."""
+    if not REFS_MEMBER_NMEP_ENABLED:
+        return {}, {}
+
+    all_coords = {}
+    for pid, c in LAUNCH_PADS.items():
+        all_coords[pid] = {"lat": c["lat"], "lon": c["lon"]}
+    for sid, c in STN_COORDS.items():
+        all_coords[sid] = {"lat": c["lat"], "lon": c["lon"]}
+
+    session = requests.Session()
+    session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=3))
+    session.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"})
+
+    WINDOW_FH = 24
+    LAG_HOURS = 6
+    tmpl = "rrfs_a/rrfsens.{d}/{cc}/{mem}/rrfs.t{cc}z.{mem}.2dfld.3km.f{fh:03d}.conus.grib2"
+
+    def _idx_ok(d, cc, mem, fh):
+        u = f"{RRFS_AWS_ROOT}/{tmpl.format(d=d, cc=cc, mem=mem, fh=fh)}.idx"
+        try:
+            r = session.get(u, timeout=12)
+            return r.status_code == 200 and len(r.text) > 50
+        except Exception:
+            return False
+
+    # --- newest cycle with m001 2dfld through the full window ---
+    now = datetime.datetime.now(datetime.timezone.utc)
+    date_str = cycle = None
+    cyc_dt = None
+    for back in range(0, 48):
+        cand = now - datetime.timedelta(hours=back)
+        if cand.hour not in (0, 6, 12, 18):
+            continue
+        d, cc = cand.strftime("%Y%m%d"), f"{cand.hour:02d}"
+        if _idx_ok(d, cc, "m001", WINDOW_FH):
+            date_str, cycle, cyc_dt = d, cc, cand.replace(minute=0, second=0, microsecond=0)
+            break
+    if not cycle:
+        logging.warning("REFS member NMEP: no rrfsens cycle with m001 2dfld f24; falling back to enspost.")
+        return {}, {}
+
+    # --- member discovery (m001.. until a gap) ---
+    members = []
+    for n in range(1, 21):
+        mem = f"m{n:03d}"
+        if _idx_ok(date_str, cycle, mem, 1):
+            members.append(mem)
+        elif members:
+            break
+    if not members:
+        members = ["m001"]
+
+    # --- time-lag: prior cycle members, valid-time aligned via fh+LAG ---
+    lag_date = lag_cycle = None
+    lag_members = []
+    if REFS_MEMBER_TLE:
+        prior = cyc_dt - datetime.timedelta(hours=LAG_HOURS)
+        dp, ccp = prior.strftime("%Y%m%d"), f"{prior.hour:02d}"
+        if _idx_ok(dp, ccp, "m001", WINDOW_FH + LAG_HOURS):
+            lag_date, lag_cycle = dp, ccp
+            for mem in members:
+                if _idx_ok(dp, ccp, mem, WINDOW_FH + LAG_HOURS):
+                    lag_members.append(mem)
+    n_total = len(members) + len(lag_members)
+    logging.info("REFS member NMEP: cycle %s %sz (%d members)%s -> %d-member ensemble." % (
+        date_str, cycle, len(members),
+        (f" + lag {lag_date} {lag_cycle}z ({len(lag_members)})" if lag_members else " (no time-lag)"),
+        n_total))
+
+    r5_nm = REFS_CUMULUS_RADII_NM["neg10"]
+    r10_nm = REFS_CUMULUS_RADII_NM["neg20"]
+
+    # --- fetch tasks: (valid_row_key, label, d, cc, fh) ---
+    tasks = []
+    for fh in range(1, WINDOW_FH + 1):
+        valid = cyc_dt + datetime.timedelta(hours=fh)
+        rk = f"{valid.day:02d}/{valid.hour:02d}"
+        for mem in members:
+            tasks.append((rk, f"cur-{mem}", date_str, cycle, fh))
+        for mem in lag_members:
+            tasks.append((rk, f"lag-{mem}", lag_date, lag_cycle, fh + LAG_HOURS))
+
+    sanity = {"done": False}
+
+    def _fetch_crop(d, cc, mem, fh):
+        base = f"{RRFS_AWS_ROOT}/{tmpl.format(d=d, cc=cc, mem=mem, fh=fh)}"
+        local = os.path.join(CACHE_DIR, f"rrfsens_{cc}z_{mem}_f{fh:03d}_{d}.grib2")
+        try:
+            r = session.get(base + ".idx", timeout=15)
+            if r.status_code != 200:
+                return None
+            entries = _parse_grib_idx(r.text)
+            cand = [e for e in entries
+                    if "RETOP" in f"{e['short']} {e['level']}".upper() or "ETOP" in e['short'].upper()]
+            if not cand:
+                return None
+            e = cand[0]
+            hdr = {"Range": f"bytes={e['start']}-{e['end'] if e['end'] is not None else ''}"}
+            rr = session.get(base, headers=hdr, timeout=30)
+            if rr.status_code not in (200, 206) or not rr.content:
+                return None
+            with open(local, "wb") as fhh:
+                fhh.write(rr.content)
+            if os.path.getsize(local) == 0:
+                return None
+            grbs = pygrib.open(local)
+            grb = None
+            for g in grbs:
+                grb = g
+                break
+            if grb is None:
+                grbs.close()
+                return None
+            vals = _sanitize_grid(grb.values)
+            lats, lons = grb.latlons()
+            grbs.close()
+            lons_n = np.where(lons > 180, lons - 360.0, lons)
+            inbox = ((lats >= FL_DOMAIN["lat_min"]) & (lats <= FL_DOMAIN["lat_max"]) &
+                     (lons_n >= FL_DOMAIN["lon_min"]) & (lons_n <= FL_DOMAIN["lon_max"]))
+            if not inbox.any():
+                return None
+            yy, xx = np.where(inbox)
+            y0, y1, x0, x1 = yy.min(), yy.max() + 1, xx.min(), xx.max() + 1
+            return (np.array(vals[y0:y1, x0:x1]),
+                    np.array(lats[y0:y1, x0:x1]),
+                    np.array(lons_n[y0:y1, x0:x1]))
+        except Exception as ex:
+            logging.debug(f"member RETOP {mem} f{fh:03d} failed: {ex}")
+            return None
+        finally:
+            if os.path.exists(local):
+                try:
+                    os.remove(local)
+                except Exception:
+                    pass
+
+    by_rk = {}
+    lock = threading.Lock()
+
+    def _worker(rk, label, d, cc, fh):
+        mem = label.split("-", 1)[1]
+        crop = _fetch_crop(d, cc, mem, fh)
+        if crop is None:
+            return
+        with lock:
+            if not sanity["done"]:
+                sanity["done"] = True
+                try:
+                    logging.info(f"[REFS MEMBER NMEP] sample {label} f{fh:03d} echo-top max="
+                                 f"{float(np.nanmax(crop[0])):.0f} m (expect ~10000-18000 m if meters).")
+                except Exception:
+                    pass
+            by_rk.setdefault(rk, {})[label] = crop
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        futs = [ex.submit(_worker, *t) for t in tasks]
+        for _ in concurrent.futures.as_completed(futs):
+            pass
+
+    if not by_rk:
+        logging.warning("REFS member NMEP: no member RETOP crops fetched; falling back to enspost.")
+        return {}, {}
+
+    # --- aggregate: per site per row_key -> per-member in-ring max echo top (m) ---
+    matrix = {sid: {} for sid in all_coords}
+    debug_field = {}
+    for rk, memmap in by_rk.items():
+        if not memmap:
+            continue
+        ref_label = next(iter(memmap))
+        _, ref_lats, ref_lons = memmap[ref_label]
+        ref_shape = ref_lats.shape
+        site_cell = {}
+        for sid, c in all_coords.items():
+            dist = (ref_lats - c["lat"]) ** 2 + (ref_lons - c["lon"]) ** 2
+            iy, ix = np.unravel_index(np.argmin(dist), dist.shape)
+            site_cell[sid] = (iy, ix)
+        aligned = [(la, lo, vals) for (vals, la, lo) in memmap.values() if la.shape == ref_shape]
+        for sid, c in all_coords.items():
+            iy, ix = site_cell[sid]
+            et5, et10 = [], []
+            for (la, lo, vals) in aligned:
+                et5.append(_ring_reduce(vals, la, lo, c["lat"], c["lon"], iy, ix, r5_nm, "max"))
+                et10.append(_ring_reduce(vals, la, lo, c["lat"], c["lon"], iy, ix, r10_nm, "max"))
+            matrix[sid][rk] = {"et5": et5, "et10": et10}
+        stack = np.stack([vals for (la, lo, vals) in aligned]) if aligned else None
+        if stack is not None and stack.shape[0]:
+            nc = 3
+            exceed = np.zeros(stack.shape[1:], dtype=float)
+            for mi in range(stack.shape[0]):
+                exceed += (_neighborhood_max(stack[mi], nc) > 6096.0)
+            debug_field[rk] = (ref_lons, ref_lats, 100.0 * exceed / stack.shape[0])
+
+    got = sum(len(v) for v in matrix.values())
+    logging.info(f"REFS member NMEP: {got} site-hours from a {n_total}-member ensemble "
+                 f"({len(by_rk)} valid hours fetched).")
+
+    # --- diagnostic maps (member NMEP P(top>20kft) at ~5 nm; compare DESI at ~10 km) ---
+    debug_paths = {}
+    if REFS_CUMULUS_DEBUG_MAPS and debug_field:
+        dbg_dir = os.path.join(MAPS_DIR, "refs_debug")
+        if os.path.isdir(dbg_dir):
+            for old in os.listdir(dbg_dir):
+                if old.endswith(".png"):
+                    try:
+                        os.remove(os.path.join(dbg_dir, old))
+                    except Exception:
+                        pass
+        drawn = 0
+        for rk in sorted(debug_field):
+            lo, la, fld = debug_field[rk]
+            p = _render_refs_echotop_debug_map(rk, lo, la, fld, f"{cycle}z-m{n_total}", "20kft")
+            if p:
+                debug_paths[rk] = p
+                drawn += 1
+        logging.info(f"[REFS MEMBER NMEP] wrote {drawn}/{len(debug_field)} member-NMEP debug maps "
+                     f"(P(top>20kft) ~5nm) to maps/refs_debug/.")
+
+    return matrix, debug_paths
+
+
 def fetch_refs_echotop_probs():
     """Pull REFS pre-computed echo-top exceedance probabilities P(echo top > {6096..15240} m)
     from the ensemble prob file. The RETOP messages ARE the ensemble member-fraction already;
@@ -2804,29 +3060,65 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     refs_cumulus_maps = {}
     if REFS_CUMULUS_ENABLED:
         try:
-            etop, refs_cumulus_maps = fetch_refs_echotop_probs()
             KFT_TO_M = 304.8
             filled = 0
-            for sid, hours in (etop or {}).items():
-                refs_rows = (combined_data.get(sid, {}) or {}).get("refs")
-                if not isinstance(refs_rows, dict):
-                    continue
-                for row_key, curves in hours.items():
-                    p = refs_rows.get(row_key)
-                    if not isinstance(p, dict):
+            member_matrix, member_maps = ({}, {})
+            if REFS_MEMBER_NMEP_ENABLED:
+                member_matrix, member_maps = fetch_rrfsens_member_nmep()
+
+            if member_matrix:
+                # TRUE member time-lagged NMEP at the real 5/10 nm radius. For each site-hour count
+                # the fraction of members whose in-ring MAX echo top reaches the isotherm height —
+                # a direct height comparison, so there is no fixed-knot 20 kft floor (no '*').
+                refs_cumulus_maps = member_maps
+                for sid, hours in member_matrix.items():
+                    refs_rows = (combined_data.get(sid, {}) or {}).get("refs")
+                    if not isinstance(refs_rows, dict):
                         continue
-                    h10 = p.get("hght_10c")  # kft, REFS-mean isotherm heights
-                    h20 = p.get("hght_20c")
-                    if h10:
-                        val, q = _interp_exceedance(curves.get("c5", {}), h10 * KFT_TO_M)
-                        p["cuP_neg10_5nm"] = val
-                        p["cuP_neg10_5nm_q"] = q
-                    if h20:
-                        val, q = _interp_exceedance(curves.get("c10", {}), h20 * KFT_TO_M)
-                        p["cuP_neg20_10nm"] = val
-                        p["cuP_neg20_10nm_q"] = q
-                    filled += 1
-            logging.info(f"REFS cumulus probabilities computed for {filled} REFS site-hours.")
+                    for row_key, ets in hours.items():
+                        p = refs_rows.get(row_key)
+                        if not isinstance(p, dict):
+                            continue
+                        h10 = p.get("hght_10c")  # kft, REFS-mean isotherm heights
+                        h20 = p.get("hght_20c")
+                        et5 = ets.get("et5") or []
+                        et10 = ets.get("et10") or []
+                        if h10 and et5:
+                            n = len(et5)
+                            h10m = h10 * KFT_TO_M
+                            p["cuP_neg10_5nm"] = round(100.0 * sum(1 for e in et5 if e >= h10m) / n)
+                            p["cuP_neg10_5nm_q"] = f"nmep{n}"
+                        if h20 and et10:
+                            n = len(et10)
+                            h20m = h20 * KFT_TO_M
+                            p["cuP_neg20_10nm"] = round(100.0 * sum(1 for e in et10 if e >= h20m) / n)
+                            p["cuP_neg20_10nm_q"] = f"nmep{n}"
+                        filled += 1
+                logging.info(f"REFS cumulus (member NMEP) computed for {filled} REFS site-hours.")
+            else:
+                # Fallback: the 40 km enspost exceedance-curve method (interpolate P(top>H) at the
+                # isotherm height). Kept so the column never goes dark if members are unavailable.
+                etop, refs_cumulus_maps = fetch_refs_echotop_probs()
+                for sid, hours in (etop or {}).items():
+                    refs_rows = (combined_data.get(sid, {}) or {}).get("refs")
+                    if not isinstance(refs_rows, dict):
+                        continue
+                    for row_key, curves in hours.items():
+                        p = refs_rows.get(row_key)
+                        if not isinstance(p, dict):
+                            continue
+                        h10 = p.get("hght_10c")  # kft, REFS-mean isotherm heights
+                        h20 = p.get("hght_20c")
+                        if h10:
+                            val, q = _interp_exceedance(curves.get("c5", {}), h10 * KFT_TO_M)
+                            p["cuP_neg10_5nm"] = val
+                            p["cuP_neg10_5nm_q"] = q
+                        if h20:
+                            val, q = _interp_exceedance(curves.get("c10", {}), h20 * KFT_TO_M)
+                            p["cuP_neg20_10nm"] = val
+                            p["cuP_neg20_10nm_q"] = q
+                        filled += 1
+                logging.info(f"REFS cumulus (enspost 40km fallback) computed for {filled} REFS site-hours.")
         except Exception as e:
             logging.error(f"REFS cumulus probabilities failed, continuing without them: {e}")
 
