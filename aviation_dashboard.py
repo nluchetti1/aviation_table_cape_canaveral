@@ -2275,59 +2275,77 @@ def _ring_reduce(arr, lats, lons_n, clat, clon, iy, ix, radius_nm, method, half=
     return round(float(np.max(vals)), 1)
 
 
-def probe_refs_member_layout(session, date_str, cycle):
-    """One-shot discovery: determine whether individual REFS members (each carrying its own RETOP)
-    are published on the bucket, or only post-processed ensemble products (avrg/eas/prob). The
-    enspost 'prob' RETOP is a ~40 km NMEP; a true 5/10 nm LCC standoff needs member-level RETOP.
-    Emits ONE decisive VERDICT line so it survives log/paste truncation."""
+def probe_rrfsens_member_retop(session):
+    """Confirm the individual RRFS ensemble members carry RETOP (echo top) and in WHICH file, so
+    we can build a true 5/10 nm member NMEP. Members live under rrfs_a/rrfsens.DATE/CC/mNNN/ — a
+    DIFFERENT prefix from the 'refs.' enspost products (which is why the old probe only ever saw
+    avrg/eas/prob). Logs the member list and the exact RETOP idx line. One-shot diagnostic."""
     import re as _re
-    base = f"rrfs_a/refs.{date_str}/{cycle}/"
 
-    # (a) subdirs directly under the cycle root — members would appear as mem01/, m01/, ...
-    subdirs = []
-    try:
-        r = session.get(f"{RRFS_AWS_ROOT}/?list-type=2&prefix={base}&delimiter=/&max-keys=1000", timeout=20)
-        if r.status_code == 200:
-            subdirs = sorted({p.rstrip("/").split("/")[-1] for p in _re.findall(r"<Prefix>([^<]+)</Prefix>", r.text)})
-    except Exception as e:
-        logging.info(f"[REFS MEMBER PROBE] subdir list error: {e}")
+    def _retop_lines(text):
+        ents = _parse_grib_idx(text)
+        rl = [f"{e['short']}:{e['level']}" for e in ents
+              if "RETOP" in e['short'].upper() or "ETOP" in e['short'].upper()]
+        return ents, rl
 
-    # (b) flat listing (no delimiter, paginated) to catch member FILES like refs.tCCz.m01... or
-    #     refs.tCCz.mem01... The token right after 'refs.tCCz.' names the product/member.
-    prods, token, pages = set(), None, 0
-    while pages < 8:
-        pages += 1
-        url = f"{RRFS_AWS_ROOT}/?list-type=2&prefix={base}&max-keys=1000"
-        if token:
-            url += f"&continuation-token={requests.utils.quote(token, safe='')}"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for back in range(0, 48):
+        cand = now - datetime.timedelta(hours=back)
+        if cand.hour not in (0, 6, 12, 18):
+            continue
+        d, cc = cand.strftime("%Y%m%d"), f"{cand.hour:02d}"
+        base = f"rrfs_a/rrfsens.{d}/{cc}"
+        # Require the full window (f024) of m001's 2dfld to be posted before accepting the cycle.
+        head = f"{RRFS_AWS_ROOT}/{base}/m001/rrfs.t{cc}z.m001.2dfld.3km.f024.conus.grib2.idx"
         try:
-            r = session.get(url, timeout=25)
-            if r.status_code != 200:
-                logging.info(f"[REFS MEMBER PROBE] flat list -> HTTP {r.status_code}")
-                break
-            for k in _re.findall(r"<Key>([^<]+)</Key>", r.text):
-                mm = _re.match(rf"refs\.t{cycle}z\.([a-z0-9]+)\.", os.path.basename(k))
-                if mm:
-                    prods.add(mm.group(1))
-            m = _re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", r.text)
-            token = m.group(1) if m else None
-            if not token:
-                break
+            r = session.get(head, timeout=15)
         except Exception as e:
-            logging.info(f"[REFS MEMBER PROBE] flat list error: {e}")
-            break
+            logging.info(f"[RRFSENS PROBE] {d} {cc}z probe error: {e}")
+            continue
+        if r.status_code != 200 or len(r.text) < 50:
+            continue
 
-    # Member indicators from either the subdir layout or the flat filename tokens.
-    member_tokens = sorted(t for t in (set(subdirs) | prods) if _re.fullmatch(r"m(em)?\d+", t))
-    logging.info(f"[REFS MEMBER PROBE] cycle {date_str} {cycle}z: subdirs={subdirs[:20]}; "
-                 f"product/member tokens={sorted(prods)[:30]}")
-    if member_tokens:
-        logging.info(f"[REFS MEMBER PROBE] VERDICT: MEMBERS FOUND -> {member_tokens[:40]} "
-                     f"(a true 5/10 nm member NMEP is buildable from these).")
-    else:
-        logging.info(f"[REFS MEMBER PROBE] VERDICT: NO MEMBER FILES — bucket publishes only ensemble "
-                     f"products {sorted(prods)[:15]}. A 5/10 nm NMEP is NOT buildable here; the 40 km "
-                     f"'prob' field is the only echo-top probability NOAA posts on this bucket.")
+        # Enumerate member directories (m001, m002, ...).
+        members = []
+        try:
+            lr = session.get(f"{RRFS_AWS_ROOT}/?list-type=2&prefix={base}/&delimiter=/&max-keys=300", timeout=20)
+            members = sorted({mm.group(0) for mm in
+                              (_re.search(r"m\d{3}", p) for p in _re.findall(r"<Prefix>([^<]+)</Prefix>", lr.text)) if mm})
+        except Exception:
+            pass
+
+        # Locate RETOP: try 2dfld first, then subset as a fallback.
+        ents, rl = _retop_lines(r.text)
+        where = "2dfld"
+        if not rl:
+            try:
+                sr = session.get(f"{RRFS_AWS_ROOT}/{base}/m001/rrfs.t{cc}z.m001.subset.3km.f024.conus.grib2.idx", timeout=15)
+                if sr.status_code == 200 and len(sr.text) > 50:
+                    ents2, rl2 = _retop_lines(sr.text)
+                    if rl2:
+                        where, rl, ents = "subset", rl2, ents2
+            except Exception:
+                pass
+
+        shorts = sorted({e['short'] for e in ents}) if ents else []
+        logging.info(f"[RRFSENS PROBE] cycle {d} {cc}z: members={members or ['m001?']} (n={len(members)})")
+        logging.info(f"[RRFSENS PROBE] RETOP found in '{where}'? -> {rl[:2] if rl else 'NOT FOUND in 2dfld/subset'}; "
+                     f"m001 {where} shorts sample={shorts[:24]}")
+
+        # Confirm the prior cycle (6 h earlier) is posted deep enough for a time-lagged 10-member
+        # ensemble: for our window f01..f24 the lagged cycle must reach f30 (= f24 + 6 h offset).
+        prior = cand - datetime.timedelta(hours=6)
+        dp, ccp = prior.strftime("%Y%m%d"), f"{prior.hour:02d}"
+        lag_url = f"{RRFS_AWS_ROOT}/rrfs_a/rrfsens.{dp}/{ccp}/m001/rrfs.t{ccp}z.m001.2dfld.3km.f030.conus.grib2.idx"
+        try:
+            lr2 = session.get(lag_url, timeout=15)
+            ok = (lr2.status_code == 200 and len(lr2.text) > 50)
+        except Exception:
+            ok = False
+        logging.info(f"[RRFSENS PROBE] time-lag cycle {dp} {ccp}z f030 posted? -> {'YES' if ok else 'NO'} "
+                     f"(need it for the +6 h lagged 5 members -> 10-member TLE).")
+        return
+    logging.info("[RRFSENS PROBE] no rrfsens cycle with m001 2dfld f024 found in the last 48h.")
 
 
 def _render_refs_echotop_debug_map(row_key, sub_lons, sub_lats, sub_vals, cycle, thr_label):
@@ -2472,7 +2490,7 @@ def fetch_refs_echotop_probs():
                  f"(neighborhood reducer = '{REFS_CUMULUS_NBR_REDUCER}')")
 
     if REFS_MEMBER_PROBE:
-        probe_refs_member_layout(session, date_str, cycle)
+        probe_rrfsens_member_retop(session)
 
     r5_nm = REFS_CUMULUS_RADII_NM['neg10']    # 5 nm standoff ring for the -10C column
     r10_nm = REFS_CUMULUS_RADII_NM['neg20']   # 10 nm standoff ring for the -20C column
