@@ -116,6 +116,12 @@ REFS_MEMBER_LAG_CYCLES = 1
 # +6 h lag cycle doesn't reach fall back to 5 members.
 REFS_MEMBER_WINDOW_FH = 60
 
+# Per-member REFS launch-thermo (KXMR panel): pull each ensemble member's full isobaric sounding at
+# XMR for the 10Z hours, compute the indices per member, and average the RESULTS — the valid way to
+# get an ensemble TI/PWAT (never from the ensemble-MEAN sounding). Costs a handful of member GRIB
+# range-reads per run (only the ~2-3 forecast hours that land on 10Z), so it's gated here.
+REFS_MEMBER_THERMO_ENABLED = True
+
 
 STN_COORDS = {
     "kxmr": {"lat": 28.468, "lon": -80.556},
@@ -1160,69 +1166,127 @@ def _theta_e(tk, tdk, p):
         math.exp((3.376 / tlcl - 0.00254) * r * 1000.0 * (1.0 + 0.81 * r))
 
 
+try:
+    import metpy.calc as _mpcalc
+    from metpy.units import units as _mpunits
+    _HAVE_METPY = True
+except Exception:
+    _HAVE_METPY = False
+
+_ML_DEPTH_HPA = 100.0  # mixed-layer parcel depth (lowest 100 hPa) for the Lifted Index
+
+
+def _mean_flow(layers):
+    """1000-700 mb vector-mean wind: FROM-direction, speed (kt), 8-pt compass regime, and the
+    mean u/v components (kept so an ensemble can be averaged in component space)."""
+    us = [L["u"] for L in layers if 700.0 <= L["pres"] <= 1000.0 and L.get("u") is not None]
+    vs = [L["v"] for L in layers if 700.0 <= L["pres"] <= 1000.0 and L.get("v") is not None]
+    if not us:
+        return {}
+    um, vm = sum(us) / len(us), sum(vs) / len(vs)
+    frm = math.degrees(math.atan2(-um, -vm)) % 360.0
+    compass = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((frm + 22.5) // 45) % 8]
+    return {"mf_dir": round(frm), "mf_spd": round(math.hypot(um, vm), 1),
+            "mf_regime": compass, "mf_u": round(um, 3), "mf_v": round(vm, 3)}
+
+
+def _thermo_metpy(layers):
+    """K-Index, PWAT, and MIXED-LAYER Lifted Index (+ Thompson = KI-LI) via MetPy."""
+    P, T, D = [], [], []
+    for L in layers:
+        if None in (L.get("pres"), L.get("tmpc"), L.get("dwpt")):
+            continue
+        P.append(L["pres"]); T.append(L["tmpc"]); D.append(min(L["dwpt"], L["tmpc"]))
+    if len(P) < 4:
+        return {}
+    p = np.array(P) * _mpunits.hPa
+    Tq = np.array(T) * _mpunits.degC
+    Tdq = np.array(D) * _mpunits.degC
+
+    def _scal(q):
+        return float(np.atleast_1d(q.magnitude)[0])
+
+    out = {}
+    ki = _scal(_mpcalc.k_index(p, Tq, Tdq))
+    out["k_index"] = round(ki, 1)
+    pw_in = _scal(_mpcalc.precipitable_water(p, Tdq).to("inch"))
+    out["pwat_in"] = round(pw_in, 2)
+    out["pwat_mm"] = round(pw_in * 25.4, 1)
+    # Mixed-layer parcel over the lowest _ML_DEPTH_HPA, lifted to 500 mb
+    _, mp_T, mp_Td = _mpcalc.mixed_parcel(p, Tq, Tdq, depth=_ML_DEPTH_HPA * _mpunits.hPa)
+    prof = _mpcalc.parcel_profile(p, mp_T, mp_Td).to("degC")
+    li = _scal(_mpcalc.lifted_index(p, Tq, prof))
+    out["lifted_index"] = round(li, 1)
+    out["thompson"] = round(ki - li, 1)
+    out["parcel"] = "mixed-layer"
+    out["engine"] = "metpy"
+    return out
+
+
+def _thermo_numpy(layers):
+    """Fallback for when MetPy isn't installed: KI, PWAT, and a MIXED-LAYER Lifted Index built by
+    mixing potential temperature and mixing ratio over the lowest _ML_DEPTH_HPA, then lifting via
+    theta-e conservation to 500 mb."""
+    out = {}
+    t850 = _interp_logp(layers, 850, "tmpc"); td850 = _interp_logp(layers, 850, "dwpt")
+    t700 = _interp_logp(layers, 700, "tmpc"); td700 = _interp_logp(layers, 700, "dwpt")
+    t500 = _interp_logp(layers, 500, "tmpc")
+    ki = None
+    if None not in (t850, td850, t700, td700, t500):
+        ki = (t850 - t500) + td850 - (t700 - td700)
+        out["k_index"] = round(ki, 1)
+    li = None
+    p_sfc = layers[0]["pres"]
+    ml = [L for L in layers if L.get("tmpc") is not None and L.get("dwpt") is not None
+          and (p_sfc - L["pres"]) <= _ML_DEPTH_HPA]
+    if t500 is not None and ml:
+        theta_ml = sum((L["tmpc"] + 273.15) * (1000.0 / L["pres"]) ** 0.2854 for L in ml) / len(ml)
+        w_ml = sum(_mixing_ratio_gkg(L["dwpt"], L["pres"]) / 1000.0 for L in ml) / len(ml)
+        ml_tk = theta_ml * (p_sfc / 1000.0) ** 0.2854
+        e = max(w_ml * p_sfc / (0.62197 + w_ml), 1e-6)
+        ml_tdc = 243.5 * math.log(e / 6.112) / (17.67 - math.log(e / 6.112))
+        thetae_parcel = _theta_e(ml_tk, ml_tdc + 273.15, p_sfc)
+        lo, hi = 200.0, 320.0
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            if _theta_e(mid, mid, 500.0) < thetae_parcel:
+                lo = mid
+            else:
+                hi = mid
+        li = t500 - (0.5 * (lo + hi) - 273.15)
+        out["lifted_index"] = round(li, 1)
+    if ki is not None and li is not None:
+        out["thompson"] = round(ki - li, 1)
+    wl = [L for L in layers if L.get("dwpt") is not None]
+    if len(wl) >= 3:
+        tot = 0.0
+        for i in range(len(wl) - 1):
+            p1, p2 = wl[i]["pres"], wl[i + 1]["pres"]
+            w1 = _mixing_ratio_gkg(wl[i]["dwpt"], p1) / 1000.0
+            w2 = _mixing_ratio_gkg(wl[i + 1]["dwpt"], p2) / 1000.0
+            tot += 0.5 * (w1 + w2) * ((p1 - p2) * 100.0) / 9.81
+        out["pwat_mm"] = round(tot, 1)
+        out["pwat_in"] = round(tot / 25.4, 2)
+    out["parcel"] = "mixed-layer"
+    out["engine"] = "numpy"
+    return out
+
+
 def compute_launch_thermo(profile_layers):
-    """1000-700 mb mean flow (+ compass regime), K-Index, Lifted Index, Thompson Index (KI-LI),
-    and PWAT — all from the shared sounding profile. Returns {} if the profile is too thin."""
+    """1000-700 mb mean flow (+ regime), K-Index, MIXED-LAYER Lifted Index, Thompson Index (KI-LI),
+    and PWAT. Uses MetPy when available and falls back to an equivalent numpy implementation.
+    NOTE: this is now called on demand for the launch-thermo panel only (not per profile), since the
+    MetPy path is ~17 ms/profile. Returns {} if the profile is too thin."""
     try:
         layers = sorted([L for L in profile_layers if L.get("pres") is not None],
                         key=lambda x: -x["pres"])
         if len(layers) < 4:
             return {}
-        out = {}
-
-        # --- 1000-700 mb mean flow (vector mean of u/v) ---
-        us = [L["u"] for L in layers if 700.0 <= L["pres"] <= 1000.0 and L.get("u") is not None]
-        vs = [L["v"] for L in layers if 700.0 <= L["pres"] <= 1000.0 and L.get("v") is not None]
-        if us:
-            um, vm = sum(us) / len(us), sum(vs) / len(vs)
-            spd = math.hypot(um, vm)
-            frm = math.degrees(math.atan2(-um, -vm)) % 360.0  # direction FROM
-            compass = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((frm + 22.5) // 45) % 8]
-            out["mf_dir"] = round(frm)
-            out["mf_spd"] = round(spd, 1)
-            out["mf_regime"] = compass
-
-        # --- K-Index ---
-        t850 = _interp_logp(layers, 850, "tmpc"); td850 = _interp_logp(layers, 850, "dwpt")
-        t700 = _interp_logp(layers, 700, "tmpc"); td700 = _interp_logp(layers, 700, "dwpt")
-        t500 = _interp_logp(layers, 500, "tmpc")
-        ki = None
-        if None not in (t850, td850, t700, td700, t500):
-            ki = (t850 - t500) + td850 - (t700 - td700)
-            out["k_index"] = round(ki, 1)
-
-        # --- Lifted Index (surface parcel to 500 mb via theta-e conservation) ---
-        li = None
-        sfc = layers[0]
-        if t500 is not None and sfc.get("tmpc") is not None and sfc.get("dwpt") is not None:
-            tk, tdk = sfc["tmpc"] + 273.15, sfc["dwpt"] + 273.15
-            tdk = min(tdk, tk)  # guard supersaturation
-            thetae_parcel = _theta_e(tk, tdk, sfc["pres"])
-            lo, hi = 200.0, 320.0
-            for _ in range(60):
-                mid = 0.5 * (lo + hi)
-                if _theta_e(mid, mid, 500.0) < thetae_parcel:  # sat theta-e at (T,500)
-                    lo = mid
-                else:
-                    hi = mid
-            li = t500 - (0.5 * (lo + hi) - 273.15)
-            out["lifted_index"] = round(li, 1)
-
-        # --- Thompson Index = KI - LI ---
-        if ki is not None and li is not None:
-            out["thompson"] = round(ki - li, 1)
-
-        # --- PWAT (trapezoidal integral of mixing ratio) ---
-        wl = [L for L in layers if L.get("dwpt") is not None]
-        if len(wl) >= 3:
-            tot = 0.0
-            for i in range(len(wl) - 1):
-                p1, p2 = wl[i]["pres"], wl[i + 1]["pres"]
-                w1 = _mixing_ratio_gkg(wl[i]["dwpt"], p1) / 1000.0
-                w2 = _mixing_ratio_gkg(wl[i + 1]["dwpt"], p2) / 1000.0
-                tot += 0.5 * (w1 + w2) * ((p1 - p2) * 100.0) / 9.81  # mm (rho_w=1000 cancels)
-            out["pwat_mm"] = round(tot, 1)
-            out["pwat_in"] = round(tot / 25.4, 2)
+        out = dict(_mean_flow(layers))
+        core = _thermo_metpy(layers) if _HAVE_METPY else {}
+        if not core:
+            core = _thermo_numpy(layers)
+        out.update(core)
         return out
     except Exception:
         return {}
@@ -1416,7 +1480,7 @@ def compute_profile_variables(profile_layers):
         "cloud_thick": round(max([max(0.0, c["top"] - c["base"]) for c in extent_decks], default=0.0) / 1000.0, 1),
         "thick_layer": 1 if thick_layer_violated else 0,
         "thick_layer_ft": round(thickest_in_band_ft),
-        **compute_launch_thermo(profile_layers),
+        "_layers": profile_layers,
     }
 
 
@@ -3153,49 +3217,185 @@ def fetch_refs_echotop_probs():
 
 
 # ---------------------------------------------------------------------------------------------
-# Launch-thermo climatology (KXMR). Percentile breakpoints are at these percentile ranks:
-CLIMO_PCTL_POINTS = [0, 10, 25, 50, 75, 90, 99, 100]
-# PWAT monthly climatology for XMR (Cape Canaveral), INCHES, at the ranks above.
-# NOTE: these are APPROXIMATE Florida-coast values as a working placeholder — replace each row
-# with the real XMR percentiles off the SPC sounding-climatology page when convenient.
+# Launch-thermo climatology (KXMR), assessed at 10Z.
+#
+# PWAT: from the SPC sounding-climatology tool (station XMR, 10Z), which reports a DAILY climatology
+# at these 7 percentile ranks. Read the 15th of each month at 10Z and drop the 7 values in below.
+PWAT_PCTL_POINTS = [0, 10, 25, 50, 75, 90, 100]   # Min, 10%, 25%, Median, 75%, 90%, Max
+# Month -> [Min, 10%, 25%, 50%, 75%, 90%, Max] in inches. REAL values read off the SPC sounding-
+# climatology tool (station XMR / Cape Kennedy), ~15th of each month, from the period of record
+# 1956-2025 (44,308 soundings). Hours vary slightly by read (the daily-smoothed climo is hour-stable).
 PWAT_CLIMO_XMR = {
-    1:  [0.3, 0.5, 0.6, 0.8, 1.0, 1.2, 1.5, 1.8],
-    2:  [0.3, 0.5, 0.6, 0.8, 1.0, 1.2, 1.5, 1.8],
-    3:  [0.3, 0.5, 0.7, 0.9, 1.1, 1.4, 1.7, 2.0],
-    4:  [0.4, 0.6, 0.8, 1.0, 1.3, 1.5, 1.9, 2.2],
-    5:  [0.5, 0.8, 1.0, 1.3, 1.5, 1.8, 2.1, 2.4],
-    6:  [0.8, 1.2, 1.4, 1.7, 1.9, 2.1, 2.4, 2.6],
-    7:  [1.0, 1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.7],
-    8:  [1.0, 1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.7],
-    9:  [0.9, 1.3, 1.5, 1.7, 1.9, 2.2, 2.5, 2.7],
-    10: [0.6, 0.9, 1.1, 1.4, 1.6, 1.9, 2.2, 2.5],
-    11: [0.4, 0.6, 0.8, 1.0, 1.3, 1.5, 1.9, 2.2],
-    12: [0.3, 0.5, 0.6, 0.8, 1.0, 1.2, 1.6, 1.9],
+    1:  [0.25, 0.44, 0.64, 0.91, 1.20, 1.41, 1.70],   # Jan 17
+    2:  [0.27, 0.45, 0.64, 0.90, 1.19, 1.40, 1.67],   # Feb 16
+    3:  [0.36, 0.53, 0.72, 0.96, 1.23, 1.43, 1.66],   # Mar 16
+    4:  [0.50, 0.67, 0.85, 1.07, 1.31, 1.51, 1.72],   # Apr 13
+    5:  [0.75, 0.96, 1.12, 1.31, 1.52, 1.69, 1.88],   # May 14
+    6:  [1.05, 1.26, 1.42, 1.60, 1.77, 1.90, 2.08],   # Jun 17
+    7:  [1.24, 1.46, 1.61, 1.78, 1.94, 2.05, 2.21],   # Jul 15
+    8:  [1.28, 1.48, 1.64, 1.83, 1.99, 2.11, 2.25],   # Aug 16
+    9:  [1.08, 1.29, 1.47, 1.69, 1.90, 2.06, 2.24],   # Sep 16
+    10: [0.78, 1.00, 1.20, 1.44, 1.70, 1.90, 2.14],   # Oct 16
+    11: [0.46, 0.68, 0.89, 1.16, 1.45, 1.67, 1.96],   # Nov 16
+    12: [0.30, 0.51, 0.72, 0.99, 1.27, 1.50, 1.81],   # Dec 15
 }
-# Thompson Index monthly climatology for XMR — PLACEHOLDER pending real data (coworker). Fill each
-# month with 8 values at CLIMO_PCTL_POINTS and the percentile column lights up automatically; until
-# then it stays None and the panel shows the TI value with a "—" percentile.
+# Thompson Index: PLACEHOLDER pending real data (coworker). Set THOMPSON_PCTL_POINTS to match the
+# ranks that data is given at, then fill each month with one value per rank; the percentile lights
+# up automatically. Until then each month is None and the panel shows TI with a "—" percentile.
+THOMPSON_PCTL_POINTS = [0, 10, 25, 50, 75, 90, 100]
 THOMPSON_CLIMO_XMR = {m: None for m in range(1, 13)}
 
 
-def _climo_percentile(value, breaks):
-    """Interpolated percentile rank (0-100) of `value` within monthly breakpoint values."""
-    if value is None or not breaks or len(breaks) != len(CLIMO_PCTL_POINTS):
+def _climo_percentile(value, breaks, points):
+    """Interpolated percentile rank of `value` within monthly breakpoint values at `points`."""
+    if value is None or not breaks or not points or len(breaks) != len(points):
         return None
     if value <= breaks[0]:
-        return 0
+        return points[0]
     if value >= breaks[-1]:
-        return 100
+        return points[-1]
     for i in range(len(breaks) - 1):
         if breaks[i] <= value <= breaks[i + 1]:
             if breaks[i + 1] == breaks[i]:
-                return CLIMO_PCTL_POINTS[i]
+                return points[i]
             f = (value - breaks[i]) / (breaks[i + 1] - breaks[i])
-            return round(CLIMO_PCTL_POINTS[i] + f * (CLIMO_PCTL_POINTS[i + 1] - CLIMO_PCTL_POINTS[i]))
+            return round(points[i] + f * (points[i + 1] - points[i]))
     return None
 
 
-def build_launch_thermo(combined_data, site="kxmr", assess_hour=10):
+def _valid_day_fields(dd, now):
+    """From a forecast day-of-month and 'now', reconstruct (weekday, 'Mon DD', sort key, month, year),
+    wrapping into next month when the day has already passed this month."""
+    month, year = now.month, now.year
+    if dd < now.day - 5:
+        month += 1
+        if month > 12:
+            month, year = 1, year + 1
+    try:
+        vdate = datetime.date(year, month, dd)
+        return (vdate.strftime("%A"), vdate.strftime("%b %d"),
+                f"{year:04d}{month:02d}{dd:02d}", month, year)
+    except Exception:
+        return (f"{dd:02d}", f"{dd:02d}", f"{dd:02d}", now.month, now.year)
+
+
+def fetch_refs_member_thermo(site="kxmr", assess_hour=10):
+    """Meteorologically valid REFS launch-thermo: pull EACH RRFS ensemble member's isobaric sounding
+    at the site for the forecast hours that land on the assessment hour (10Z), compute the indices
+    per member with compute_launch_thermo, and average the RESULTS (TI/PWAT as scalar means; mean
+    flow in u/v component space). This is the correct ensemble number — never the index of the mean
+    sounding. Returns {row_key: {mf_dir, mf_spd, mf_regime, thompson, pwat_in, n}} (empty on failure,
+    so the panel simply omits REFS)."""
+    if not REFS_MEMBER_THERMO_ENABLED:
+        return {}
+    sc = STN_COORDS.get(site)
+    if not sc:
+        return {}
+    coords = {site: {"lat": sc["lat"], "lon": sc["lon"]}}
+
+    session = requests.Session()
+    session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=3))
+    session.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"})
+
+    tmpl = "rrfs_a/rrfsens.{d}/{cc}/{mem}/rrfs.t{cc}z.{mem}.prslev.3km.f{fh:03d}.conus.grib2"
+
+    def _idx_ok(d, cc, mem, fh):
+        try:
+            r = session.get(f"{RRFS_AWS_ROOT}/{tmpl.format(d=d, cc=cc, mem=mem, fh=fh)}.idx", timeout=12)
+            return r.status_code == 200 and len(r.text) > 50
+        except Exception:
+            return False
+
+    # newest rrfsens cycle whose m001 prslev reaches at least the first assess-hour valid time
+    now = datetime.datetime.now(datetime.timezone.utc)
+    date_str = cycle = None
+    cyc_dt = None
+    for back in range(0, 48):
+        cand = now - datetime.timedelta(hours=back)
+        if cand.hour not in (0, 6, 12, 18):
+            continue
+        d, cc = cand.strftime("%Y%m%d"), f"{cand.hour:02d}"
+        first_fh = ((assess_hour - cand.hour) % 24) or 24
+        if _idx_ok(d, cc, "m001", first_fh):
+            date_str, cycle, cyc_dt = d, cc, cand.replace(minute=0, second=0, microsecond=0)
+            break
+    if not cycle:
+        logging.warning("REFS member thermo: no rrfsens prslev cycle found; REFS omitted from panel.")
+        return {}
+
+    members = []
+    for n in range(1, 21):
+        mem = f"m{n:03d}"
+        first_fh = ((assess_hour - cyc_dt.hour) % 24) or 24
+        if _idx_ok(date_str, cycle, mem, first_fh):
+            members.append(mem)
+        elif members:
+            break
+    if not members:
+        return {}
+
+    fhs = [fh for fh in range(1, REFS_MEMBER_WINDOW_FH + 1)
+           if (cyc_dt + datetime.timedelta(hours=fh)).hour == assess_hour]
+    if not fhs:
+        return {}
+
+    out = {}
+    for fh in fhs:
+        valid = cyc_dt + datetime.timedelta(hours=fh)
+        rk = f"{valid.day:02d}/{valid.hour:02d}"
+        per = []
+        for mem in members:
+            grib_url = f"{RRFS_AWS_ROOT}/{tmpl.format(d=date_str, cc=cycle, mem=mem, fh=fh)}"
+            local = None
+            try:
+                ir = session.get(grib_url + ".idx", timeout=15)
+                if ir.status_code != 200:
+                    continue
+                local = _range_download_grib(session, grib_url, _parse_grib_idx(ir.text),
+                                             PAD_LEVELS_HPA, debug=False)
+                if not local:
+                    continue
+                prof = build_pad_profiles_from_grib(local, coords, debug=False).get(site)
+                if not prof:
+                    continue
+                th = compute_launch_thermo(prof)
+                if th:
+                    per.append(th)
+            except Exception as e:
+                logging.debug(f"REFS member thermo {mem} f{fh:03d}: {e}")
+            finally:
+                if local and os.path.exists(local):
+                    try:
+                        os.remove(local)
+                    except Exception:
+                        pass
+        if not per:
+            continue
+
+        def _avg(key):
+            v = [t[key] for t in per if t.get(key) is not None]
+            return sum(v) / len(v) if v else None
+
+        row = {"n": len(per)}
+        mfu, mfv = _avg("mf_u"), _avg("mf_v")
+        if mfu is not None and mfv is not None:
+            frm = math.degrees(math.atan2(-mfu, -mfv)) % 360.0
+            row["mf_dir"] = round(frm)
+            row["mf_spd"] = round(math.hypot(mfu, mfv), 1)
+            row["mf_regime"] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((frm + 22.5) // 45) % 8]
+        ti, pw = _avg("thompson"), _avg("pwat_in")
+        if ti is not None:
+            row["thompson"] = round(ti, 1)
+        if pw is not None:
+            row["pwat_in"] = round(pw, 2)
+        out[rk] = row
+
+    logging.info(f"REFS member thermo: cycle {date_str} {cycle}z, {len(members)} members, "
+                 f"{len(out)} x {assess_hour}Z rows at {site.upper()} (index-of-member mean).")
+    return out
+
+
+def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_rows=None):
     """Assemble the launch-thermo panel: for each model that has a KXMR sounding, one row per
     forecast day at the assessment hour (10Z), with mean flow, regime, Thompson Index (+percentile),
     and PWAT (+percentile). Returns {"site","hour","models":[...],"by_model":{model:[rows]}}."""
@@ -3204,6 +3404,11 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10):
     by_model = {}
     for model, rows in site_models.items():
         if not isinstance(rows, dict):
+            continue
+        # Skip the REFS ensemble-MEAN sounding: airmass indices (moisture-driven PWAT, and KI/LI/
+        # TI) are not meaningful from a mean sounding — averaging RH across members destroys the
+        # moisture structure (PWAT collapses, KI goes dry). RRFS deterministic is the hi-res stand-in.
+        if model == "refs":
             continue
         day_rows = []
         seen_days = set()
@@ -3216,39 +3421,62 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10):
                 continue
             if hh != assess_hour or dd in seen_days:
                 continue
-            if "mf_dir" not in prof and "thompson" not in prof and "pwat_in" not in prof:
+            layers = prof.get("_layers")
+            if not layers:
+                continue
+            th = compute_launch_thermo(layers)   # MetPy (mixed-layer LI) on demand, KXMR 10Z only
+            if not th:
                 continue
             seen_days.add(dd)
-            # reconstruct the valid date (forecast wraps into next month if the day already passed)
-            month = now.month
-            year = now.year
-            if dd < now.day - 5:
-                month += 1
-                if month > 12:
-                    month, year = 1, year + 1
-            try:
-                vdate = datetime.date(year, month, dd)
-                day_label = vdate.strftime("%A")
-                date_str = vdate.strftime("%b %d")
-            except Exception:
-                day_label, date_str, month = row_key, row_key, now.month
-            ti = prof.get("thompson")
-            pwat = prof.get("pwat_in")
+            day_label, date_str, sort_key, month, _yr = _valid_day_fields(dd, now)
+            ti = th.get("thompson")
+            pwat = th.get("pwat_in")
             day_rows.append({
                 "day": day_label,
                 "date": date_str,
-                "sort": f"{year:04d}{month:02d}{dd:02d}",
-                "mf_dir": prof.get("mf_dir"),
-                "mf_spd": prof.get("mf_spd"),
-                "regime": prof.get("mf_regime"),
+                "sort": sort_key,
+                "mf_dir": th.get("mf_dir"),
+                "mf_spd": th.get("mf_spd"),
+                "regime": th.get("mf_regime"),
                 "ti": ti,
-                "ti_pct": _climo_percentile(ti, THOMPSON_CLIMO_XMR.get(month)),
+                "ti_pct": _climo_percentile(ti, THOMPSON_CLIMO_XMR.get(month), THOMPSON_PCTL_POINTS),
                 "pwat": pwat,
-                "pwat_pct": _climo_percentile(pwat, PWAT_CLIMO_XMR.get(month)),
+                "pwat_pct": _climo_percentile(pwat, PWAT_CLIMO_XMR.get(month), PWAT_PCTL_POINTS),
+                "engine": th.get("engine"),
             })
         if day_rows:
             day_rows.sort(key=lambda r: r["sort"])
             by_model[model] = day_rows
+
+    # REFS re-added as a TRUE ensemble: per-member indices averaged (from fetch_refs_member_thermo),
+    # not the invalid index-of-the-mean-sounding.
+    if refs_member_rows:
+        refs_day_rows = []
+        for row_key, r in refs_member_rows.items():
+            try:
+                dd, _hh = map(int, row_key.split("/"))
+            except Exception:
+                continue
+            day_label, date_str, sort_key, month, _yr = _valid_day_fields(dd, now)
+            ti = r.get("thompson")
+            pwat = r.get("pwat_in")
+            refs_day_rows.append({
+                "day": day_label,
+                "date": date_str,
+                "sort": sort_key,
+                "mf_dir": r.get("mf_dir"),
+                "mf_spd": r.get("mf_spd"),
+                "regime": r.get("mf_regime"),
+                "ti": ti,
+                "ti_pct": _climo_percentile(ti, THOMPSON_CLIMO_XMR.get(month), THOMPSON_PCTL_POINTS),
+                "pwat": pwat,
+                "pwat_pct": _climo_percentile(pwat, PWAT_CLIMO_XMR.get(month), PWAT_PCTL_POINTS),
+                "engine": f"metpy·{r.get('n', 0)}-mem",
+            })
+        if refs_day_rows:
+            refs_day_rows.sort(key=lambda r: r["sort"])
+            by_model["refs"] = refs_day_rows
+
     # order models: put the ones with the most rows first, stable-ish preferred order
     pref = ["gfs", "ecmwf", "rrfs", "refs", "rap", "hrrr"]
     models = sorted(by_model.keys(), key=lambda m: (pref.index(m) if m in pref else 99, m))
@@ -3417,12 +3645,29 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
 
     # Launch-thermo panel (KXMR, 10Z per day) — latest run only, like the maps.
     try:
-        launch_thermo = build_launch_thermo(combined_data, site="kxmr", assess_hour=10)
+        refs_member_rows = fetch_refs_member_thermo(site="kxmr", assess_hour=10)
+    except Exception as e:
+        logging.error(f"REFS member thermo fetch failed: {e}")
+        refs_member_rows = {}
+    try:
+        launch_thermo = build_launch_thermo(combined_data, site="kxmr", assess_hour=10,
+                                            refs_member_rows=refs_member_rows)
         logging.info(f"Launch thermo: {len(launch_thermo['models'])} models, "
                      f"rows/model={ {m: len(launch_thermo['by_model'][m]) for m in launch_thermo['models']} }")
     except Exception as e:
         logging.error(f"Launch thermo build failed: {e}")
         launch_thermo = {"site": "KXMR", "hour": 10, "models": [], "by_model": {}}
+
+    # Strip the raw sounding layers stashed for on-demand thermo — they must NOT bloat history.json.
+    for _sid, _models in combined_data.items():
+        if not isinstance(_models, dict):
+            continue
+        for _mk, _rows in _models.items():
+            if not isinstance(_rows, dict):
+                continue
+            for _prof in _rows.values():
+                if isinstance(_prof, dict):
+                    _prof.pop("_layers", None)
 
     payload = {
         "runs": history_runs,
