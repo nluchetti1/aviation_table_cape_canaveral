@@ -108,6 +108,7 @@
             <a onclick="updateMetric('cuP_neg10_5nm')" id="nav-cuP_neg10_5nm">Cu P(top≥−10°C, 5nm)</a>
             <a onclick="updateMetric('cuP_neg20_10nm')" id="nav-cuP_neg20_10nm">Cu P(top≥−20°C, 10nm)</a>
             <a onclick="updateMetric('ct_thunder')" id="nav-ct_thunder">Cal. Thunder Map</a>
+            <a onclick="showLaunchThermo()" id="nav-launch_thermo">10Z Synoptic</a>
         </div>
         <div class="station-selector">
             <label for="stn-dropdown">Station:</label>
@@ -179,6 +180,7 @@
         let ct4Maps = null;
         let refsCumulusMaps = null;  // {row_key: "maps/refs_debug/....png"} — REFS P(top>20kft) ~5nm (-10C)
         let refsCumulusMaps10 = null; // {row_key: "..."} — REFS P(top>25kft) ~10nm (-20C)
+        let launchThermo = null;      // {site,hour,models:[...],by_model:{model:[dayRows]}}
         let ctWindow = '4hr';  // toggles between '4hr' and '1hr' for the persistent CT column
         let activeMetric = 'mom_mean';
         let activeStn = 'kxmr';
@@ -209,6 +211,7 @@
                 ct4Maps = (payload.href_maps_latest && payload.href_maps_latest.ct4_maps) || null;
                 refsCumulusMaps = (payload.href_maps_latest && payload.href_maps_latest.refs_cumulus_maps) || null;
                 refsCumulusMaps10 = (payload.href_maps_latest && payload.href_maps_latest.refs_cumulus_maps10) || null;
+                launchThermo = payload.launch_thermo || null;
 
                 // Diagnostic: how many hours carry a real calibrated-thunder map per window.
                 const countReal = (o) => !o ? 0 : Object.values(o).filter(Boolean).length;
@@ -964,7 +967,70 @@
 
         function hidePopup() { popupCard.style.display = "none"; }
 
+        // ---- 10Z Synoptic panel (mean flow / regime / Thompson / PWAT, one row per day) ----
+        function showLaunchThermo() {
+            if (!launchThermo || !(launchThermo.models || []).length) {
+                alert("No 10Z synoptic data in this run yet.");
+                return;
+            }
+            document.getElementById('ltSite').textContent = launchThermo.site || 'KXMR';
+            const sel = document.getElementById('ltModel');
+            sel.innerHTML = launchThermo.models
+                .map(m => `<option value="${m}">${m.toUpperCase()}</option>`).join('');
+            renderLaunchThermo();
+            document.getElementById('ltModal').style.display = 'flex';
+        }
+        function hideLaunchThermo() { document.getElementById('ltModal').style.display = 'none'; }
+        function renderLaunchThermo() {
+            const model = document.getElementById('ltModel').value;
+            const rows = (launchThermo.by_model && launchThermo.by_model[model]) || [];
+            const pct = (v) => v == null ? '<span style="color:#94a3b8;">—</span>' : `${v}<sup>th</sup>`;
+            const num = (v) => v == null ? '—' : v;
+            const flow = (r) => (r.mf_dir == null) ? '—' : `${r.mf_dir}° / ${num(r.mf_spd)} kt`;
+            let html = `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
+              <thead><tr style="text-align:left; color:#475569; border-bottom:2px solid #e2e8f0;">
+                <th style="padding:8px 6px;">Day</th>
+                <th style="padding:8px 6px;">1000–700 mb Mean Flow</th>
+                <th style="padding:8px 6px;">Flow Regime</th>
+                <th style="padding:8px 6px;">Thompson Index</th>
+                <th style="padding:8px 6px;">PWAT (in)</th>
+              </tr></thead><tbody>`;
+            if (!rows.length) {
+                html += `<tr><td colspan="5" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
+            } else {
+                for (const r of rows) {
+                    html += `<tr style="border-bottom:1px solid #f1f5f9;">
+                      <td style="padding:8px 6px; font-weight:600;">${r.day}<span style="color:#94a3b8; font-weight:400;"> · ${r.date}</span></td>
+                      <td style="padding:8px 6px;">${flow(r)}</td>
+                      <td style="padding:8px 6px;">${r.regime || '—'}</td>
+                      <td style="padding:8px 6px;">${num(r.ti)} <span style="color:#cbd5e1;">|</span> ${pct(r.ti_pct)}</td>
+                      <td style="padding:8px 6px;">${num(r.pwat)} <span style="color:#cbd5e1;">|</span> ${pct(r.pwat_pct)}</td>
+                    </tr>`;
+                }
+            }
+            html += `</tbody></table>
+              <div style="margin-top:10px; font-size:0.78rem; color:#94a3b8;">
+                Mean flow &amp; regime = 1000–700 mb vector-mean wind (from-direction). Thompson Index = K-Index − Lifted Index.
+                Percentiles vs XMR climatology (PWAT is an approximate placeholder; Thompson percentile pending climo data).
+              </div>`;
+            document.getElementById('ltBody').innerHTML = html;
+        }
+
         window.onload = initDashboard;
     </script>
+    <div id="ltModal" onclick="if(event.target===this)hideLaunchThermo()"
+         style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.55); z-index:1000; align-items:flex-start; justify-content:center;">
+      <div style="background:#fff; margin-top:5vh; max-width:900px; width:94%; max-height:88vh; overflow:auto; border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,0.3);">
+        <div style="display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid #e2e8f0; position:sticky; top:0; background:#fff;">
+          <div style="font-weight:700; color:#1e3a5f;">10Z Synoptic — <span id="ltSite">KXMR</span></div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <label style="font-size:0.85rem; color:#475569;">Model:</label>
+            <select id="ltModel" onchange="renderLaunchThermo()" style="padding:4px 8px; border:1px solid #cbd5e1; border-radius:6px;"></select>
+            <button onclick="hideLaunchThermo()" style="border:none; background:#e2e8f0; border-radius:6px; padding:4px 10px; cursor:pointer;">✕</button>
+          </div>
+        </div>
+        <div id="ltBody" style="padding:6px 18px 18px;"></div>
+      </div>
+    </div>
 </body>
 </html>
