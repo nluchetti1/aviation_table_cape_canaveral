@@ -984,10 +984,25 @@
         function renderLaunchThermo() {
             const model = document.getElementById('ltModel').value;
             const rows = (launchThermo.by_model && launchThermo.by_model[model]) || [];
-            const pct = (v) => v == null ? '<span style="color:#94a3b8;">—</span>' : `${v}<sup>th</sup>`;
+            const ens = (rows[0] && /(\d+)-mem/.exec(rows[0].engine || '')) ;
+            const ensNote = ens ? `<div style="font-size:0.78rem; color:#475569; margin:2px 0 8px;">REFS = ${ens[1]}-member ensemble (mean of per-member indices, not the mean sounding).</div>` : '';
+            const pctColor = (v) => {
+                // low percentiles = calm/dry/stable, high = moist/unstable -> escalate cool->red
+                if (v == null) return null;
+                if (v >= 90) return { bg: '#dc2626', fg: '#ffffff' };  // >=90th
+                if (v >= 75) return { bg: '#f59e0b', fg: '#3a2a00' };  // 75-89th
+                if (v >= 50) return { bg: '#fde68a', fg: '#3a2a00' };  // 50-74th
+                if (v >= 25) return { bg: '#dbeafe', fg: '#1e3a5f' };  // 25-49th
+                return { bg: '#e0f2fe', fg: '#0c4a6e' };               // <25th
+            };
+            const pct = (v) => {
+                if (v == null) return '<span style="color:#94a3b8;">—</span>';
+                const c = pctColor(v);
+                return `<span style="background:${c.bg}; color:${c.fg}; padding:1px 7px; border-radius:10px; font-weight:600; font-size:0.82rem;">${v}<sup>th</sup></span>`;
+            };
             const num = (v) => v == null ? '—' : v;
             const flow = (r) => (r.mf_dir == null) ? '—' : `${r.mf_dir}° / ${num(r.mf_spd)} kt`;
-            let html = `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
+            let html = ensNote + `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
               <thead><tr style="text-align:left; color:#475569; border-bottom:2px solid #e2e8f0;">
                 <th style="padding:8px 6px;">Day</th>
                 <th style="padding:8px 6px;">1000–700 mb Mean Flow</th>
@@ -1010,8 +1025,7 @@
             }
             html += `</tbody></table>
               <div style="margin-top:10px; font-size:0.78rem; color:#94a3b8;">
-                Mean flow &amp; regime = 1000–700 mb vector-mean wind (from-direction). Thompson Index = K-Index − Lifted Index.
-                Percentiles vs XMR climatology (PWAT is an approximate placeholder; Thompson percentile pending climo data).
+                Mean flow &amp; regime = 1000–700 mb vector-mean wind (from-direction). Thompson Index = K-Index − Lifted Index (mixed-layer parcel, MetPy). Percentiles vs XMR 10Z climatology — badge shades cool→red as the value climbs toward climatological extremes. PWAT climo is real for May; other months approximate pending SPC reads. Thompson percentile pending climo data.
               </div>`;
             document.getElementById('ltBody').innerHTML = html;
         }
