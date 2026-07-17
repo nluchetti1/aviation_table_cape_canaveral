@@ -1002,22 +1002,25 @@
             };
             const num = (v) => v == null ? '—' : v;
             const flow = (r) => (r.mf_dir == null) ? '—' : `${r.mf_dir}° / ${num(r.mf_spd)} kt`;
+            const anvil = (r) => (r.av_dir == null) ? '—' : `${r.av_dir}° / ${num(r.av_spd)} kt`;
             let html = ensNote + `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
               <thead><tr style="text-align:left; color:#475569; border-bottom:2px solid #e2e8f0;">
                 <th style="padding:8px 6px;">Day</th>
                 <th style="padding:8px 6px;">1000–700 mb Mean Flow</th>
                 <th style="padding:8px 6px;">Flow Regime</th>
+                <th style="padding:8px 6px;">Anvil Flow (300–150 mb)</th>
                 <th style="padding:8px 6px;">Thompson Index</th>
                 <th style="padding:8px 6px;">PWAT (in)</th>
               </tr></thead><tbody>`;
             if (!rows.length) {
-                html += `<tr><td colspan="5" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
+                html += `<tr><td colspan="6" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
             } else {
                 for (const r of rows) {
                     html += `<tr style="border-bottom:1px solid #f1f5f9;">
                       <td style="padding:8px 6px; font-weight:600;">${r.day}<span style="color:#94a3b8; font-weight:400;"> · ${r.date}</span></td>
                       <td style="padding:8px 6px;">${flow(r)}</td>
                       <td style="padding:8px 6px;">${r.regime || '—'}</td>
+                      <td style="padding:8px 6px;">${anvil(r)}</td>
                       <td style="padding:8px 6px;">${num(r.ti)} <span style="color:#cbd5e1;">|</span> ${pct(r.ti_pct)}</td>
                       <td style="padding:8px 6px;">${num(r.pwat)} <span style="color:#cbd5e1;">|</span> ${pct(r.pwat_pct)}</td>
                     </tr>`;
