@@ -1176,18 +1176,19 @@ except Exception:
 _ML_DEPTH_HPA = 100.0  # mixed-layer parcel depth (lowest 100 hPa) for the Lifted Index
 
 
-def _mean_flow(layers):
-    """1000-700 mb vector-mean wind: FROM-direction, speed (kt), 8-pt compass regime, and the
-    mean u/v components (kept so an ensemble can be averaged in component space)."""
-    us = [L["u"] for L in layers if 700.0 <= L["pres"] <= 1000.0 and L.get("u") is not None]
-    vs = [L["v"] for L in layers if 700.0 <= L["pres"] <= 1000.0 and L.get("v") is not None]
+def _layer_mean_flow(layers, p_bot, p_top, prefix):
+    """Vector-mean wind over [p_top, p_bot] mb: FROM-direction, speed (kt), 8-pt compass regime, and
+    the mean u/v components (kept so an ensemble can be averaged in component space). Keys are
+    prefixed (e.g. 'mf' -> mf_dir/mf_spd/..., 'av' -> av_dir/...)."""
+    us = [L["u"] for L in layers if p_top <= L["pres"] <= p_bot and L.get("u") is not None]
+    vs = [L["v"] for L in layers if p_top <= L["pres"] <= p_bot and L.get("v") is not None]
     if not us:
         return {}
     um, vm = sum(us) / len(us), sum(vs) / len(vs)
     frm = math.degrees(math.atan2(-um, -vm)) % 360.0
     compass = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((frm + 22.5) // 45) % 8]
-    return {"mf_dir": round(frm), "mf_spd": round(math.hypot(um, vm), 1),
-            "mf_regime": compass, "mf_u": round(um, 3), "mf_v": round(vm, 3)}
+    return {f"{prefix}_dir": round(frm), f"{prefix}_spd": round(math.hypot(um, vm), 1),
+            f"{prefix}_regime": compass, f"{prefix}_u": round(um, 3), f"{prefix}_v": round(vm, 3)}
 
 
 def _thermo_metpy(layers):
@@ -1282,7 +1283,8 @@ def compute_launch_thermo(profile_layers):
                         key=lambda x: -x["pres"])
         if len(layers) < 4:
             return {}
-        out = dict(_mean_flow(layers))
+        out = dict(_layer_mean_flow(layers, 1000.0, 700.0, "mf"))
+        out.update(_layer_mean_flow(layers, 300.0, 150.0, "av"))
         core = _thermo_metpy(layers) if _HAVE_METPY else {}
         if not core:
             core = _thermo_numpy(layers)
@@ -3383,6 +3385,12 @@ def fetch_refs_member_thermo(site="kxmr", assess_hour=10):
             row["mf_dir"] = round(frm)
             row["mf_spd"] = round(math.hypot(mfu, mfv), 1)
             row["mf_regime"] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((frm + 22.5) // 45) % 8]
+        avu, avv = _avg("av_u"), _avg("av_v")
+        if avu is not None and avv is not None:
+            afrm = math.degrees(math.atan2(-avu, -avv)) % 360.0
+            row["av_dir"] = round(afrm)
+            row["av_spd"] = round(math.hypot(avu, avv), 1)
+            row["av_regime"] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((afrm + 22.5) // 45) % 8]
         ti, pw = _avg("thompson"), _avg("pwat_in")
         if ti is not None:
             row["thompson"] = round(ti, 1)
@@ -3438,6 +3446,8 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 "mf_dir": th.get("mf_dir"),
                 "mf_spd": th.get("mf_spd"),
                 "regime": th.get("mf_regime"),
+                "av_dir": th.get("av_dir"),
+                "av_spd": th.get("av_spd"),
                 "ti": ti,
                 "ti_pct": _climo_percentile(ti, THOMPSON_CLIMO_XMR.get(month), THOMPSON_PCTL_POINTS),
                 "pwat": pwat,
@@ -3467,6 +3477,8 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 "mf_dir": r.get("mf_dir"),
                 "mf_spd": r.get("mf_spd"),
                 "regime": r.get("mf_regime"),
+                "av_dir": r.get("av_dir"),
+                "av_spd": r.get("av_spd"),
                 "ti": ti,
                 "ti_pct": _climo_percentile(ti, THOMPSON_CLIMO_XMR.get(month), THOMPSON_PCTL_POINTS),
                 "pwat": pwat,
