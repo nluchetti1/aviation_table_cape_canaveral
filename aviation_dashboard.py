@@ -51,6 +51,20 @@ CONVECTIVE_MASK_ENABLED = True
 CONVECTIVE_DBZ = 40.0     # composite reflectivity (dBZ) at/above which a column is "convective"
 CONVECTIVE_NBR_NM = 5.0   # neighborhood radius (nautical miles) sampled around each site
 
+# ---- Anvil mask for the Thick Cloud Layer rule (attached/detached anvil exclusion) ----
+# The Thick Cloud Layer rule ALSO does not apply to anvil clouds (governed by the anvil LLCC rules).
+# An anvil is high glaciated cloud streaming downwind from a convective core, so a site-hour is
+# tagged 'anvil' when three things line up: (1) the model's own thick deck is glaciated — its top is
+# above the -20C level; (2) the point itself is non-convective (else it's the CB, already caught by
+# the convective mask); and (3) a >=40 dBZ core sits UPSTREAM along that model's 300-150 mb anvil
+# flow, out to the advection reach. HRRR REFC is sampled by compass sector so each model checks the
+# sector its own anvil streams from. Raw thickness values are preserved; only the label changes.
+ANVIL_MASK_ENABLED = True
+ANVIL_SRC_DBZ = 40.0        # upstream core reflectivity (dBZ) that can seed an anvil
+ANVIL_NEAR_NM = 12.0        # inner radius (nm): beyond the immediate CB neighborhood
+ANVIL_ADVECT_NM = 100.0     # outer radius (nm): how far an anvil can stream from its parent core
+ANVIL_TOP_MARGIN_KFT = 2.0  # thick-deck top must be this far above the -20C height to count as ice
+
 # ---- REFS Cumulus Cloud LLCC probabilities (durable ensemble-product path) ----
 # Uses the pre-computed REFS echo-top exceedance probabilities P(echo top > {6096,9144,10668,
 # 12192,15240} m) from the ensemble prob file, neighborhood-reduced within the LLCC radii and
@@ -1482,6 +1496,7 @@ def compute_profile_variables(profile_layers):
         "cloud_thick": round(max([max(0.0, c["top"] - c["base"]) for c in extent_decks], default=0.0) / 1000.0, 1),
         "thick_layer": 1 if thick_layer_violated else 0,
         "thick_layer_ft": round(thickest_in_band_ft),
+        **_layer_mean_flow(profile_layers, 300.0, 150.0, "av"),
         "_layers": profile_layers,
     }
 
@@ -2321,9 +2336,11 @@ def fetch_convective_reflectivity(time_keys):
     now_utc = datetime.datetime.now(datetime.timezone.utc)
 
     def _url(cc, date_str, fh):
+        # Box enlarged (vs the tiny convective box) so anvil sources up to ANVIL_ADVECT_NM upstream
+        # of any site are inside the grid. Still a small NOMADS subset.
         return (f"https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl?file=hrrr.t{cc}z.wrfsfcf{fh:02d}.grib2"
-                f"&var_REFC=on&lev_entire_atmosphere=on&subregion=&leftlon=-81.2&rightlon=-80.0"
-                f"&toplat=29.2&bottomlat=28.0&dir=%2Fhrrr.{date_str}%2Fconus")
+                f"&var_REFC=on&lev_entire_atmosphere=on&subregion=&leftlon=-83.5&rightlon=-78.5"
+                f"&toplat=31.0&bottomlat=25.0&dir=%2Fhrrr.{date_str}%2Fconus")
 
     def _probe(url):
         for attempt in range(3):
@@ -2377,13 +2394,31 @@ def fetch_convective_reflectivity(time_keys):
             if refc is None:
                 return row_key, {}
             lons_n = np.where(lons > 180, lons - 360.0, lons)
+            compass8 = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
             for sid, c in all_coords.items():
                 dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
                 iy, ix = np.unravel_index(np.argmin(dist), dist.shape)
                 y0, y1 = max(0, iy - ncells), min(refc.shape[0], iy + ncells + 1)
                 x0, x1 = max(0, ix - ncells), min(refc.shape[1], ix + ncells + 1)
                 nb = refc[y0:y1, x0:x1]
-                out[sid] = round(float(np.max(nb)) if nb.size else float(refc[iy, ix]), 1)
+                entry = {"nbr": round(float(np.max(nb)) if nb.size else float(refc[iy, ix]), 1),
+                         "point": round(float(refc[iy, ix]), 1)}
+                if ANVIL_MASK_ENABLED:
+                    # bearing (0=N,90=E) and great-circle-ish distance (nm) from the site to every
+                    # cell; keep the max REFC per compass sector within the anvil advection annulus.
+                    dlat_nm = (lats - c["lat"]) * 60.0
+                    dlon_nm = (lons_n - c["lon"]) * 60.0 * math.cos(math.radians(c["lat"]))
+                    dist_nm = np.sqrt(dlat_nm ** 2 + dlon_nm ** 2)
+                    bearing = np.degrees(np.arctan2(dlon_nm, dlat_nm)) % 360.0
+                    ring = (dist_nm >= ANVIL_NEAR_NM) & (dist_nm <= ANVIL_ADVECT_NM)
+                    sectors = {}
+                    for k, name in enumerate(compass8):
+                        lo, hi = (k * 45 - 22.5) % 360.0, (k * 45 + 22.5) % 360.0
+                        sect = ((bearing >= lo) & (bearing < hi)) if lo < hi else ((bearing >= lo) | (bearing < hi))
+                        m = ring & sect
+                        sectors[name] = round(float(np.max(refc[m])), 1) if np.any(m) else 0.0
+                    entry["sectors"] = sectors
+                out[sid] = entry
             return row_key, out
         except Exception as e:
             logging.debug(f"REFC f{fh:02d} failed: {e}")
@@ -2409,9 +2444,11 @@ def fetch_convective_reflectivity(time_keys):
                 pass
 
     total = sum(len(v) for v in matrix.values())
-    hits = sum(1 for s in matrix.values() for v in s.values() if v is not None and v >= CONVECTIVE_DBZ)
+    hits = sum(1 for s in matrix.values() for cell in s.values()
+               if isinstance(cell, dict) and cell.get("nbr") is not None and cell["nbr"] >= CONVECTIVE_DBZ)
     logging.info(f"Convective mask: REFC for {total} site-hours; {hits} exceed {CONVECTIVE_DBZ:.0f} dBZ "
-                 f"(neighborhood {CONVECTIVE_NBR_NM:.0f} nm / {ncells} cells).")
+                 f"(neighborhood {CONVECTIVE_NBR_NM:.0f} nm / {ncells} cells)"
+                 f"{'; anvil sectors on' if ANVIL_MASK_ENABLED else ''}.")
     return matrix
 
 
@@ -3247,6 +3284,11 @@ PWAT_CLIMO_XMR = {
 THOMPSON_PCTL_POINTS = [0, 10, 25, 50, 75, 90, 100]
 THOMPSON_CLIMO_XMR = {m: None for m in range(1, 13)}
 
+# When a model has no sounding valid exactly at the assessment hour (10Z) on a given day — common
+# for short-range RAP/HRRR depending on cycle timing — accept the nearest hour within this many
+# hours instead of dropping the day. Exact 10Z always wins when present.
+ASSESS_HOUR_TOL = 2
+
 
 def _climo_percentile(value, breaks, points):
     """Interpolated percentile rank of `value` within monthly breakpoint values at `points`."""
@@ -3419,7 +3461,10 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
         if model == "refs":
             continue
         day_rows = []
-        seen_days = set()
+        # Gather candidate profiles per forecast day within ASSESS_HOUR_TOL of the assessment hour,
+        # then keep the one nearest to it (exact 10Z wins). Short-range models (RAP/HRRR) frequently
+        # skip exactly 10Z depending on cycle timing, so an exact-only match dropped them entirely.
+        day_cands = {}
         for row_key, prof in rows.items():
             if not isinstance(prof, dict):
                 continue
@@ -3427,33 +3472,36 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 dd, hh = map(int, row_key.split("/"))
             except Exception:
                 continue
-            if hh != assess_hour or dd in seen_days:
+            diff = abs(hh - assess_hour)
+            if diff > ASSESS_HOUR_TOL or not prof.get("_layers"):
                 continue
-            layers = prof.get("_layers")
-            if not layers:
-                continue
-            th = compute_launch_thermo(layers)   # MetPy (mixed-layer LI) on demand, KXMR 10Z only
-            if not th:
-                continue
-            seen_days.add(dd)
-            day_label, date_str, sort_key, month, _yr = _valid_day_fields(dd, now)
-            ti = th.get("thompson")
-            pwat = th.get("pwat_in")
-            day_rows.append({
-                "day": day_label,
-                "date": date_str,
-                "sort": sort_key,
-                "mf_dir": th.get("mf_dir"),
-                "mf_spd": th.get("mf_spd"),
-                "regime": th.get("mf_regime"),
-                "av_dir": th.get("av_dir"),
-                "av_spd": th.get("av_spd"),
-                "ti": ti,
-                "ti_pct": _climo_percentile(ti, THOMPSON_CLIMO_XMR.get(month), THOMPSON_PCTL_POINTS),
-                "pwat": pwat,
-                "pwat_pct": _climo_percentile(pwat, PWAT_CLIMO_XMR.get(month), PWAT_PCTL_POINTS),
-                "engine": th.get("engine"),
-            })
+            day_cands.setdefault(dd, []).append((diff, hh, prof))
+        for dd, cands in day_cands.items():
+            cands.sort(key=lambda c: (c[0], c[1]))
+            for diff, hh, prof in cands:
+                th = compute_launch_thermo(prof["_layers"])  # MetPy (mixed-layer LI), on demand
+                if not th:
+                    continue
+                day_label, date_str, sort_key, month, _yr = _valid_day_fields(dd, now)
+                ti = th.get("thompson")
+                pwat = th.get("pwat_in")
+                day_rows.append({
+                    "day": day_label,
+                    "date": date_str,
+                    "sort": sort_key,
+                    "vhh": hh,
+                    "mf_dir": th.get("mf_dir"),
+                    "mf_spd": th.get("mf_spd"),
+                    "regime": th.get("mf_regime"),
+                    "av_dir": th.get("av_dir"),
+                    "av_spd": th.get("av_spd"),
+                    "ti": ti,
+                    "ti_pct": _climo_percentile(ti, THOMPSON_CLIMO_XMR.get(month), THOMPSON_PCTL_POINTS),
+                    "pwat": pwat,
+                    "pwat_pct": _climo_percentile(pwat, PWAT_CLIMO_XMR.get(month), PWAT_PCTL_POINTS),
+                    "engine": th.get("engine"),
+                })
+                break
         if day_rows:
             day_rows.sort(key=lambda r: r["sort"])
             by_model[model] = day_rows
@@ -3474,6 +3522,7 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 "day": day_label,
                 "date": date_str,
                 "sort": sort_key,
+                "vhh": assess_hour,
                 "mf_dir": r.get("mf_dir"),
                 "mf_spd": r.get("mf_spd"),
                 "regime": r.get("mf_regime"),
@@ -3538,22 +3587,46 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         try:
             refc = fetch_convective_reflectivity(time_rows)
             tagged = 0
+            anvil_tagged = 0
             for sid, hours in (refc or {}).items():
                 site_models = combined_data.get(sid)
                 if not site_models:
                     continue
-                for row_key, dbz in hours.items():
+                for row_key, cell in hours.items():
+                    if not isinstance(cell, dict):
+                        continue
+                    dbz = cell.get("nbr")
+                    point = cell.get("point")
+                    sectors = cell.get("sectors") or {}
                     conv = (dbz is not None and dbz >= CONVECTIVE_DBZ)
                     for _model, mrows in site_models.items():
                         p = mrows.get(row_key) if isinstance(mrows, dict) else None
-                        if isinstance(p, dict):
-                            p["refc_nbr"] = dbz
-                            if conv:
-                                p["convective"] = True
-                                tagged += 1
-            logging.info(f"Convective mask applied: {tagged} site-hour-model cells tagged convective.")
+                        if not isinstance(p, dict):
+                            continue
+                        p["refc_nbr"] = dbz
+                        if conv:
+                            p["convective"] = True
+                            tagged += 1
+                        elif ANVIL_MASK_ENABLED and p.get("thick_layer") == 1:
+                            # Anvil: glaciated thick deck overhead (top above the -20C level), a
+                            # non-convective point, and a >=40 dBZ core upstream along THIS model's
+                            # 300-150 mb anvil flow (the sector the anvil streams FROM).
+                            ct = p.get("cloud_top")      # kft, highest cloud-deck top
+                            h20 = p.get("hght_20c")      # kft, -20C isotherm height
+                            av_reg = p.get("av_regime")  # compass of the anvil FROM-direction
+                            glaciated = (ct is not None and h20 is not None
+                                         and ct >= h20 + ANVIL_TOP_MARGIN_KFT)
+                            src = sectors.get(av_reg, 0.0) if av_reg else 0.0
+                            non_conv_pt = (point is None or point < CONVECTIVE_DBZ)
+                            if glaciated and non_conv_pt and src >= ANVIL_SRC_DBZ:
+                                p["anvil"] = True
+                                p["anvil_src_dbz"] = src
+                                p["anvil_dir"] = av_reg
+                                anvil_tagged += 1
+            logging.info(f"Convective mask applied: {tagged} site-hour-model cells tagged convective; "
+                         f"{anvil_tagged} tagged anvil.")
         except Exception as e:
-            logging.error(f"Convective mask failed, continuing without it: {e}")
+            logging.error(f"Convective/anvil mask failed, continuing without it: {e}")
 
     # REFS Cumulus Cloud standoff probabilities: interpolate the REFS echo-top exceedance curves
     # at each site's REFS-mean isotherm heights and store the go/no-go probabilities on the REFS
@@ -3680,6 +3753,8 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
             for _prof in _rows.values():
                 if isinstance(_prof, dict):
                     _prof.pop("_layers", None)
+                    _prof.pop("av_u", None)
+                    _prof.pop("av_v", None)
 
     payload = {
         "runs": history_runs,
