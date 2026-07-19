@@ -2360,12 +2360,24 @@ def fetch_convective_reflectivity(time_keys):
     session.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"})
     now_utc = datetime.datetime.now(datetime.timezone.utc)
 
-    def _url(cc, date_str, fh):
-        # Box enlarged (vs the tiny convective box) so anvil sources up to ANVIL_ADVECT_NM upstream
-        # of any site are inside the grid. Still a small NOMADS subset.
+    def _s3_url(cc, date_str, fh):
+        return f"{HRRR_AWS_ROOT}/hrrr.{date_str}/conus/hrrr.t{cc}z.wrfsfcf{fh:02d}.grib2"
+
+    def _nomads_url(cc, date_str, fh):
+        # Server-side subset. Kept only as a fallback: this CGI filter is the piece that has been
+        # intermittently unavailable, taking the convective AND anvil masks down with it.
         return (f"https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl?file=hrrr.t{cc}z.wrfsfcf{fh:02d}.grib2"
                 f"&var_REFC=on&lev_entire_atmosphere=on&subregion=&leftlon=-83.5&rightlon=-78.5"
                 f"&toplat=31.0&bottomlat=25.0&dir=%2Fhrrr.{date_str}%2Fconus")
+
+    def _s3_idx_ok(cc, date_str, fh):
+        """The .idx is a few KB of text; fetching it both proves the cycle exists and gives us the
+        byte offsets, so no separate HEAD probe is needed."""
+        try:
+            r = session.get(_s3_url(cc, date_str, fh) + ".idx", timeout=12)
+            return r.status_code == 200 and "REFC" in r.text
+        except Exception:
+            return False
 
     def _probe(url):
         for attempt in range(3):
@@ -2378,34 +2390,65 @@ def fetch_convective_reflectivity(time_keys):
         return False
 
     # HRRR runs hourly; find the most recent cycle with f01 posted (probe back up to 6 h).
+    # Prefer AWS S3 (byte-range, no CGI dependency); fall back to the NOMADS filter if S3 is dry.
     active_date = active_cycle = None
+    refc_source = None
     for back in range(0, 7):
         t = now_utc - datetime.timedelta(hours=back)
         d, cc = t.strftime("%Y%m%d"), t.strftime("%H")
-        if _probe(_url(cc, d, 1)):
-            active_date, active_cycle = d, cc
+        if _s3_idx_ok(cc, d, 1):
+            active_date, active_cycle, refc_source = d, cc, "s3"
             break
     if not active_cycle:
-        logging.warning("Convective mask: no available HRRR REFC cycle found on NOMADS.")
+        for back in range(0, 7):
+            t = now_utc - datetime.timedelta(hours=back)
+            d, cc = t.strftime("%Y%m%d"), t.strftime("%H")
+            if _probe(_nomads_url(cc, d, 1)):
+                active_date, active_cycle, refc_source = d, cc, "nomads"
+                break
+    if not active_cycle:
+        logging.warning("Convective mask: no available HRRR REFC cycle found (tried AWS S3 and NOMADS).")
         return {}
     cycle_init = datetime.datetime.strptime(f"{active_date}{active_cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
     # HRRR forecast length: 48 h at the 00/06/12/18Z cycles, 18 h otherwise.
     max_fh = 48 if active_cycle in ("00", "06", "12", "18") else 18
-    logging.info(f"Convective mask: HRRR REFC from {active_date} {active_cycle}z ({max_fh}-h).")
+    logging.info(f"Convective mask: HRRR REFC from {active_date} {active_cycle}z ({max_fh}-h) via {refc_source.upper()}.")
 
     ncells = max(1, round((CONVECTIVE_NBR_NM * 1.852) / 3.0))  # ~10 nm at HRRR 3-km spacing
 
+    def _fetch_refc_file(fh, local):
+        """Download just the REFC message to `local`. S3 path byte-ranges the single message out of
+        the full wrfsfc file; NOMADS path streams the pre-subset file. Returns True on success."""
+        if refc_source == "s3":
+            grib_url = _s3_url(active_cycle, active_date, fh)
+            r = session.get(grib_url + ".idx", timeout=20)
+            if r.status_code != 200:
+                return False
+            ent = next((e for e in _parse_grib_idx(r.text)
+                        if e["short"] == "REFC" and "entire atmosphere" in e["level"]), None)
+            if not ent:
+                return False
+            rng = f"bytes={ent['start']}-{'' if ent['end'] is None else ent['end']}"
+            rr = session.get(grib_url, headers={"Range": rng}, timeout=30)
+            if rr.status_code not in (200, 206) or not rr.content:
+                return False
+            with open(local, "wb") as fhh:
+                fhh.write(rr.content)
+            return True
+        with session.get(_nomads_url(active_cycle, active_date, fh), timeout=25, stream=True) as r:
+            if r.status_code != 200:
+                return False
+            with open(local, "wb") as fhh:
+                for chunk in r.iter_content(chunk_size=8192):
+                    fhh.write(chunk)
+        return True
+
     def _worker(fh, row_key):
-        url = _url(active_cycle, active_date, fh)
         local = os.path.join(CACHE_DIR, f"refc_{active_cycle}z_f{fh:02d}.grib2")
         out = {}
         try:
-            with session.get(url, timeout=25, stream=True) as r:
-                if r.status_code != 200:
-                    return row_key, {}
-                with open(local, "wb") as fhh:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        fhh.write(chunk)
+            if not _fetch_refc_file(fh, local):
+                return row_key, {}
             grbs = pygrib.open(local)
             refc = lats = lons = None
             for grb in grbs:
@@ -2419,6 +2462,15 @@ def fetch_convective_reflectivity(time_keys):
             if refc is None:
                 return row_key, {}
             lons_n = np.where(lons > 180, lons - 360.0, lons)
+            # S3 serves the full CONUS grid (no server-side subsetting), so crop to the Florida box
+            # here — this keeps the per-site neighborhood and sector math on a small array.
+            box = ((lats >= 25.0) & (lats <= 31.0) & (lons_n >= -83.5) & (lons_n <= -78.5))
+            if np.any(box):
+                ys, xs = np.where(box)
+                y0b, y1b, x0b, x1b = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+                refc = refc[y0b:y1b, x0b:x1b]
+                lats = lats[y0b:y1b, x0b:x1b]
+                lons_n = lons_n[y0b:y1b, x0b:x1b]
             compass8 = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
             for sid, c in all_coords.items():
                 dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
