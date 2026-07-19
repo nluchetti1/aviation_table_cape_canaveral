@@ -32,7 +32,10 @@ BUFKIT_MODELS = ["gfs", "rap", "hrrr"]
 # ---- ECMWF Open Data (IFS HRES 0.25°, CC-BY-4.0) additive global column ----
 ECMWF_ENABLED = True
 ECMWF_SOURCE = "ecmwf"    # ecmwf-opendata source: ecmwf | aws | azure | google
-ECMWF_MAX_FH = 48         # forecast hours to ingest (IFS open-data is 3-hourly to 144h)
+ECMWF_MAX_FH = 144        # forecast hours to ingest. IFS open-data is 3-hourly out to 144 h (then
+                          # 6-hourly, which this step list would silently miss), so 144 is the
+                          # natural stop. ~49 steps: bigger download + slower retrieve than 48 h,
+                          # traded for ECMWF reaching day 6 in the matrix and the 10Z panel.
 ECMWF_LEVELS_HPA = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100]
 
 # ---- Convective (cumulus) mask for the Thick Cloud Layer / Max Layer Thickness LLCC ----
