@@ -831,6 +831,7 @@
                     • Max Layer Thickness: <strong>${p.cloud_thick == null ? '—' : p.cloud_thick + ' kft'}${p.convective ? ' (conv)' : (p.anvil ? ' (anvil)' : '')}</strong><br>
                     • Thick Cloud Layer (LLCC): <strong>${p.convective ? 'CONV — see Cumulus rule' : (p.anvil ? 'ANVIL — see Anvil rule' : (p.thick_layer === 1 ? 'VIOLATED' : (p.thick_layer === 0 ? 'OK' : '—')))}</strong><br>
                     ${p.anvil ? `• Anvil source: <strong>${p.anvil_src_dbz} dBZ upstream (${p.anvil_dir})</strong><br>` : ''}
+                    ${(!p.anvil && p.anvil_diag) ? `• <span style="color:#64748b;">Anvil overhead (diagnostic): <strong>${p.anvil_src_dbz} dBZ upstream (${p.anvil_dir})</strong> — no thick-layer violation to mask</span><br>` : ''}
                     • Composite Refl (${p.convective ? 'convective' : 'nbr max'}): <strong>${p.refc_nbr == null ? '—' : p.refc_nbr + ' dBZ'}</strong><br>
                     • Cu P(top≥−10°C, 5nm): <strong>${p.cuP_neg10_5nm == null ? '—' : Math.round(p.cuP_neg10_5nm) + '%' + (p.cuP_neg10_5nm_q === 'floor' ? '*' : '')}</strong><br>
                     • Cu P(top≥−20°C, 10nm): <strong>${p.cuP_neg20_10nm == null ? '—' : Math.round(p.cuP_neg20_10nm) + '%' + (p.cuP_neg20_10nm_q === 'floor' ? '*' : '')}</strong> <span style="color:#94a3b8;font-size:0.85em;">(REFS)</span>
@@ -907,7 +908,6 @@
         // and neighborhood differ per column: −10°C/5 nm shows P(top>20 kft) at ~5 nm; −20°C/10 nm
         // shows P(top>25 kft) at ~10 nm. Mirrors showCtMapPopup.
         function showRefsCumulusMapPopup(e, profile, mapSrc, timeKey, metric) {
-            const src = mapSrc || hrefBlankMap;
             const fb = hrefBlankMap || "";
             const isNeg10 = (metric === 'cuP_neg10_5nm');
             const val = isNeg10 ? profile.cuP_neg10_5nm : profile.cuP_neg20_10nm;
@@ -916,9 +916,11 @@
             const valTxt = (val == null) ? '—' : Math.round(val) + '%' + star;
             const label = isNeg10 ? 'Cu P(top≥−10°C, 5 nm)' : 'Cu P(top≥−20°C, 10 nm)';
             const mapThr = isNeg10 ? '20 kft &middot; ~5 nm' : '25 kft &middot; ~10 nm';
-            const mapHtml = src
-                ? `<div class="ltg-map-grid" style="grid-template-columns: 1fr;"><div class="ltg-map-cell"><img src="${src}" alt="REFS echo-top probability map" onerror="if(this.dataset.fb!=='1'){this.dataset.fb='1';this.src='${fb}';}" /></div></div>`
-                : `<div class="ltg-map-empty-full">No spatial map for ${timeKey || 'this'}Z.</div>`;
+            // Only render an image when a REAL map exists for this hour. Previously a null map fell
+            // back to the blank placeholder, which looked like a broken/empty popup; now say why.
+            const mapHtml = mapSrc
+                ? `<div class="ltg-map-grid" style="grid-template-columns: 1fr;"><div class="ltg-map-cell"><img src="${mapSrc}" alt="REFS echo-top probability map" onerror="if(this.dataset.fb!=='1'){this.dataset.fb='1';this.src='${fb}';}" /></div></div>`
+                : `<div class="ltg-map-empty-full">No spatial map for ${timeKey || 'this'}Z — beyond the REFS member window for the latest cycle, or you're viewing an earlier DPROG/DT run (maps are kept for the current run only).</div>`;
             popupCard.classList.remove("popup-wide");
             popupCard.innerHTML = `
                 <div class="popup-header">REFS Echo-Top Probability</div>
