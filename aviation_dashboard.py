@@ -64,6 +64,11 @@ ANVIL_SRC_DBZ = 40.0        # upstream core reflectivity (dBZ) that can seed an 
 ANVIL_NEAR_NM = 12.0        # inner radius (nm): beyond the immediate CB neighborhood
 ANVIL_ADVECT_NM = 100.0     # outer radius (nm): how far an anvil can stream from its parent core
 ANVIL_TOP_MARGIN_KFT = 2.0  # thick-deck top must be this far above the -20C height to count as ice
+# Diagnostic mode: also evaluate the anvil test on cells that are NOT would-be thick-layer
+# violations, recording the result as 'anvil_diag' (hover popup only — no badge, no suppression).
+# This exists purely so the detector can be validated against GOES on a real anvil day without
+# needing a thick-cloud violation to coincide. Set False to skip the extra bookkeeping.
+ANVIL_DIAG_MODE = True
 
 # ---- REFS Cumulus Cloud LLCC probabilities (durable ensemble-product path) ----
 # Uses the pre-computed REFS echo-top exceedance probabilities P(echo top > {6096,9144,10668,
@@ -2314,6 +2319,26 @@ def fetch_all_ecmwf_soundings():
     return matrix
 
 
+def _anvil_eval(p, point, sectors):
+    """Shared anvil test for one profile cell. Returns {'src','dir'} when the column looks like
+    anvil debris — glaciated deck aloft, quiet point, and a convective core UPSTREAM along this
+    column's own 300-150 mb anvil flow — else None. Used both for the real mask (on would-be thick-
+    layer violations) and for the diagnostic pass, so the two can never drift apart."""
+    ct = p.get("cloud_top")      # kft, highest cloud-deck top
+    h20 = p.get("hght_20c")      # kft, -20C isotherm height
+    av_reg = p.get("av_regime")  # compass of the anvil FROM-direction
+    if ct is None or h20 is None or not av_reg:
+        return None
+    if ct < h20 + ANVIL_TOP_MARGIN_KFT:          # not glaciated -> not an anvil
+        return None
+    if point is not None and point >= CONVECTIVE_DBZ:  # it's the CB itself
+        return None
+    src = (sectors or {}).get(av_reg, 0.0)
+    if src < ANVIL_SRC_DBZ:                      # no upstream source feeding it
+        return None
+    return {"src": src, "dir": av_reg}
+
+
 def fetch_convective_reflectivity(time_keys):
     """Detect convective cores near each site from HRRR composite reflectivity (REFC), so the
     Thick Cloud Layer / Max Layer Thickness LLCC fields can be flagged as cu/anvil-governed
@@ -3588,6 +3613,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
             refc = fetch_convective_reflectivity(time_rows)
             tagged = 0
             anvil_tagged = 0
+            anvil_diag = 0
             for sid, hours in (refc or {}).items():
                 site_models = combined_data.get(sid)
                 if not site_models:
@@ -3607,24 +3633,26 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
                         if conv:
                             p["convective"] = True
                             tagged += 1
-                        elif ANVIL_MASK_ENABLED and p.get("thick_layer") == 1:
-                            # Anvil: glaciated thick deck overhead (top above the -20C level), a
-                            # non-convective point, and a >=40 dBZ core upstream along THIS model's
-                            # 300-150 mb anvil flow (the sector the anvil streams FROM).
-                            ct = p.get("cloud_top")      # kft, highest cloud-deck top
-                            h20 = p.get("hght_20c")      # kft, -20C isotherm height
-                            av_reg = p.get("av_regime")  # compass of the anvil FROM-direction
-                            glaciated = (ct is not None and h20 is not None
-                                         and ct >= h20 + ANVIL_TOP_MARGIN_KFT)
-                            src = sectors.get(av_reg, 0.0) if av_reg else 0.0
-                            non_conv_pt = (point is None or point < CONVECTIVE_DBZ)
-                            if glaciated and non_conv_pt and src >= ANVIL_SRC_DBZ:
+                        elif ANVIL_MASK_ENABLED:
+                            hit = _anvil_eval(p, point, sectors)
+                            if hit and p.get("thick_layer") == 1:
+                                # Real mask: this would have read VIOLATED, but it's anvil debris,
+                                # governed by the Anvil rule instead.
                                 p["anvil"] = True
-                                p["anvil_src_dbz"] = src
-                                p["anvil_dir"] = av_reg
+                                p["anvil_src_dbz"] = hit["src"]
+                                p["anvil_dir"] = hit["dir"]
                                 anvil_tagged += 1
+                            elif hit and ANVIL_DIAG_MODE:
+                                # Diagnostic only: anvil conditions are met but there's no thick-
+                                # layer violation to suppress. Recorded for validation; the cell
+                                # keeps its normal OK/value rendering.
+                                p["anvil_diag"] = True
+                                p["anvil_src_dbz"] = hit["src"]
+                                p["anvil_dir"] = hit["dir"]
+                                anvil_diag += 1
             logging.info(f"Convective mask applied: {tagged} site-hour-model cells tagged convective; "
-                         f"{anvil_tagged} tagged anvil.")
+                         f"{anvil_tagged} tagged anvil"
+                         + (f"; {anvil_diag} anvil-overhead (diagnostic only)." if ANVIL_DIAG_MODE else "."))
         except Exception as e:
             logging.error(f"Convective/anvil mask failed, continuing without it: {e}")
 
