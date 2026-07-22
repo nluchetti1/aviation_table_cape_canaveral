@@ -3336,33 +3336,44 @@ def fetch_refs_echotop_probs():
 
 
 # ---------------------------------------------------------------------------------------------
-# Launch-thermo climatology (KXMR), assessed at 10Z.
-#
-# PWAT: from the SPC sounding-climatology tool (station XMR, 10Z), which reports a DAILY climatology
-# at these 7 percentile ranks. Read the 15th of each month at 10Z and drop the 7 values in below.
-PWAT_PCTL_POINTS = [0, 10, 25, 50, 75, 90, 100]   # Min, 10%, 25%, Median, 75%, 90%, Max
-# Month -> [Min, 10%, 25%, 50%, 75%, 90%, Max] in inches. REAL values read off the SPC sounding-
-# climatology tool (station XMR / Cape Kennedy), ~15th of each month, from the period of record
-# 1956-2025 (44,308 soundings). Hours vary slightly by read (the daily-smoothed climo is hour-stable).
+# Launch-thermo climatology (KXMR), assessed at 10Z. Both PWAT and Thompson are now full 15-point
+# monthly distributions from the XMR period of record; _climo_percentile interpolates the value's
+# rank within them. Percentile ranks (fractions -> 0-100):
+CLIMO_PCTL_POINTS_15 = [0, 1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99, 100]
+
+# PWAT: monthly percentile distribution (inches) for XMR / Cape Kennedy.
+PWAT_PCTL_POINTS = CLIMO_PCTL_POINTS_15
 PWAT_CLIMO_XMR = {
-    1:  [0.25, 0.44, 0.64, 0.91, 1.20, 1.41, 1.70],   # Jan 17
-    2:  [0.27, 0.45, 0.64, 0.90, 1.19, 1.40, 1.67],   # Feb 16
-    3:  [0.36, 0.53, 0.72, 0.96, 1.23, 1.43, 1.66],   # Mar 16
-    4:  [0.50, 0.67, 0.85, 1.07, 1.31, 1.51, 1.72],   # Apr 13
-    5:  [0.75, 0.96, 1.12, 1.31, 1.52, 1.69, 1.88],   # May 14
-    6:  [1.05, 1.26, 1.42, 1.60, 1.77, 1.90, 2.08],   # Jun 17
-    7:  [1.24, 1.46, 1.61, 1.78, 1.94, 2.05, 2.21],   # Jul 15
-    8:  [1.28, 1.48, 1.64, 1.83, 1.99, 2.11, 2.25],   # Aug 16
-    9:  [1.08, 1.29, 1.47, 1.69, 1.90, 2.06, 2.24],   # Sep 16
-    10: [0.78, 1.00, 1.20, 1.44, 1.70, 1.90, 2.14],   # Oct 16
-    11: [0.46, 0.68, 0.89, 1.16, 1.45, 1.67, 1.96],   # Nov 16
-    12: [0.30, 0.51, 0.72, 0.99, 1.27, 1.50, 1.81],   # Dec 15
+     1: [0.093, 0.171, 0.27, 0.338, 0.466, 0.577, 0.699, 0.808, 0.948, 1.083, 1.229, 1.432, 1.582, 1.757, 2.834],  # Jan
+     2: [0.091, 0.19, 0.297, 0.375, 0.53, 0.676, 0.782, 0.907, 1.032, 1.154, 1.275, 1.401, 1.539, 1.726, 2.026],  # Feb
+     3: [0.096, 0.217, 0.324, 0.421, 0.566, 0.676, 0.791, 0.889, 0.992, 1.118, 1.236, 1.412, 1.551, 1.779, 1.962],  # Mar
+     4: [0.131, 0.252, 0.431, 0.518, 0.679, 0.779, 0.892, 1.003, 1.098, 1.238, 1.36, 1.552, 1.681, 1.852, 2.236],  # Apr
+     5: [0.179, 0.422, 0.671, 0.809, 0.961, 1.097, 1.192, 1.293, 1.39, 1.502, 1.603, 1.774, 1.904, 2.143, 2.715],  # May
+     6: [0.0, 0.768, 1.096, 1.287, 1.471, 1.585, 1.66, 1.748, 1.836, 1.922, 2.004, 2.13, 2.207, 2.435, 2.669],  # Jun
+     7: [0.142, 1.016, 1.307, 1.444, 1.637, 1.716, 1.806, 1.895, 1.957, 2.025, 2.093, 2.191, 2.264, 2.447, 2.987],  # Jul
+     8: [0.011, 0.751, 1.225, 1.456, 1.677, 1.787, 1.875, 1.943, 2.0, 2.067, 2.158, 2.249, 2.317, 2.491, 2.762],  # Aug
+     9: [0.038, 0.743, 1.137, 1.257, 1.472, 1.635, 1.761, 1.844, 1.926, 2.022, 2.113, 2.218, 2.314, 2.478, 2.901],  # Sep
+    10: [0.277, 0.399, 0.638, 0.773, 0.975, 1.11, 1.262, 1.403, 1.575, 1.729, 1.906, 2.075, 2.264, 2.475, 2.787],  # Oct
+    11: [0.065, 0.325, 0.471, 0.577, 0.732, 0.861, 0.965, 1.093, 1.204, 1.337, 1.485, 1.68, 1.827, 2.075, 2.352],  # Nov
+    12: [0.132, 0.217, 0.307, 0.394, 0.577, 0.739, 0.847, 0.967, 1.094, 1.211, 1.362, 1.523, 1.689, 1.917, 2.873],  # Dec
 }
-# Thompson Index: PLACEHOLDER pending real data (coworker). Set THOMPSON_PCTL_POINTS to match the
-# ranks that data is given at, then fill each month with one value per rank; the percentile lights
-# up automatically. Until then each month is None and the panel shows TI with a "—" percentile.
-THOMPSON_PCTL_POINTS = [0, 10, 25, 50, 75, 90, 100]
-THOMPSON_CLIMO_XMR = {m: None for m in range(1, 13)}
+
+# Thompson Index (K − LI): monthly percentile distribution for XMR (coworker-supplied climatology).
+THOMPSON_PCTL_POINTS = CLIMO_PCTL_POINTS_15
+THOMPSON_CLIMO_XMR = {
+     1: [-104.6, -74.3, -55.2, -48.2, -34.7, -25.6, -17.9, -9.0, -1.9, 5.0, 16.6, 25.3, 30.5, 36.8, 40.9],  # Jan
+     2: [-88.3, -69.4, -53.5, -41.8, -27.6, -19.0, -11.4, -3.1, 3.9, 11.1, 19.9, 27.2, 32.0, 37.4, 42.2],  # Feb
+     3: [-73.6, -61.5, -47.6, -37.1, -22.9, -15.8, -8.4, -2.0, 4.3, 10.8, 19.8, 29.1, 34.8, 39.2, 45.9],  # Mar
+     4: [-60.8, -51.1, -34.9, -26.5, -15.9, -8.0, -2.0, 3.4, 10.7, 17.9, 25.6, 32.1, 36.2, 41.3, 45.1],  # Apr
+     5: [-50.3, -31.4, -17.1, -8.8, 0.6, 7.1, 12.8, 18.7, 23.8, 28.4, 32.3, 35.9, 38.7, 42.4, 47.3],  # May
+     6: [-27.3, -6.3, 7.6, 14.9, 23.0, 27.2, 30.3, 32.2, 33.8, 35.8, 37.5, 39.5, 41.4, 44.3, 48.6],  # Jun
+     7: [-15.4, 6.2, 16.3, 20.5, 26.7, 29.6, 31.7, 33.2, 34.8, 36.1, 37.6, 39.7, 41.6, 44.6, 51.6],  # Jul
+     8: [-15.5, 0.2, 14.0, 21.6, 27.6, 30.4, 32.2, 33.9, 35.0, 36.6, 38.4, 40.4, 41.7, 44.9, 51.2],  # Aug
+     9: [-32.3, -13.8, 2.4, 9.2, 21.8, 27.2, 30.4, 32.4, 34.6, 36.2, 37.8, 39.6, 41.2, 44.1, 46.7],  # Sep
+    10: [-68.6, -50.5, -29.3, -18.7, -7.9, 1.0, 9.4, 17.0, 23.4, 30.2, 34.3, 38.4, 40.0, 44.9, 54.2],  # Oct
+    11: [-73.9, -55.5, -40.4, -31.5, -19.5, -11.3, -4.3, 0.9, 8.2, 16.4, 24.2, 31.3, 35.1, 41.3, 45.4],  # Nov
+    12: [-87.2, -67.5, -52.9, -42.0, -28.4, -17.5, -10.3, -3.4, 3.2, 11.2, 18.8, 27.7, 31.4, 37.4, 45.1],  # Dec
+}
 
 # When a model has no sounding valid exactly at the assessment hour (10Z) on a given day — common
 # for short-range RAP/HRRR depending on cycle timing — accept the nearest hour within this many
