@@ -181,6 +181,7 @@
         let refsCumulusMaps = null;  // {row_key: "maps/refs_debug/....png"} — REFS P(top>20kft) ~5nm (-10C)
         let refsCumulusMaps10 = null; // {row_key: "..."} — REFS P(top>25kft) ~10nm (-20C)
         let launchThermo = null;      // {site,hour,models:[...],by_model:{model:[dayRows]}}
+        let refcMaps = null;          // {row_key: "maps/refc/....png"} — NWS-scale reflectivity
         let ctWindow = '4hr';  // toggles between '4hr' and '1hr' for the persistent CT column
         let activeMetric = 'mom_mean';
         let activeStn = 'kxmr';
@@ -212,6 +213,7 @@
                 refsCumulusMaps = (payload.href_maps_latest && payload.href_maps_latest.refs_cumulus_maps) || null;
                 refsCumulusMaps10 = (payload.href_maps_latest && payload.href_maps_latest.refs_cumulus_maps10) || null;
                 launchThermo = payload.launch_thermo || null;
+                refcMaps = payload.refc_maps || null;
 
                 // Diagnostic: how many hours carry a real calibrated-thunder map per window.
                 const countReal = (o) => !o ? 0 : Object.values(o).filter(Boolean).length;
@@ -515,12 +517,19 @@
                             // the Calibrated Thunder column). Everything else keeps the thermo popup.
                             const isRefsCu = (m === 'refs' &&
                                 (activeMetric === 'cuP_neg10_5nm' || activeMetric === 'cuP_neg20_10nm'));
+                            // Anvil-tagged cells on the thick-layer metrics hover the NWS-scale
+                            // composite reflectivity so the parent core is visible upstream.
+                            const isAnvilCell = (profile && profile.anvil &&
+                                (activeMetric === 'thick_layer' || activeMetric === 'cloud_thick'));
                             if (isRefsCu) {
                                 // -10C/5nm hovers the 20 kft/~5nm field; -20C/10nm hovers 25 kft/~10nm.
                                 const mapDict = (activeMetric === 'cuP_neg20_10nm')
                                     ? (refsCumulusMaps10 || {}) : (refsCumulusMaps || {});
                                 const mapSrc = mapDict[timeKey] || null;
                                 cellEl.onmouseenter = (ev) => showRefsCumulusMapPopup(ev, profile, mapSrc, timeKey, activeMetric);
+                            } else if (isAnvilCell) {
+                                const mapSrc = (refcMaps || {})[timeKey] || null;
+                                cellEl.onmouseenter = (ev) => showAnvilMapPopup(ev, profile, mapSrc, timeKey, m);
                             } else {
                                 cellEl.onmouseenter = (e) => showPopup(e, m, profile);
                             }
@@ -907,6 +916,30 @@
         // probability map for that valid hour, so it can be eyeballed against DESI. The threshold
         // and neighborhood differ per column: −10°C/5 nm shows P(top>20 kft) at ~5 nm; −20°C/10 nm
         // shows P(top>25 kft) at ~10 nm. Mirrors showCtMapPopup.
+        function showAnvilMapPopup(e, profile, mapSrc, timeKey, model) {
+            const fb = hrefBlankMap || "";
+            const mapHtml = mapSrc
+                ? `<div class="ltg-map-grid" style="grid-template-columns: 1fr;"><div class="ltg-map-cell"><img src="${mapSrc}" alt="HRRR composite reflectivity" onerror="if(this.dataset.fb!=='1'){this.dataset.fb='1';this.src='${fb}';}" /></div></div>`
+                : `<div class="ltg-map-empty-full">No reflectivity map stored for ${timeKey || 'this'}Z — beyond the HRRR REFC window, or you're viewing an earlier DPROG/DT run (maps are kept for the current run only).</div>`;
+            popupCard.innerHTML = `
+                <div class="popup-header">${model.toUpperCase()} &mdash; ANVIL &mdash; ${timeKey}Z</div>
+                <div class="popup-body">
+                    • Thick Cloud Layer (LLCC): <strong>ANVIL — see Anvil rule</strong><br>
+                    • Anvil source: <strong>${profile.anvil_src_dbz} dBZ upstream (${profile.anvil_dir})</strong><br>
+                    • Highest Cloud Top: <strong>${profile.cloud_top == null ? '—' : profile.cloud_top + ' kft'}</strong><br>
+                    • −20°C Height: <strong>${profile.hght_20c == null ? '—' : profile.hght_20c + ' kft'}</strong><br>
+                    • Max Layer Thickness: <strong>${profile.cloud_thick == null ? '—' : profile.cloud_thick + ' kft'}</strong><br>
+                    ${mapHtml}
+                    <div style="font-size:0.72rem; color:#94a3b8; margin-top:4px;">
+                      HRRR composite reflectivity (NWS scale). The glaciated deck overhead is fed by the
+                      core upstream along the ${profile.anvil_dir} anvil flow, so the Anvil rule governs
+                      rather than the stratiform Thick Cloud Layer rule.
+                    </div>
+                </div>`;
+            popupCard.style.display = "block";
+            movePopup(e);
+        }
+
         function showRefsCumulusMapPopup(e, profile, mapSrc, timeKey, metric) {
             const fb = hrefBlankMap || "";
             const isNeg10 = (metric === 'cuP_neg10_5nm');
@@ -1009,6 +1042,11 @@
             const num = (v) => v == null ? '—' : v;
             const flow = (r) => (r.mf_dir == null) ? '—' : `${r.mf_dir}° / ${num(r.mf_spd)} kt`;
             const anvil = (r) => (r.av_dir == null) ? '—' : `${r.av_dir}° / ${num(r.av_spd)} kt`;
+            const ltgCell = (v) => {
+                if (v == null) return '<span style="color:#94a3b8;">—</span>';
+                const c = pctColor(Math.round(v));   // same cool->red ramp as the percentiles
+                return `<span style="background:${c.bg}; color:${c.fg}; padding:1px 8px; border-radius:10px; font-weight:600;">${v}%</span>`;
+            };
             let html = ensNote + `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
               <thead><tr style="text-align:left; color:#475569; border-bottom:2px solid #e2e8f0;">
                 <th style="padding:8px 6px;">Day</th>
@@ -1017,9 +1055,10 @@
                 <th style="padding:8px 6px;">Anvil Flow (300–150 mb)</th>
                 <th style="padding:8px 6px;">Thompson Index</th>
                 <th style="padding:8px 6px;">PWAT (in)</th>
+                <th style="padding:8px 6px;">Cizek Lightning Probability</th>
               </tr></thead><tbody>`;
             if (!rows.length) {
-                html += `<tr><td colspan="6" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
+                html += `<tr><td colspan="7" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
             } else {
                 for (const r of rows) {
                     const offHr = (r.vhh != null && r.vhh !== launchThermo.hour)
@@ -1031,6 +1070,7 @@
                       <td style="padding:8px 6px;">${anvil(r)}</td>
                       <td style="padding:8px 6px;">${num(r.ti)} <span style="color:#cbd5e1;">|</span> ${pct(r.ti_pct)}</td>
                       <td style="padding:8px 6px;">${num(r.pwat)} <span style="color:#cbd5e1;">|</span> ${pct(r.pwat_pct)}</td>
+                      <td style="padding:8px 6px;">${ltgCell(r.ltg)}</td>
                     </tr>`;
                 }
             }
