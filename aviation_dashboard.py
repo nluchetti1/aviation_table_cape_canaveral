@@ -13,6 +13,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
@@ -1198,6 +1199,18 @@ except Exception:
 _ML_DEPTH_HPA = 100.0  # mixed-layer parcel depth (lowest 100 hPa) for the Lifted Index
 
 
+def _layer_mean_rh(layers, p_bot, p_top):
+    """Mean relative humidity (%) over [p_top, p_bot] mb. Uses each layer's RH via _layer_rh, which
+    is native GRIB RH on the pad/GRIB paths and Magnus-derived from T/Td on BUFKIT."""
+    vals = []
+    for L in layers:
+        if p_top <= L.get("pres", 0) <= p_bot:
+            rh = _layer_rh(L) if "_layer_rh" in globals() else L.get("rh")
+            if rh is not None:
+                vals.append(rh)
+    return sum(vals) / len(vals) if vals else None
+
+
 def _layer_mean_flow(layers, p_bot, p_top, prefix):
     """Vector-mean wind over [p_top, p_bot] mb: FROM-direction, speed (kt), 8-pt compass regime, and
     the mean u/v components (kept so an ensemble can be averaged in component space). Keys are
@@ -1211,6 +1224,87 @@ def _layer_mean_flow(layers, p_bot, p_top, prefix):
     compass = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((frm + 22.5) // 45) % 8]
     return {f"{prefix}_dir": round(frm), f"{prefix}_spd": round(math.hypot(um, vm), 1),
             f"{prefix}_regime": compass, f"{prefix}_u": round(um, 3), f"{prefix}_v": round(vm, 3)}
+
+
+def _layer_mean_rh(layers, p_bot, p_top):
+    """Mean relative humidity (%) over [p_top, p_bot] mb. Uses native GRIB RH where present and
+    Magnus-derived RH (from T/Td) otherwise — consistent with the cloud logic."""
+    rhs = []
+    for L in layers:
+        if not (p_top <= L.get("pres", -1) <= p_bot):
+            continue
+        rh = L.get("rh")
+        if rh is None and L.get("tmpc") is not None and L.get("dwpt") is not None:
+            a, b = 17.625, 243.04
+            es = lambda x: math.exp((a * x) / (b + x))
+            rh = max(0.0, min(100.0, 100.0 * es(L["dwpt"]) / es(L["tmpc"])))
+        if rh is not None:
+            rhs.append(rh)
+    return sum(rhs) / len(rhs) if rhs else None
+
+
+# ---- Lightning probability (coworker's RandomForest, exported to a dependency-free numpy file) ----
+# Features, in the model's own order: [Thompson_Index, 1000-700mb Average U-Wind Component (kt,
+# eastward +), 700-500mb Average RH (%)]. The .sav was trained under scikit-learn 1.3.2; rather than
+# pin that (it conflicts with the pipeline's numpy 2.x), the 500 trees were extracted to
+# LIGHTNING_MODEL_PATH and are evaluated here in pure numpy. Verified bit-for-bit (max abs diff 0.0)
+# against sklearn 1.3.2 predict_proba, so this reproduces the coworker's tool exactly.
+LIGHTNING_ENABLED = True
+LIGHTNING_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lightning_rf_10Z.npz")
+_LTG_RF = None            # cached tree arrays
+_LTG_RF_TRIED = False
+
+
+def _load_lightning_rf():
+    global _LTG_RF, _LTG_RF_TRIED
+    if _LTG_RF_TRIED:
+        return _LTG_RF
+    _LTG_RF_TRIED = True
+    try:
+        d = np.load(LIGHTNING_MODEL_PATH, allow_pickle=True)
+        _LTG_RF = {
+            "offsets": d["offsets"], "cl": d["children_left"], "cr": d["children_right"],
+            "feat": d["feature"], "thr": d["threshold"], "val": d["value"],
+            "n_trees": int(d["n_trees"][0]),
+            "names": [str(x) for x in d["feature_names"]],
+        }
+        logging.info(f"Lightning RF loaded: {_LTG_RF['n_trees']} trees, features={_LTG_RF['names']}.")
+    except Exception as e:
+        logging.warning(f"Lightning RF unavailable ({e}); lightning column will be blank.")
+        _LTG_RF = None
+    return _LTG_RF
+
+
+def lightning_probability(thompson, mf_dir, mf_spd, rh_700_500):
+    """P(lightning) in %, from the coworker's RandomForest. U-wind is rebuilt from the 1000-700 mb
+    mean flow with the coworker's own convention: speed * cos(270 - dir) == eastward component (kt).
+    Returns None if any feature is missing or the model isn't loaded."""
+    if not LIGHTNING_ENABLED:
+        return None
+    if thompson is None or mf_dir is None or mf_spd is None or rh_700_500 is None:
+        return None
+    rf = _load_lightning_rf()
+    if rf is None:
+        return None
+    try:
+        u = mf_spd * math.cos(math.radians(270.0 - mf_dir))          # eastward component, kt
+        x = np.array([float(thompson), float(u), float(rh_700_500)], dtype=float)
+        offs, cl, cr, feat, thr, val = (rf["offsets"], rf["cl"], rf["cr"],
+                                        rf["feat"], rf["thr"], rf["val"])
+        acc = 0.0
+        for ti in range(rf["n_trees"]):
+            a = offs[ti]
+            node = 0
+            while cl[a + node] != -1:                                # -1 == leaf (TREE_LEAF)
+                node = (cl[a + node] if x[feat[a + node]] <= thr[a + node] else cr[a + node])
+            leaf = val[a + node]                                     # [count_class0, count_class1]
+            s = leaf[0] + leaf[1]
+            if s > 0:
+                acc += leaf[1] / s
+        return round(acc / rf["n_trees"] * 100.0, 1)
+    except Exception as e:
+        logging.debug(f"lightning_probability failed: {e}")
+        return None
 
 
 def _thermo_metpy(layers):
@@ -1295,6 +1389,107 @@ def _thermo_numpy(layers):
     return out
 
 
+def _rh_of_layer(l):
+    """Relative humidity (%) for a layer: native GRIB 'rh' when present, else Magnus-derived from
+    T/Td (BUFKIT path). Mirrors the _layer_rh helper used for cloud decks."""
+    rh = l.get("rh")
+    if rh is not None:
+        return rh
+    t, td = l.get("tmpc"), l.get("dwpt")
+    if t is None or td is None:
+        return None
+    a, b = 17.625, 243.04
+    es = lambda x: math.exp((a * x) / (b + x))
+    return max(1.0, min(100.0, 100.0 * es(min(td, t)) / es(t)))
+
+
+def _layer_mean_rh(layers, p_bot, p_top):
+    """Mean RH (%) through [p_top, p_bot] mb."""
+    vals = [_rh_of_layer(l) for l in layers if p_top <= l["pres"] <= p_bot]
+    vals = [v for v in vals if v is not None]
+    return round(sum(vals) / len(vals), 1) if vals else None
+
+
+# ---- Cizek lightning-probability random forest (KSC/CCSFS, 10Z sounding) --------------------
+# Source model: cyclonecizek/LightningProbabilityTool, RFC_model_limited_depth_10Z_updated.sav
+# (RandomForestClassifier, 500 trees, max_depth 6, scikit-learn 1.3.2).
+#
+# That pickle requires numpy<2 and cannot be loaded alongside this pipeline's numpy 2.x, so the
+# forest was exported to a plain .npz of per-tree arrays and is evaluated here in pure numpy. The
+# extraction was verified to reproduce sklearn's predict_proba EXACTLY (max abs diff 0.0) over a
+# validation grid, so this is a re-implementation of the same model, not an approximation.
+#
+# Features, in this exact order (model.feature_names_in_):
+#   Thompson_Index                        -- K-Index minus Lifted Index
+#   1000-700mb_Average_U-Wind_Component   -- NOTE: the upstream tool defines this as
+#                                            speed_kt * cos(deg2rad(270 - direction)), i.e. a
+#                                            WESTERLY-POSITIVE component in KNOTS off the
+#                                            meteorological FROM-direction. This is NOT the
+#                                            standard math-convention u, so it is rebuilt with the
+#                                            upstream formula rather than reusing mf_u.
+#   700-500mb_Average_RH                  -- percent
+RF_LIGHTNING_ENABLED = True
+RF_LIGHTNING_NPZ = "rf_lightning_10Z.npz"
+_RF_LTG = None
+_RF_LTG_TRIED = False
+
+
+def _rf_lightning_load():
+    """Load the exported forest once. Returns the arrays dict, or None if unavailable (in which
+    case the column simply shows '-' — a missing model must never fail the run)."""
+    global _RF_LTG, _RF_LTG_TRIED
+    if _RF_LTG_TRIED:
+        return _RF_LTG
+    _RF_LTG_TRIED = True
+    if not RF_LIGHTNING_ENABLED:
+        return None
+    try:
+        path = RF_LIGHTNING_NPZ
+        if not os.path.exists(path):
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), RF_LIGHTNING_NPZ)
+        d = np.load(path, allow_pickle=True)
+        _RF_LTG = {k: d[k] for k in d.files}
+        ntrees = len(_RF_LTG["tree_offsets"]) - 1
+        logging.info(f"Cizek lightning RF loaded: {ntrees} trees, "
+                     f"{int(_RF_LTG['tree_offsets'][-1])} nodes.")
+    except Exception as e:
+        logging.warning(f"Cizek lightning RF unavailable ({e}); probability column will be blank.")
+        _RF_LTG = None
+    return _RF_LTG
+
+
+def rf_lightning_u_wind(mf_dir, mf_spd):
+    """Upstream tool's '1000-700mb Average U-Wind Component': westerly-positive knots."""
+    if mf_dir is None or mf_spd is None:
+        return None
+    return mf_spd * math.cos(math.radians(270.0 - mf_dir))
+
+
+def rf_lightning_prob(thompson, u_wind, rh_700_500):
+    """P(lightning) in percent for one 10Z environment, or None if a feature is missing."""
+    r = _rf_lightning_load()
+    if r is None or thompson is None or u_wind is None or rh_700_500 is None:
+        return None
+    try:
+        X = np.array([[float(thompson), float(u_wind), float(rh_700_500)]], dtype=float)
+        cl, cr = r["children_left"], r["children_right"]
+        fe, th, va, off = r["feature"], r["threshold"], r["value"], r["tree_offsets"]
+        acc = np.zeros((1, va.shape[1]), dtype=float)
+        for t in range(len(off) - 1):
+            a, b = int(off[t]), int(off[t + 1])
+            tcl, tcr, tfe, tth = cl[a:b], cr[a:b], fe[a:b], th[a:b]
+            node = 0
+            while tcl[node] != -1:                     # walk to a leaf
+                node = tcl[node] if X[0, tfe[node]] <= tth[node] else tcr[node]
+            acc += va[a:b][node]
+        acc /= (len(off) - 1)
+        c1 = int(np.where(r["classes"] == 1.0)[0][0])
+        return round(float(acc[0, c1]) * 100.0, 1)
+    except Exception as e:
+        logging.debug(f"Cizek lightning RF predict failed: {e}")
+        return None
+
+
 def compute_launch_thermo(profile_layers):
     """1000-700 mb mean flow (+ regime), K-Index, MIXED-LAYER Lifted Index, Thompson Index (KI-LI),
     and PWAT. Uses MetPy when available and falls back to an equivalent numpy implementation.
@@ -1307,6 +1502,9 @@ def compute_launch_thermo(profile_layers):
             return {}
         out = dict(_layer_mean_flow(layers, 1000.0, 700.0, "mf"))
         out.update(_layer_mean_flow(layers, 300.0, 150.0, "av"))
+        rh75 = _layer_mean_rh(layers, 700.0, 500.0)   # Cizek RF feature 3
+        if rh75 is not None:
+            out["rh_700_500"] = rh75
         core = _thermo_metpy(layers) if _HAVE_METPY else {}
         if not core:
             core = _thermo_numpy(layers)
@@ -1424,12 +1622,27 @@ def compute_profile_variables(profile_layers):
     # dewpoint-depression <= 2C criterion, which captures the fuller vertical extent of the
     # moist/cloudy layer (RH >= 95% clips the deck edges and undercounts thickness).
     RH_CLOUD_THRESHOLD = 95.0
+    # ...but the depr<=2C test is only physical in the water/mixed part of the column. At cirrus
+    # temperatures the Magnus depression collapses (at -68C, RH~85% already gives depr~1.3C), so a
+    # model with a moist near-tropopause bias — notably GFS on the pad grids — invents a phantom
+    # cloud top at 40-47 kft. So above CLOUD_GLACIATION_C we drop depr and demand genuine near-
+    # saturation (RH>=95%, or a very small depr when RH is absent, e.g. BUFKIT), which admits real
+    # cirrus/anvil but rejects the artifact.
+    CLOUD_GLACIATION_C = -40.0
+
+    def _extent_cloud(l):
+        t, d = l.get("tmpc"), l.get("depr")
+        if t is None or d is None:
+            return False
+        if t >= CLOUD_GLACIATION_C:
+            return d <= 2.0                      # water/mixed cloud: full-extent depression test
+        rh = _layer_rh(l)                        # glaciated: require true near-saturation
+        return rh >= RH_CLOUD_THRESHOLD if rh is not None else d <= 1.0
+
     ceiling_decks = _group_cloud_layers(
         lambda l: (_layer_rh(l) is not None and _layer_rh(l) >= RH_CLOUD_THRESHOLD)
     )
-    extent_decks = _group_cloud_layers(
-        lambda l: (l.get("depr") is not None and l["depr"] <= 2.0)
-    )
+    extent_decks = _group_cloud_layers(_extent_cloud)
 
     # --- Mixed-layer momentum (BUFKIT-style) -------------------------------------
     # Both PBL Mom Mean (transport-style mean wind through the mixed layer) and PBL Mom Max
@@ -2451,7 +2664,7 @@ def fetch_convective_reflectivity(time_keys):
         out = {}
         try:
             if not _fetch_refc_file(fh, local):
-                return row_key, {}
+                return row_key, {}, None
             grbs = pygrib.open(local)
             refc = lats = lons = None
             for grb in grbs:
@@ -2463,7 +2676,7 @@ def fetch_convective_reflectivity(time_keys):
                     break
             grbs.close()
             if refc is None:
-                return row_key, {}
+                return row_key, {}, None
             lons_n = np.where(lons > 180, lons - 360.0, lons)
             # S3 serves the full CONUS grid (no server-side subsetting), so crop to the Florida box
             # here — this keeps the per-site neighborhood and sector math on a small array.
@@ -2474,6 +2687,7 @@ def fetch_convective_reflectivity(time_keys):
                 refc = refc[y0b:y1b, x0b:x1b]
                 lats = lats[y0b:y1b, x0b:x1b]
                 lons_n = lons_n[y0b:y1b, x0b:x1b]
+            sub_lons_out, sub_lats_out = lons_n, lats
             compass8 = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
             for sid, c in all_coords.items():
                 dist = (lats - c["lat"]) ** 2 + (lons_n - c["lon"]) ** 2
@@ -2499,16 +2713,20 @@ def fetch_convective_reflectivity(time_keys):
                         sectors[name] = round(float(np.max(refc[m])), 1) if np.any(m) else 0.0
                     entry["sectors"] = sectors
                 out[sid] = entry
-            return row_key, out
+            # Hand the cropped grid back so REFC maps can be rendered AFTER the pool (matplotlib is
+            # not thread-safe). Small: the Florida crop is ~1% of the CONUS grid.
+            grid = (sub_lons_out, sub_lats_out, refc) if ANVIL_MASK_ENABLED else None
+            return row_key, out, grid
         except Exception as e:
             logging.debug(f"REFC f{fh:02d} failed: {e}")
-            return row_key, {}
+            return row_key, {}, None
         finally:
             if os.path.exists(local):
                 try: os.remove(local)
                 except Exception: pass
 
     matrix = {sid: {} for sid in all_coords}
+    grids = {}
     tasks = []
     for fh in range(1, max_fh + 1):
         valid = cycle_init + datetime.timedelta(hours=fh)
@@ -2517,9 +2735,11 @@ def fetch_convective_reflectivity(time_keys):
         futs = [ex.submit(_worker, fh, rk) for fh, rk in tasks]
         for fut in concurrent.futures.as_completed(futs):
             try:
-                rk, site_vals = fut.result()
+                rk, site_vals, grid = fut.result()
                 for sid, v in site_vals.items():
                     matrix[sid][rk] = v
+                if grid is not None:
+                    grids[rk] = grid
             except Exception:
                 pass
 
@@ -2529,7 +2749,18 @@ def fetch_convective_reflectivity(time_keys):
     logging.info(f"Convective mask: REFC for {total} site-hours; {hits} exceed {CONVECTIVE_DBZ:.0f} dBZ "
                  f"(neighborhood {CONVECTIVE_NBR_NM:.0f} nm / {ncells} cells)"
                  f"{'; anvil sectors on' if ANVIL_MASK_ENABLED else ''}.")
-    return matrix
+
+    # Render the reflectivity maps single-threaded, after the pool (matplotlib is not thread-safe).
+    # These back the ANVIL hover popup: the parent core shows upstream of the tagged site.
+    refc_maps = {}
+    if ANVIL_MASK_ENABLED and grids:
+        for rk in sorted(grids.keys()):
+            lo, la, va = grids[rk]
+            p = _render_refc_map(rk, lo, la, va, active_cycle)
+            if p:
+                refc_maps[rk] = p
+        logging.info(f"REFC maps: rendered {len(refc_maps)} NWS-scale reflectivity maps to maps/refc/.")
+    return matrix, refc_maps
 
 
 def _interp_exceedance(curve, height_m):
@@ -2658,6 +2889,75 @@ def probe_rrfsens_member_retop(session):
                      f"(need it for the +6 h lagged 5 members -> 10-member TLE).")
         return
     logging.info("[RRFSENS PROBE] no rrfsens cycle with m001 2dfld f024 found in the last 48h.")
+
+
+def _render_refc_map(row_key, sub_lons, sub_lats, sub_vals, cycle):
+    """Render one composite-reflectivity PNG over the Florida domain using the standard NWS radar
+    reflectivity color scale, with the pads/stations marked. Used by the ANVIL hover popup so the
+    parent convective core feeding the anvil can be seen upstream. Returns the path or None."""
+    try:
+        out_dir = os.path.join(MAPS_DIR, "refc")
+        os.makedirs(out_dir, exist_ok=True)
+        # Standard NWS reflectivity ramp: 5-75 dBZ in 5-dBZ steps.
+        nws_colors = ["#04e9e7", "#019ff4", "#0300f4", "#02fd02", "#01c501", "#008e00",
+                      "#fdf802", "#e5bc00", "#fd9500", "#fd0000", "#d40000", "#bc0000",
+                      "#f800fd", "#9854c6", "#fdfdfd"]
+        bounds = list(range(5, 85, 5))                      # 16 edges -> 15 colors
+        cmap = mcolors.ListedColormap(nws_colors)
+        cmap.set_under((0, 0, 0, 0))                        # <5 dBZ fully transparent
+        norm = mcolors.BoundaryNorm(bounds, cmap.N)
+
+        proj = ccrs.PlateCarree()
+        counties = cfeature.NaturalEarthFeature(
+            category="cultural", name="admin_2_counties", scale="10m", facecolor="none")
+        states = cfeature.NaturalEarthFeature(
+            category="cultural", name="admin_1_states_provinces_lines", scale="50m", facecolor="none")
+
+        fig = plt.figure(figsize=(5.5, 5.8), dpi=120)
+        ax = fig.add_subplot(1, 1, 1, projection=proj)
+        ax.set_extent([FL_DOMAIN["lon_min"], FL_DOMAIN["lon_max"],
+                       FL_DOMAIN["lat_min"], FL_DOMAIN["lat_max"]], crs=proj)
+        ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="#0b1020", zorder=0)
+        ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#141a24", zorder=0)
+        ax.add_feature(counties, edgecolor="#334155", linewidth=0.3, zorder=1)
+        ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="#94a3b8", linewidth=0.8, zorder=3)
+        ax.add_feature(states, edgecolor="#94a3b8", linewidth=0.6, zorder=3)
+
+        masked = np.ma.masked_less(sub_vals, 5.0)
+        mesh = ax.pcolormesh(sub_lons, sub_lats, masked, cmap=cmap, norm=norm,
+                             shading="auto", transform=proj, zorder=2)
+
+        for pid, c in LAUNCH_PADS.items():
+            ax.plot(c["lon"], c["lat"], marker="o", markersize=4, color="#38bdf8",
+                    markeredgecolor="white", markeredgewidth=0.6, transform=proj, zorder=5)
+        for sid, c in STN_COORDS.items():
+            hot = sid.lower() == "kxmr"
+            ax.plot(c["lon"], c["lat"], marker="^", markersize=7 if hot else 5,
+                    color="#22c55e" if hot else "#e2e8f0", markeredgecolor="black",
+                    markeredgewidth=0.7, transform=proj, zorder=6)
+            ax.text(c["lon"] + 0.06, c["lat"] + 0.04, sid.upper(), fontsize=6, fontweight="bold",
+                    color="#f8fafc", transform=proj, zorder=7,
+                    bbox=dict(boxstyle="round,pad=0.12", facecolor="#0f172a", alpha=0.6, edgecolor="none"))
+
+        ax.set_title(f"HRRR composite reflectivity — valid {row_key}Z (from {cycle}z)",
+                     fontsize=8.5, fontweight="bold", color="#0f172a")
+        cbar = fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.03, ticks=bounds[::2], extend="min")
+        cbar.set_label("dBZ", fontsize=7)
+        cbar.ax.tick_params(labelsize=6)
+
+        safe_key = row_key.replace("/", "")
+        out_name = f"refc_{cycle}z_{safe_key}z.png"
+        out_path = os.path.join(out_dir, out_name)
+        fig.savefig(out_path, format="png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        return f"maps/refc/{out_name}"
+    except Exception as e:
+        logging.error(f"REFC map render failed for {row_key}: {e}")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
 
 
 def _render_refs_echotop_debug_map(row_key, sub_lons, sub_lats, sub_vals, cycle, thr_label):
@@ -3529,6 +3829,21 @@ def fetch_refs_member_thermo(site="kxmr", assess_hour=10):
             row["thompson"] = round(ti, 1)
         if pw is not None:
             row["pwat_in"] = round(pw, 2)
+        rh = _avg("rh_700_500")
+        if rh is not None:
+            row["rh_700_500"] = round(rh, 1)
+        # Ensemble lightning probability: run the RF on EACH member's own environment and average
+        # the resulting probabilities (same principle as the indices — never run it on a mean
+        # sounding, whose moisture structure is smeared).
+        member_p = []
+        for t in per:
+            p = rf_lightning_prob(t.get("thompson"),
+                                  rf_lightning_u_wind(t.get("mf_dir"), t.get("mf_spd")),
+                                  t.get("rh_700_500"))
+            if p is not None:
+                member_p.append(p)
+        if member_p:
+            row["ltg"] = round(sum(member_p) / len(member_p), 1)
         out[rk] = row
 
     logging.info(f"REFS member thermo: cycle {date_str} {cycle}z, {len(members)} members, "
@@ -3576,11 +3891,14 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 day_label, date_str, sort_key, month, _yr = _valid_day_fields(dd, now)
                 ti = th.get("thompson")
                 pwat = th.get("pwat_in")
+                ltg = rf_lightning_prob(ti, rf_lightning_u_wind(th.get("mf_dir"), th.get("mf_spd")),
+                                        th.get("rh_700_500"))
                 day_rows.append({
                     "day": day_label,
                     "date": date_str,
                     "sort": sort_key,
                     "vhh": hh,
+                    "ltg": ltg,
                     "mf_dir": th.get("mf_dir"),
                     "mf_spd": th.get("mf_spd"),
                     "regime": th.get("mf_regime"),
@@ -3614,6 +3932,7 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 "date": date_str,
                 "sort": sort_key,
                 "vhh": assess_hour,
+                "ltg": r.get("ltg"),
                 "mf_dir": r.get("mf_dir"),
                 "mf_spd": r.get("mf_spd"),
                 "regime": r.get("mf_regime"),
@@ -3674,9 +3993,11 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     # cu/anvil-governed (their own LLCC rules) rather than a stratiform thick-cloud bust. HRRR is
     # the convection truth source and the tag is applied across every model column for that
     # site-hour; the underlying thickness values are preserved so nothing is lost.
+    refc_maps = {}   # {row_key: "maps/refc/....png"} — backs the ANVIL hover popup
     if CONVECTIVE_MASK_ENABLED:
         try:
-            refc = fetch_convective_reflectivity(time_rows)
+            refc, refc_maps_out = fetch_convective_reflectivity(time_rows)
+            refc_maps.update(refc_maps_out or {})
             tagged = 0
             anvil_tagged = 0
             anvil_diag = 0
@@ -3854,6 +4175,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         "runs": history_runs,
         "href_maps_latest": href_maps_latest,
         "launch_thermo": launch_thermo,
+        "refc_maps": refc_maps,
     }
 
     with open(HISTORY_FILE, "w") as f:
@@ -3864,7 +4186,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     # keep-set — the previous `{**href_maps, **ct_all_maps}` merge silently discarded density
     # maps (and ct1 maps) wherever a row key was shared, so they were pruned right after
     # being generated. That was why only a handful of density hours survived on disk.
-    referenced_paths = _collect_map_paths(href_maps, ct1_maps, ct4_maps, blank_basemap_path)
+    referenced_paths = _collect_map_paths(href_maps, ct1_maps, ct4_maps, blank_basemap_path, refc_maps)
     prune_stale_maps(referenced_paths)
     logging.info("Dashboard matrix completely compiled and written to history.json.")
 
