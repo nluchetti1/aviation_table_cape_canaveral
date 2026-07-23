@@ -1087,7 +1087,7 @@
                 const k = REGIME_CLASS[v] || 'along';
                 const style = k === 'on'  ? 'background:#dbeafe; color:#0c4a6e;'      // onshore  — blue
                             : k === 'off' ? 'background:#fed7aa; color:#7c2d12;'      // offshore — amber
-                            :               'background:#e2e8f0; color:#334155;';     // alongshore — neutral
+                            :               'background:#dcfce7; color:#14532d;';     // alongshore — green
                 const tag = k === 'on' ? 'onshore' : k === 'off' ? 'offshore' : 'alongshore';
                 return `<span title="${tag}" style="${style} padding:2px 9px; border-radius:10px; font-weight:600;">${v}</span>
                         <span style="color:#94a3b8; font-size:0.72rem; margin-left:4px;">${tag}</span>`;
@@ -1103,7 +1103,7 @@
             };
             let html = ensNote + `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
               <thead><tr style="text-align:left; color:#475569; border-bottom:2px solid #e2e8f0;">
-                <th style="padding:8px 6px;">Day</th>
+                <th style="padding:8px 6px; width:150px; white-space:nowrap;">Day</th>
                 <th style="padding:8px 6px;">1000–700 mb Mean Flow</th>
                 <th style="padding:8px 6px;">Flow Regime</th>
                 <th style="padding:8px 6px;">Anvil Flow (300–150 mb)</th>
@@ -1117,7 +1117,7 @@
             } else {
                 for (const r of rows) {
                     html += `<tr style="border-bottom:1px solid #f1f5f9;">
-                      <td style="padding:8px 6px; font-weight:600;">${r.day}<span style="color:#94a3b8; font-weight:400;"> · ${r.date}</span></td>
+                      <td style="padding:8px 6px; font-weight:600; white-space:nowrap;">${r.day}<span style="color:#94a3b8; font-weight:400;"> · ${r.date}</span></td>
                       <td style="padding:8px 6px;">${flow(r)}</td>
                       <td style="padding:8px 6px;">${regimeCell(r.regime)}</td>
                       <td style="padding:8px 6px;">${anvil(r)}</td>
@@ -1136,7 +1136,7 @@
     </script>
     <div id="ltModal" onclick="if(event.target===this)hideLaunchThermo()"
          style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.55); z-index:1000; align-items:flex-start; justify-content:center;">
-      <div style="background:#fff; margin-top:5vh; max-width:900px; width:94%; max-height:88vh; overflow:auto; border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,0.3);">
+      <div style="background:#fff; margin-top:5vh; max-width:1180px; width:96%; max-height:88vh; overflow:auto; border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,0.3);">
         <div style="display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid #e2e8f0; position:sticky; top:0; background:#fff;">
           <div style="font-weight:700; color:#1e3a5f;">10Z Synoptic — <span id="ltSite">KXMR</span></div>
           <div style="display:flex; align-items:center; gap:8px;">
