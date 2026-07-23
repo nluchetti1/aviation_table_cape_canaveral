@@ -182,6 +182,8 @@
         let refsCumulusMaps10 = null; // {row_key: "..."} — REFS P(top>25kft) ~10nm (-20C)
         let launchThermo = null;      // {site,hour,models:[...],by_model:{model:[dayRows]}}
         let refcMaps = null;          // {row_key: "maps/refc/....png"} — NWS-scale reflectivity
+        let launchThermoRuns = null;  // [{timestamp, thermo}] — panel dprog/dt, current + 3 back
+        let ltRunIdx = 0;             // which run the panel is currently showing
         let ctWindow = '4hr';  // toggles between '4hr' and '1hr' for the persistent CT column
         let activeMetric = 'mom_mean';
         let activeStn = 'kxmr';
@@ -213,6 +215,7 @@
                 refsCumulusMaps = (payload.href_maps_latest && payload.href_maps_latest.refs_cumulus_maps) || null;
                 refsCumulusMaps10 = (payload.href_maps_latest && payload.href_maps_latest.refs_cumulus_maps10) || null;
                 launchThermo = payload.launch_thermo || null;
+                launchThermoRuns = payload.launch_thermo_runs || null;
                 refcMaps = payload.refc_maps || null;
 
                 // Diagnostic: how many hours carry a real calibrated-thunder map per window.
@@ -1006,23 +1009,56 @@
 
         function hidePopup() { popupCard.style.display = "none"; }
 
-        // ---- 10Z Synoptic panel (mean flow / regime / Thompson / PWAT, one row per day) ----
+        // ---- 10Z Synoptic panel (mean flow / regime / anvil / Thompson / RH / PWAT / lightning) ----
+        function ltActiveThermo() {
+            if (launchThermoRuns && launchThermoRuns[ltRunIdx] && launchThermoRuns[ltRunIdx].thermo) {
+                return launchThermoRuns[ltRunIdx].thermo;
+            }
+            return launchThermo;
+        }
+        function setLaunchThermoRun(i) {
+            ltRunIdx = i;
+            const t = ltActiveThermo();
+            const sel = document.getElementById('ltModel');
+            const prev = sel.value;
+            sel.innerHTML = (t.models || []).map(m => `<option value="${m}">${m.toUpperCase()}</option>`).join('');
+            if ((t.models || []).includes(prev)) sel.value = prev;   // keep the model when stepping runs
+            renderLaunchThermoRuns();
+            renderLaunchThermo();
+        }
+        function renderLaunchThermoRuns() {
+            const el = document.getElementById('ltRuns');
+            if (!el) return;
+            if (!launchThermoRuns || launchThermoRuns.length < 2) { el.innerHTML = ''; return; }
+            el.innerHTML = launchThermoRuns.map((r, i) => {
+                const label = i === 0 ? 'Current Run' : `Run -${i}`;
+                const on = (i === ltRunIdx);
+                return `<button onclick="setLaunchThermoRun(${i})" title="${r.timestamp || ''}"
+                    style="border:1px solid ${on ? '#1e3a5f' : '#cbd5e1'}; background:${on ? '#1e3a5f' : '#fff'};
+                           color:${on ? '#fff' : '#1e3a5f'}; border-radius:6px; padding:3px 10px; margin-right:6px;
+                           cursor:pointer; font-size:0.8rem; font-weight:${on ? '600' : '400'};">${label}</button>`;
+            }).join('') + `<span style="color:#94a3b8; font-size:0.75rem; margin-left:4px;">${
+                (launchThermoRuns[ltRunIdx] || {}).timestamp || ''}</span>`;
+        }
         function showLaunchThermo() {
             if (!launchThermo || !(launchThermo.models || []).length) {
                 alert("No 10Z synoptic data in this run yet.");
                 return;
             }
+            ltRunIdx = 0;
             document.getElementById('ltSite').textContent = launchThermo.site || 'KXMR';
             const sel = document.getElementById('ltModel');
             sel.innerHTML = launchThermo.models
                 .map(m => `<option value="${m}">${m.toUpperCase()}</option>`).join('');
+            renderLaunchThermoRuns();
             renderLaunchThermo();
             document.getElementById('ltModal').style.display = 'flex';
         }
         function hideLaunchThermo() { document.getElementById('ltModal').style.display = 'none'; }
         function renderLaunchThermo() {
+            const thermo = ltActiveThermo();
             const model = document.getElementById('ltModel').value;
-            const rows = (launchThermo.by_model && launchThermo.by_model[model]) || [];
+            const rows = (thermo.by_model && thermo.by_model[model]) || [];
             const ens = (rows[0] && /(\d+)-mem/.exec(rows[0].engine || '')) ;
             const ensNote = ens ? `<div style="font-size:0.78rem; color:#475569; margin:2px 0 8px;">REFS = ${ens[1]}-member ensemble (mean of per-member indices, not the mean sounding).</div>` : '';
             const pctColor = (v) => {
@@ -1042,6 +1078,24 @@
             const num = (v) => v == null ? '—' : v;
             const flow = (r) => (r.mf_dir == null) ? '—' : `${r.mf_dir}° / ${num(r.mf_spd)} kt`;
             const anvil = (r) => (r.av_dir == null) ? '—' : `${r.av_dir}° / ${num(r.av_spd)} kt`;
+            // The Cape's coast faces roughly east, so an easterly component is ONSHORE (marine,
+            // moist, sea-breeze suppressed) and a westerly component is OFFSHORE (continental,
+            // sea-breeze favorable). Due N/S is alongshore — neither.
+            const REGIME_CLASS = { NE:'on', E:'on', SE:'on', NW:'off', W:'off', SW:'off', N:'along', S:'along' };
+            const regimeCell = (v) => {
+                if (!v) return '—';
+                const k = REGIME_CLASS[v] || 'along';
+                const style = k === 'on'  ? 'background:#dbeafe; color:#0c4a6e;'      // onshore  — blue
+                            : k === 'off' ? 'background:#fed7aa; color:#7c2d12;'      // offshore — amber
+                            :               'background:#e2e8f0; color:#334155;';     // alongshore — neutral
+                const tag = k === 'on' ? 'onshore' : k === 'off' ? 'offshore' : 'alongshore';
+                return `<span title="${tag}" style="${style} padding:2px 9px; border-radius:10px; font-weight:600;">${v}</span>
+                        <span style="color:#94a3b8; font-size:0.72rem; margin-left:4px;">${tag}</span>`;
+            };
+            const rhCell = (r) => {
+                if (r.ltg_rh == null) return '—';
+                return `${r.ltg_rh}% <span style="color:#cbd5e1;">|</span> ${pct(r.rh_pct)}`;
+            };
             const ltgCell = (v) => {
                 if (v == null) return '<span style="color:#94a3b8;">—</span>';
                 const c = pctColor(Math.round(v));   // same cool->red ramp as the percentiles
@@ -1054,19 +1108,21 @@
                 <th style="padding:8px 6px;">Flow Regime</th>
                 <th style="padding:8px 6px;">Anvil Flow (300–150 mb)</th>
                 <th style="padding:8px 6px;">Thompson Index</th>
+                <th style="padding:8px 6px;">700–500 mb RH</th>
                 <th style="padding:8px 6px;">PWAT (in)</th>
                 <th style="padding:8px 6px;">Cizek Lightning Probability</th>
               </tr></thead><tbody>`;
             if (!rows.length) {
-                html += `<tr><td colspan="7" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
+                html += `<tr><td colspan="8" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
             } else {
                 for (const r of rows) {
                     html += `<tr style="border-bottom:1px solid #f1f5f9;">
                       <td style="padding:8px 6px; font-weight:600;">${r.day}<span style="color:#94a3b8; font-weight:400;"> · ${r.date}</span></td>
                       <td style="padding:8px 6px;">${flow(r)}</td>
-                      <td style="padding:8px 6px;">${r.regime || '—'}</td>
+                      <td style="padding:8px 6px;">${regimeCell(r.regime)}</td>
                       <td style="padding:8px 6px;">${anvil(r)}</td>
                       <td style="padding:8px 6px;">${num(r.ti)} <span style="color:#cbd5e1;">|</span> ${pct(r.ti_pct)}</td>
+                      <td style="padding:8px 6px;">${rhCell(r)}</td>
                       <td style="padding:8px 6px;">${num(r.pwat)} <span style="color:#cbd5e1;">|</span> ${pct(r.pwat_pct)}</td>
                       <td style="padding:8px 6px;">${ltgCell(r.ltg)}</td>
                     </tr>`;
@@ -1089,6 +1145,7 @@
             <button onclick="hideLaunchThermo()" style="border:none; background:#e2e8f0; border-radius:6px; padding:4px 10px; cursor:pointer;">✕</button>
           </div>
         </div>
+        <div id="ltRuns" style="padding:10px 18px 0; display:flex; align-items:center; flex-wrap:wrap;"></div>
         <div id="ltBody" style="padding:6px 18px 18px;"></div>
       </div>
     </div>
