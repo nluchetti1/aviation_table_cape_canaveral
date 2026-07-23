@@ -3891,14 +3891,17 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 day_label, date_str, sort_key, month, _yr = _valid_day_fields(dd, now)
                 ti = th.get("thompson")
                 pwat = th.get("pwat_in")
-                ltg = rf_lightning_prob(ti, rf_lightning_u_wind(th.get("mf_dir"), th.get("mf_spd")),
-                                        th.get("rh_700_500"))
+                u_ltg = rf_lightning_u_wind(th.get("mf_dir"), th.get("mf_spd"))
+                rh_ltg = th.get("rh_700_500")
+                ltg = rf_lightning_prob(ti, u_ltg, rh_ltg)
                 day_rows.append({
                     "day": day_label,
                     "date": date_str,
                     "sort": sort_key,
                     "vhh": hh,
                     "ltg": ltg,
+                    "ltg_u": None if u_ltg is None else round(u_ltg, 2),
+                    "ltg_rh": rh_ltg,
                     "mf_dir": th.get("mf_dir"),
                     "mf_spd": th.get("mf_spd"),
                     "regime": th.get("mf_regime"),
@@ -3933,6 +3936,10 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 "sort": sort_key,
                 "vhh": assess_hour,
                 "ltg": r.get("ltg"),
+                "ltg_u": (None if r.get("mf_dir") is None else
+                          round(rf_lightning_u_wind(r.get("mf_dir"), r.get("mf_spd")), 2)),
+                "ltg_rh": r.get("rh_700_500"),
+                "ltg_members": r.get("n"),
                 "mf_dir": r.get("mf_dir"),
                 "mf_spd": r.get("mf_spd"),
                 "regime": r.get("mf_regime"),
@@ -3951,6 +3958,30 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
     # order models: put the ones with the most rows first, stable-ish preferred order
     pref = ["gfs", "ecmwf", "rrfs", "refs", "rap", "hrrr"]
     models = sorted(by_model.keys(), key=lambda m: (pref.index(m) if m in pref else 99, m))
+
+    # Dump the EXACT feature values fed to the Cizek RF so they can be typed straight into the
+    # upstream Streamlit tool and compared. Feature order matches model.feature_names_in_.
+    try:
+        logging.info("=" * 78)
+        logging.info(f"CIZEK LIGHTNING RF INPUTS — {site.upper()} {assess_hour:02d}Z "
+                     f"(Thompson_Index, 1000-700mb_Average_U-Wind_Component[kt], 700-500mb_Average_RH[%])")
+        logging.info(f"  {'model':6s} {'valid':11s} {'hr':>4s} {'Thompson':>9s} {'U-wind':>8s} {'RH':>7s} {'P(ltg)':>8s}")
+        for m in models:
+            for r in by_model[m]:
+                hr = f"{r.get('vhh'):02d}Z" if r.get("vhh") is not None else "--"
+                ti = "n/a" if r.get("ti") is None else f"{r['ti']:9.1f}"
+                uu = "     n/a" if r.get("ltg_u") is None else f"{r['ltg_u']:8.2f}"
+                rh = "    n/a" if r.get("ltg_rh") is None else f"{r['ltg_rh']:7.1f}"
+                pp = "     n/a" if r.get("ltg") is None else f"{r['ltg']:7.1f}%"
+                note = ""
+                if m == "refs" and r.get("ltg_members"):
+                    note = (f"   [P is the mean of {r['ltg_members']} per-member probabilities; "
+                            f"features shown are member means and will NOT reproduce it exactly]")
+                logging.info(f"  {m:6s} {r['date']:11s} {hr:>4s} {ti} {uu} {rh} {pp}{note}")
+        logging.info("=" * 78)
+    except Exception as e:
+        logging.debug(f"Cizek RF input dump failed: {e}")
+
     return {"site": site.upper(), "hour": assess_hour, "models": models, "by_model": by_model}
 
 
