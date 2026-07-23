@@ -3680,6 +3680,16 @@ THOMPSON_CLIMO_XMR = {
 # hours instead of dropping the day. Exact 10Z always wins when present.
 ASSESS_HOUR_TOL = 2
 
+# How many runs of the 10Z panel to retain for its own DPROG/DT (current + 3 back).
+LAUNCH_THERMO_HISTORY_RUNS = 4
+
+# 700-500 mb mean RH: PLACEHOLDER pending the XMR climatology. Set RH75_PCTL_POINTS to whatever
+# ranks the data arrives at, then fill each month with one value per rank (same shape as the PWAT
+# and Thompson tables above) and the percentile badge lights up automatically. Until then the
+# column shows the RH value with a "-" percentile.
+RH75_PCTL_POINTS = CLIMO_PCTL_POINTS_15
+RH75_CLIMO_XMR = {m: None for m in range(1, 13)}
+
 
 def _climo_percentile(value, breaks, points):
     """Interpolated percentile rank of `value` within monthly breakpoint values at `points`."""
@@ -3902,6 +3912,7 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                     "ltg": ltg,
                     "ltg_u": None if u_ltg is None else round(u_ltg, 2),
                     "ltg_rh": rh_ltg,
+                    "rh_pct": _climo_percentile(rh_ltg, RH75_CLIMO_XMR.get(month), RH75_PCTL_POINTS),
                     "mf_dir": th.get("mf_dir"),
                     "mf_spd": th.get("mf_spd"),
                     "regime": th.get("mf_regime"),
@@ -3939,6 +3950,7 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 "ltg_u": (None if r.get("mf_dir") is None else
                           round(rf_lightning_u_wind(r.get("mf_dir"), r.get("mf_spd")), 2)),
                 "ltg_rh": r.get("rh_700_500"),
+                "rh_pct": _climo_percentile(r.get("rh_700_500"), RH75_CLIMO_XMR.get(month), RH75_PCTL_POINTS),
                 "ltg_members": r.get("n"),
                 "mf_dir": r.get("mf_dir"),
                 "mf_spd": r.get("mf_spd"),
@@ -4003,12 +4015,15 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         ct4_points, ct4_maps = {stn: {} for stn in STATIONS}, {}
 
     history_runs = []
+    prior_thermo_runs = []
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r") as f:
                 existing = json.load(f)
             # Tolerate the legacy flat-array history.json format from before href_maps_latest existed.
             history_runs = existing.get("runs", []) if isinstance(existing, dict) else existing
+            if isinstance(existing, dict):
+                prior_thermo_runs = existing.get("launch_thermo_runs", []) or []
         except Exception:
             history_runs = []
 
@@ -4202,10 +4217,18 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
                     _prof.pop("av_u", None)
                     _prof.pop("av_v", None)
 
+    # Panel DPROG/DT: unlike the spatial maps, the 10Z panel DOES keep run history so trends in
+    # Thompson/PWAT/lightning can be eyeballed run over run. Current + 3 back.
+    thermo_runs = [r for r in prior_thermo_runs
+                   if isinstance(r, dict) and r.get("timestamp") != current_timestamp]
+    thermo_runs.insert(0, {"timestamp": current_timestamp, "thermo": launch_thermo})
+    thermo_runs = thermo_runs[:LAUNCH_THERMO_HISTORY_RUNS]
+
     payload = {
         "runs": history_runs,
         "href_maps_latest": href_maps_latest,
         "launch_thermo": launch_thermo,
+        "launch_thermo_runs": thermo_runs,
         "refc_maps": refc_maps,
     }
 
