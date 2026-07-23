@@ -1061,10 +1061,8 @@
                 html += `<tr><td colspan="7" style="padding:14px 6px; color:#94a3b8;">No 10Z rows for ${model.toUpperCase()} this run.</td></tr>`;
             } else {
                 for (const r of rows) {
-                    const offHr = (r.vhh != null && r.vhh !== launchThermo.hour)
-                        ? ` <span style="color:#b45309;">· ${String(r.vhh).padStart(2,'0')}Z</span>` : '';
                     html += `<tr style="border-bottom:1px solid #f1f5f9;">
-                      <td style="padding:8px 6px; font-weight:600;">${r.day}<span style="color:#94a3b8; font-weight:400;"> · ${r.date}</span>${offHr}</td>
+                      <td style="padding:8px 6px; font-weight:600;">${r.day}<span style="color:#94a3b8; font-weight:400;"> · ${r.date}</span></td>
                       <td style="padding:8px 6px;">${flow(r)}</td>
                       <td style="padding:8px 6px;">${r.regime || '—'}</td>
                       <td style="padding:8px 6px;">${anvil(r)}</td>
