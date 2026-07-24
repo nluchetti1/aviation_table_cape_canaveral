@@ -145,6 +145,19 @@ REFS_MEMBER_WINDOW_FH = 60
 # range-reads per run (only the ~2-3 forecast hours that land on 10Z), so it's gated here.
 REFS_MEMBER_THERMO_ENABLED = True
 
+# ---- GEFS ensemble column for the 10Z panel (global 0.5 deg, AWS mirror) ---------------------
+# Panel-only: GEFS is far coarser than the mesoscale columns and would add nothing to the hourly
+# matrix, but it gives a genuine global-ensemble read on the daily airmass out to a week.
+# NOTE ON FILES: pgrb2a (the "primary" half-degree file) carries TMP and RH at ONLY 1000/925/850
+# mb, so it alone cannot produce K-Index, Lifted Index or 700-500 RH. The mid/upper temperature
+# and moisture live in pgrb2b, so BOTH files are byte-ranged and concatenated per member.
+GEFS_ENABLED = True
+GEFS_MEMBERS = 15          # c00 control + p01..p14; spread converges quickly for airmass indices
+GEFS_MAX_FH = 168          # 3-hourly output; 168 h = 7 forecast days
+# GEFS cycles every 6 h but this pipeline runs hourly, so the fetched rows are cached against the
+# cycle and only refetched when a new cycle appears (saves ~5 of every 6 runs).
+GEFS_CACHE_ENABLED = True
+
 
 STN_COORDS = {
     "kxmr": {"lat": 28.468, "lon": -80.556},
@@ -3738,6 +3751,194 @@ def _valid_day_fields(dd, now):
         return (f"{dd:02d}", f"{dd:02d}", f"{dd:02d}", now.month, now.year)
 
 
+def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
+    """GEFS ensemble launch-thermo for the 10Z panel: pull each member's isobaric sounding at the
+    site for the forecast hours nearest the assessment hour, compute the indices PER MEMBER, and
+    average the results via _ensemble_thermo_row.
+
+    Returns (rows, cycle_key). `cache` may be a previous {"cycle":..., "rows":...}; if the newest
+    posted cycle matches it the cached rows are returned untouched, which skips the whole fetch on
+    the ~5 of every 6 hourly runs where GEFS has not advanced."""
+    if not GEFS_ENABLED:
+        return {}, None
+    sc = STN_COORDS.get(site)
+    if not sc:
+        return {}, None
+    coords = {site: {"lat": sc["lat"], "lon": sc["lon"]}}
+
+    session = requests.Session()
+    session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=3))
+    session.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"})
+
+    members = ["c00"] + [f"p{i:02d}" for i in range(1, max(1, GEFS_MEMBERS))]
+
+    # GEFS is GLOBAL: one 0.5-deg GRIB message is the whole planet (~180 KB), so byte-ranging the
+    # AWS copy would pull ~1.9 GB per fetch to read a single point. NOMADS' grib_filter crops
+    # server-side to a small box around the Cape instead — ~15 KB per file, ~3 MB total. Same
+    # mechanism the GFS/RAP pad columns already use.
+    _LEV = "".join(f"&lev_{L}_mb=on" for L in PAD_LEVELS_HPA)
+    _VAR = "&var_HGT=on&var_TMP=on&var_RH=on&var_UGRD=on&var_VGRD=on"
+
+    def _url(d, cc, mem, fh, ab):
+        script = "filter_gefs_atmos_0p50a.pl" if ab == "a" else "filter_gefs_atmos_0p50b.pl"
+        sub = "pgrb2ap5" if ab == "a" else "pgrb2bp5"
+        return (f"https://nomads.ncep.noaa.gov/cgi-bin/{script}"
+                f"?file=ge{mem}.t{cc}z.pgrb2{ab}.0p50.f{fh:03d}{_LEV}{_VAR}"
+                f"&subregion=&leftlon=-81.5&rightlon=-79.5&toplat=29.5&bottomlat=27.5"
+                f"&dir=%2Fgefs.{d}%2F{cc}%2Fatmos%2F{sub}")
+
+    def _idx_ok(d, cc, mem, fh, ab="a"):
+        """Probe a cycle by asking the filter for one small file."""
+        try:
+            r = session.get(_url(d, cc, mem, fh, ab), timeout=20, stream=True)
+            ok = (r.status_code == 200)
+            r.close()
+            return ok
+        except Exception:
+            return False
+
+    # newest posted GEFS cycle (00/06/12/18Z), probing back up to 24 h
+    now = datetime.datetime.now(datetime.timezone.utc)
+    date_str = cycle = None
+    cyc_dt = None
+    for back in range(0, 25):
+        cand = now - datetime.timedelta(hours=back)
+        if cand.hour not in (0, 6, 12, 18):
+            continue
+        d, cc = cand.strftime("%Y%m%d"), f"{cand.hour:02d}"
+        if _idx_ok(d, cc, "c00", 3):
+            date_str, cycle = d, cc
+            cyc_dt = cand.replace(minute=0, second=0, microsecond=0)
+            break
+    if not cycle:
+        logging.warning("GEFS thermo: no posted cycle found on AWS; GEFS omitted from panel.")
+        return {}, None
+
+    cycle_key = f"{date_str}{cycle}"
+    if GEFS_CACHE_ENABLED and isinstance(cache, dict) and cache.get("cycle") == cycle_key and cache.get("rows"):
+        logging.info(f"GEFS thermo: cycle {date_str} {cycle}z unchanged - reusing {len(cache['rows'])} cached rows.")
+        return cache["rows"], cycle_key
+
+    # GEFS is 3-hourly, so an exact 10Z valid time never exists off a 00/06/12/18Z cycle. Take the
+    # step nearest the assessment hour on each forecast day, within ASSESS_HOUR_TOL.
+    best_by_day = {}
+    for fh in range(3, GEFS_MAX_FH + 1, 3):
+        v = cyc_dt + datetime.timedelta(hours=fh)
+        diff = abs(v.hour - assess_hour)
+        if diff > ASSESS_HOUR_TOL:
+            continue
+        key = v.strftime("%Y%m%d")
+        if key not in best_by_day or diff < best_by_day[key][0]:
+            best_by_day[key] = (diff, fh, v)
+    picks = sorted(best_by_day.values(), key=lambda x: x[1])
+    if not picks:
+        return {}, cycle_key
+
+    want_vars = {"HGT", "TMP", "RH", "UGRD", "VGRD"}
+
+    def _grab(d, cc, mem, fh, ab, out_fh):
+        """Stream one pre-subset pgrb2a/b file into `out_fh`. GRIB2 files are just concatenated
+        messages, so the a and b files can share one local file for parsing."""
+        try:
+            with session.get(_url(d, cc, mem, fh, ab), timeout=45, stream=True) as r:
+                if r.status_code != 200:
+                    return 0
+                n = 0
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        out_fh.write(chunk)
+                        n += len(chunk)
+                return n
+        except Exception as e:
+            logging.debug(f"GEFS {mem} f{fh:03d} pgrb2{ab}: {e}")
+            return 0
+
+    out = {}
+    probed = False
+    for (_diff, fh, valid) in picks:
+        rk = f"{valid.day:02d}/{valid.hour:02d}"
+        per = []
+        for mem in members:
+            local = os.path.join(CACHE_DIR, f"gefs_{mem}_{cycle}z_f{fh:03d}.grib2")
+            try:
+                with open(local, "wb") as fhandle:
+                    n_a = _grab(date_str, cycle, mem, fh, "a", fhandle)
+                    n_b = _grab(date_str, cycle, mem, fh, "b", fhandle)
+                if not probed:
+                    # One-time check: pgrb2a carries TMP/RH only at 1000/925/850, so a zero-byte
+                    # or missing b file would silently blank Thompson and 700-500 RH for the whole
+                    # GEFS column. Log both sizes so that failure mode is visible immediately.
+                    logging.info(f"[GEFS PROBE] {mem} f{fh:03d}: pgrb2a {n_a/1024:.1f} KB + "
+                                 f"pgrb2b {n_b/1024:.1f} KB (mid/upper TMP+RH come from the b file).")
+                    probed = True
+                if (n_a + n_b) == 0:
+                    continue
+                prof = build_pad_profiles_from_grib(local, coords, debug=False).get(site)
+                if not prof:
+                    continue
+                th = compute_launch_thermo(prof)
+                if th:
+                    per.append(th)
+            except Exception as e:
+                logging.debug(f"GEFS thermo {mem} f{fh:03d}: {e}")
+            finally:
+                if os.path.exists(local):
+                    try:
+                        os.remove(local)
+                    except Exception:
+                        pass
+        if per:
+            out[rk] = _ensemble_thermo_row(per)
+
+    logging.info(f"GEFS thermo: cycle {date_str} {cycle}z, {len(members)} members, "
+                 f"{len(out)} rows near {assess_hour}Z at {site.upper()} (index-of-member mean).")
+    return out, cycle_key
+
+
+def _ensemble_thermo_row(per):
+    """Collapse a list of per-member compute_launch_thermo() dicts into one ensemble row.
+
+    Scalars (Thompson, PWAT, RH) are averaged directly; winds are averaged in u/v COMPONENT space
+    and re-derived to direction/speed so opposing directions don't average to nonsense. The
+    lightning RF is run on EACH member's own environment and the probabilities averaged (with the
+    member spread kept) — never on a mean sounding, whose moisture structure is smeared.
+    Shared by the REFS and GEFS ensemble columns."""
+    def _avg(key):
+        v = [t[key] for t in per if t.get(key) is not None]
+        return sum(v) / len(v) if v else None
+
+    COMPASS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    row = {"n": len(per)}
+    for u_key, v_key, pfx in (("mf_u", "mf_v", "mf"), ("av_u", "av_v", "av")):
+        uu, vv = _avg(u_key), _avg(v_key)
+        if uu is None or vv is None:
+            continue
+        frm = math.degrees(math.atan2(-uu, -vv)) % 360.0
+        row[f"{pfx}_dir"] = round(frm)
+        row[f"{pfx}_spd"] = round(math.hypot(uu, vv), 1)
+        row[f"{pfx}_regime"] = COMPASS[int((frm + 22.5) // 45) % 8]
+    ti, pw, rh = _avg("thompson"), _avg("pwat_in"), _avg("rh_700_500")
+    if ti is not None:
+        row["thompson"] = round(ti, 1)
+    if pw is not None:
+        row["pwat_in"] = round(pw, 2)
+    if rh is not None:
+        row["rh_700_500"] = round(rh, 1)
+    member_p = []
+    for t in per:
+        p = rf_lightning_prob(t.get("thompson"),
+                              rf_lightning_u_wind(t.get("mf_dir"), t.get("mf_spd")),
+                              t.get("rh_700_500"))
+        if p is not None:
+            member_p.append(p)
+    if member_p:
+        row["ltg"] = round(sum(member_p) / len(member_p), 1)
+        row["ltg_min"] = round(min(member_p), 1)
+        row["ltg_max"] = round(max(member_p), 1)
+        row["ltg_n"] = len(member_p)
+    return row
+
+
 def fetch_refs_member_thermo(site="kxmr", assess_hour=10):
     """Meteorologically valid REFS launch-thermo: pull EACH RRFS ensemble member's isobaric sounding
     at the site for the forecast hours that land on the assessment hour (10Z), compute the indices
@@ -3798,84 +3999,74 @@ def fetch_refs_member_thermo(site="kxmr", assess_hour=10):
     if not fhs:
         return {}
 
+    # --- time-lagged ensemble: fold in the prior cycle's members, valid-time aligned ---------
+    # Same principle as the Cumulus echo-top NMEP: pairing this cycle's members with the -6 h
+    # cycle's members at the SAME valid time doubles the sample (5 -> 10). For daily airmass
+    # indices a 6 h older forecast is a legitimate additional draw on the same airmass, so this is
+    # more defensible here than it would be for convective placement.
+    sources = [(date_str, cycle, cyc_dt, members)]
+    if REFS_MEMBER_TLE:
+        lag_dt = cyc_dt - datetime.timedelta(hours=6 * REFS_MEMBER_LAG_CYCLES)
+        ld, lcc = lag_dt.strftime("%Y%m%d"), f"{lag_dt.hour:02d}"
+        lag_first_fh = int((cyc_dt + datetime.timedelta(hours=fhs[0]) - lag_dt).total_seconds() // 3600)
+        if lag_first_fh <= REFS_MEMBER_WINDOW_FH and _idx_ok(ld, lcc, "m001", lag_first_fh):
+            lag_members = []
+            for n in range(1, 21):
+                mem = f"m{n:03d}"
+                if _idx_ok(ld, lcc, mem, lag_first_fh):
+                    lag_members.append(mem)
+                elif lag_members:
+                    break
+            if lag_members:
+                sources.append((ld, lcc, lag_dt, lag_members))
+
     out = {}
     for fh in fhs:
         valid = cyc_dt + datetime.timedelta(hours=fh)
         rk = f"{valid.day:02d}/{valid.hour:02d}"
         per = []
-        for mem in members:
-            grib_url = f"{RRFS_AWS_ROOT}/{tmpl.format(d=date_str, cc=cycle, mem=mem, fh=fh)}"
-            local = None
-            try:
-                ir = session.get(grib_url + ".idx", timeout=15)
-                if ir.status_code != 200:
-                    continue
-                local = _range_download_grib(session, grib_url, _parse_grib_idx(ir.text),
-                                             PAD_LEVELS_HPA, debug=False)
-                if not local:
-                    continue
-                prof = build_pad_profiles_from_grib(local, coords, debug=False).get(site)
-                if not prof:
-                    continue
-                th = compute_launch_thermo(prof)
-                if th:
-                    per.append(th)
-            except Exception as e:
-                logging.debug(f"REFS member thermo {mem} f{fh:03d}: {e}")
-            finally:
-                if local and os.path.exists(local):
-                    try:
-                        os.remove(local)
-                    except Exception:
-                        pass
+        for (s_date, s_cycle, s_dt, s_members) in sources:
+            s_fh = int((valid - s_dt).total_seconds() // 3600)
+            if s_fh < 1 or s_fh > REFS_MEMBER_WINDOW_FH:
+                continue
+            for mem in s_members:
+                grib_url = f"{RRFS_AWS_ROOT}/{tmpl.format(d=s_date, cc=s_cycle, mem=mem, fh=s_fh)}"
+                local = None
+                try:
+                    ir = session.get(grib_url + ".idx", timeout=15)
+                    if ir.status_code != 200:
+                        continue
+                    local = _range_download_grib(session, grib_url, _parse_grib_idx(ir.text),
+                                                 PAD_LEVELS_HPA, debug=False)
+                    if not local:
+                        continue
+                    prof = build_pad_profiles_from_grib(local, coords, debug=False).get(site)
+                    if not prof:
+                        continue
+                    th = compute_launch_thermo(prof)
+                    if th:
+                        per.append(th)
+                except Exception as e:
+                    logging.debug(f"REFS member thermo {s_cycle}z {mem} f{s_fh:03d}: {e}")
+                finally:
+                    if local and os.path.exists(local):
+                        try:
+                            os.remove(local)
+                        except Exception:
+                            pass
         if not per:
             continue
+        out[rk] = _ensemble_thermo_row(per)
 
-        def _avg(key):
-            v = [t[key] for t in per if t.get(key) is not None]
-            return sum(v) / len(v) if v else None
-
-        row = {"n": len(per)}
-        mfu, mfv = _avg("mf_u"), _avg("mf_v")
-        if mfu is not None and mfv is not None:
-            frm = math.degrees(math.atan2(-mfu, -mfv)) % 360.0
-            row["mf_dir"] = round(frm)
-            row["mf_spd"] = round(math.hypot(mfu, mfv), 1)
-            row["mf_regime"] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((frm + 22.5) // 45) % 8]
-        avu, avv = _avg("av_u"), _avg("av_v")
-        if avu is not None and avv is not None:
-            afrm = math.degrees(math.atan2(-avu, -avv)) % 360.0
-            row["av_dir"] = round(afrm)
-            row["av_spd"] = round(math.hypot(avu, avv), 1)
-            row["av_regime"] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((afrm + 22.5) // 45) % 8]
-        ti, pw = _avg("thompson"), _avg("pwat_in")
-        if ti is not None:
-            row["thompson"] = round(ti, 1)
-        if pw is not None:
-            row["pwat_in"] = round(pw, 2)
-        rh = _avg("rh_700_500")
-        if rh is not None:
-            row["rh_700_500"] = round(rh, 1)
-        # Ensemble lightning probability: run the RF on EACH member's own environment and average
-        # the resulting probabilities (same principle as the indices — never run it on a mean
-        # sounding, whose moisture structure is smeared).
-        member_p = []
-        for t in per:
-            p = rf_lightning_prob(t.get("thompson"),
-                                  rf_lightning_u_wind(t.get("mf_dir"), t.get("mf_spd")),
-                                  t.get("rh_700_500"))
-            if p is not None:
-                member_p.append(p)
-        if member_p:
-            row["ltg"] = round(sum(member_p) / len(member_p), 1)
-        out[rk] = row
-
-    logging.info(f"REFS member thermo: cycle {date_str} {cycle}z, {len(members)} members, "
+    src_txt = " + ".join(f"{s[1]}z({len(s[3])})" for s in sources)
+    n_total = sum(len(s[3]) for s in sources)
+    logging.info(f"REFS member thermo: cycle {date_str} {cycle}z, {n_total}-member TLE [{src_txt}], "
                  f"{len(out)} x {assess_hour}Z rows at {site.upper()} (index-of-member mean).")
     return out
 
 
-def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_rows=None):
+def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_rows=None,
+                        gefs_member_rows=None):
     """Assemble the launch-thermo panel: for each model that has a KXMR sounding, one row per
     forecast day at the assessment hour (10Z), with mean flow, regime, Thompson Index (+percentile),
     and PWAT (+percentile). Returns {"site","hour","models":[...],"by_model":{model:[rows]}}."""
@@ -3944,25 +4135,30 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
             day_rows.sort(key=lambda r: r["sort"])
             by_model[model] = day_rows
 
-    # REFS re-added as a TRUE ensemble: per-member indices averaged (from fetch_refs_member_thermo),
-    # not the invalid index-of-the-mean-sounding.
-    if refs_member_rows:
-        refs_day_rows = []
-        for row_key, r in refs_member_rows.items():
+    # Ensemble columns (REFS, GEFS) come in pre-averaged from their member fetches: per-member
+    # indices averaged, never the index of a mean sounding. Same row shape as the deterministic
+    # models, plus the member count and the lightning spread.
+    def _add_ensemble(model_name, member_rows):
+        if not member_rows:
+            return
+        rows_out = []
+        for row_key, r in member_rows.items():
             try:
-                dd, _hh = map(int, row_key.split("/"))
+                dd, hh = map(int, row_key.split("/"))
             except Exception:
                 continue
             day_label, date_str, sort_key, month, _yr = _valid_day_fields(dd, now)
-            ti = r.get("thompson")
-            pwat = r.get("pwat_in")
-            refs_day_rows.append({
+            ti, pwat = r.get("thompson"), r.get("pwat_in")
+            rows_out.append({
                 "day": day_label,
                 "date": date_str,
                 "sort": sort_key,
-                "vhh": assess_hour,
+                "vhh": hh,
                 "month": month,
                 "ltg": r.get("ltg"),
+                "ltg_min": r.get("ltg_min"),
+                "ltg_max": r.get("ltg_max"),
+                "ltg_n": r.get("ltg_n"),
                 "ltg_u": (None if r.get("mf_dir") is None else
                           round(rf_lightning_u_wind(r.get("mf_dir"), r.get("mf_spd")), 2)),
                 "ltg_rh": r.get("rh_700_500"),
@@ -3977,14 +4173,17 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 "ti_pct": _climo_percentile(ti, THOMPSON_CLIMO_XMR.get(month), THOMPSON_PCTL_POINTS),
                 "pwat": pwat,
                 "pwat_pct": _climo_percentile(pwat, PWAT_CLIMO_XMR.get(month), PWAT_PCTL_POINTS),
-                "engine": f"metpy·{r.get('n', 0)}-mem",
+                "engine": f"metpy\u00b7{r.get('n', 0)}-mem",
             })
-        if refs_day_rows:
-            refs_day_rows.sort(key=lambda r: r["sort"])
-            by_model["refs"] = refs_day_rows
+        if rows_out:
+            rows_out.sort(key=lambda x: x["sort"])
+            by_model[model_name] = rows_out
+
+    _add_ensemble("refs", refs_member_rows)
+    _add_ensemble("gefs", gefs_member_rows)
 
     # order models: put the ones with the most rows first, stable-ish preferred order
-    pref = ["gfs", "ecmwf", "rrfs", "refs", "rap", "hrrr"]
+    pref = ["gfs", "ecmwf", "gefs", "rrfs", "refs", "rap", "hrrr"]
     models = sorted(by_model.keys(), key=lambda m: (pref.index(m) if m in pref else 99, m))
 
     # Dump the EXACT feature values fed to the Cizek RF so they can be typed straight into the
@@ -4032,6 +4231,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
 
     history_runs = []
     prior_thermo_runs = []
+    prior_gefs_cache = None
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r") as f:
@@ -4040,6 +4240,7 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
             history_runs = existing.get("runs", []) if isinstance(existing, dict) else existing
             if isinstance(existing, dict):
                 prior_thermo_runs = existing.get("launch_thermo_runs", []) or []
+                prior_gefs_cache = existing.get("gefs_cache") or None
         except Exception:
             history_runs = []
 
@@ -4212,8 +4413,15 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         logging.error(f"REFS member thermo fetch failed: {e}")
         refs_member_rows = {}
     try:
+        gefs_member_rows, gefs_cycle_key = fetch_gefs_member_thermo(
+            site="kxmr", assess_hour=10, cache=prior_gefs_cache)
+    except Exception as e:
+        logging.error(f"GEFS member thermo fetch failed: {e}")
+        gefs_member_rows, gefs_cycle_key = {}, None
+    try:
         launch_thermo = build_launch_thermo(combined_data, site="kxmr", assess_hour=10,
-                                            refs_member_rows=refs_member_rows)
+                                            refs_member_rows=refs_member_rows,
+                                            gefs_member_rows=gefs_member_rows)
         logging.info(f"Launch thermo: {len(launch_thermo['models'])} models, "
                      f"rows/model={ {m: len(launch_thermo['by_model'][m]) for m in launch_thermo['models']} }")
     except Exception as e:
@@ -4246,6 +4454,10 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         "launch_thermo": launch_thermo,
         "launch_thermo_runs": thermo_runs,
         "refc_maps": refc_maps,
+        # GEFS cycles 6-hourly while this runs hourly; cache the rows so the fetch is skipped
+        # until a new cycle posts.
+        "gefs_cache": ({"cycle": gefs_cycle_key, "rows": gefs_member_rows}
+                       if (GEFS_CACHE_ENABLED and gefs_cycle_key and gefs_member_rows) else None),
         # Monthly percentile distributions, shipped so the panel can draw box-and-whisker plots
         # from exactly the same numbers the percentile badges use.
         "climo": {
