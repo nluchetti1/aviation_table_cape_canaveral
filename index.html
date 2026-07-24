@@ -1191,6 +1191,82 @@
             s += `</svg>`;
             return s;
         }
+        function ltBoxPlotOneSVG(varName, month, value, label, pctRank) {
+            const cfg = LT_BOX_VARS[varName];
+            const tbl = (climoTables || {})[varName];
+            const pts = (climoTables || {}).points;
+            if (!cfg || !tbl || !pts) return null;
+            const v = tbl[month] || tbl[String(month)];
+            if (!v) return null;
+            const iOf = p => pts.indexOf(p);
+            const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+            const st = {
+                min: v[iOf(0)], w1: v[iOf(1)],
+                q25: (v[iOf(20)] + v[iOf(30)]) / 2,
+                med: v[iOf(50)],
+                q75: (v[iOf(70)] + v[iOf(80)]) / 2,
+                w99: v[iOf(99)], max: v[iOf(100)]
+            };
+            let lo = st.min, hi = st.max;
+            if (value != null) { lo = Math.min(lo, value); hi = Math.max(hi, value); }
+            const W = 560, H = 430, ml = 74, mr = 190, mt = 34, mb = 46;
+            const pw = W - ml - mr, ph = H - mt - mb;
+            const pad = (hi - lo) * 0.05 || 1;
+            const y0 = lo - pad, y1 = hi + pad;
+            const cx = ml + pw / 2, bw = Math.min(pw * 0.62, 120);
+            const Y = x => mt + ph * (1 - (x - y0) / (y1 - y0));
+            const fmt = x => Math.abs(y1 - y0) < 5 ? x.toFixed(2) : x.toFixed(1);
+
+            let s = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px; font-family:system-ui,sans-serif;">`;
+            s += `<rect width="${W}" height="${H}" fill="#fff"/>`;
+            for (let i = 0; i <= 6; i++) {
+                const val = y0 + (y1 - y0) * i / 6, yy = Y(val);
+                s += `<line x1="${ml}" y1="${yy}" x2="${ml + pw}" y2="${yy}" stroke="#e2e8f0"/>`;
+                s += `<text x="${ml - 8}" y="${yy + 3.5}" text-anchor="end" font-size="10" fill="#64748b">${fmt(val)}</text>`;
+            }
+            const x0 = cx - bw / 2;
+            s += `<line x1="${cx}" y1="${Y(st.w99)}" x2="${cx}" y2="${Y(st.q75)}" stroke="#334155"/>`;
+            s += `<line x1="${cx}" y1="${Y(st.w1)}" x2="${cx}" y2="${Y(st.q25)}" stroke="#334155"/>`;
+            s += `<line x1="${cx - bw * 0.3}" y1="${Y(st.w99)}" x2="${cx + bw * 0.3}" y2="${Y(st.w99)}" stroke="#334155"/>`;
+            s += `<line x1="${cx - bw * 0.3}" y1="${Y(st.w1)}" x2="${cx + bw * 0.3}" y2="${Y(st.w1)}" stroke="#334155"/>`;
+            s += `<rect x="${x0}" y="${Y(st.q75)}" width="${bw}" height="${Math.max(1, Y(st.q25) - Y(st.q75))}"
+                    fill="#3b7ea1" fill-opacity="0.85" stroke="#1e3a5f"/>`;
+            s += `<line x1="${x0}" y1="${Y(st.med)}" x2="${x0 + bw}" y2="${Y(st.med)}" stroke="#0f172a" stroke-width="1.8"/>`;
+            s += `<circle cx="${cx}" cy="${Y(st.min)}" r="2.4" fill="none" stroke="#94a3b8"/>`;
+            s += `<circle cx="${cx}" cy="${Y(st.max)}" r="2.4" fill="none" stroke="#94a3b8"/>`;
+            // reference labels to the right of the box
+            const refs = [['99th', st.w99], ['75th', st.q75], ['Median', st.med], ['25th', st.q25], ['1st', st.w1]];
+            refs.forEach(([nm, val]) => {
+                s += `<line x1="${x0 + bw}" y1="${Y(val)}" x2="${x0 + bw + 12}" y2="${Y(val)}" stroke="#cbd5e1"/>`;
+                s += `<text x="${x0 + bw + 16}" y="${Y(val) + 3.5}" font-size="9.5" fill="#64748b">${nm} \u00a0${fmt(val)}${cfg.unit}</text>`;
+            });
+            if (value != null) {
+                const vy = Y(value);
+                s += `<line x1="${ml}" y1="${vy}" x2="${x0 + bw + 12}" y2="${vy}" stroke="#dc2626" stroke-width="1" stroke-dasharray="4 3"/>`;
+                s += `<circle cx="${cx}" cy="${vy}" r="6" fill="#dc2626" stroke="#fff" stroke-width="1.6"/>`;
+                const above = vy > mt + 22;
+                s += `<text x="${cx + bw / 2 + 16}" y="${vy + (above ? -8 : 16)}" font-size="11" font-weight="700" fill="#dc2626">
+                        ${label}: ${value}${cfg.unit}${pctRank != null ? ` (${pctRank}th)` : ''}</text>`;
+            }
+            s += `<text x="${cx}" y="${H - mb + 20}" text-anchor="middle" font-size="11" fill="#334155" font-weight="600">${MN[month - 1]} climatology</text>`;
+            s += `<text x="${W / 2}" y="18" text-anchor="middle" font-size="12.5" font-weight="700" fill="#0f172a">${cfg.label} \u2014 ${MN[month - 1]}</text>`;
+            s += `</svg>`;
+            return s;
+        }
+        function showBoxPlotDay(varName, month, value, label, pctRank) {
+            const svg = ltBoxPlotOneSVG(varName, month, value, label, pctRank);
+            const body = document.getElementById('bpBody');
+            if (!svg) { body.innerHTML = '<div style="padding:20px; color:#94a3b8;">No climatology available for that variable.</div>'; }
+            else {
+                const model = document.getElementById('ltModel').value;
+                body.innerHTML = svg + `<div style="font-size:0.78rem; color:#64748b; margin-top:8px;">
+                    Box = 25th\u201375th percentile, line = median, whiskers = 1st/99th, open circles = record min/max
+                    (XMR climatology for this month). <span style="color:#dc2626; font-weight:600;">Red dot</span> is
+                    ${model.toUpperCase()} ${label}. <a href="#" onclick="showBoxPlot('${varName}'); return false;"
+                    style="color:#1e3a5f;">See all 12 months</a>.</div>`;
+            }
+            document.getElementById('bpModal').style.display = 'flex';
+        }
         function showBoxPlot(varName) {
             const svg = ltBoxPlotSVG(varName);
             const body = document.getElementById('bpBody');
@@ -1242,6 +1318,12 @@
                 return `<span title="${tag}" style="${style} padding:2px 9px; border-radius:10px; font-weight:600;">${v}</span>
                         <span style="color:#94a3b8; font-size:0.72rem; margin-left:4px;">${tag}</span>`;
             };
+            const clickCell = (varName, r, val, pctVal, inner) => {
+                if (val == null || r.month == null) return `<td style="padding:8px 6px;">${inner}</td>`;
+                return `<td onclick="showBoxPlotDay('${varName}', ${r.month}, ${val}, '${r.date}', ${pctVal == null ? 'null' : pctVal})"
+                          title="Click to see ${r.date} on the monthly climatology"
+                          style="padding:8px 6px; cursor:pointer;">${inner}</td>`;
+            };
             const rhCell = (r) => {
                 if (r.ltg_rh == null) return '—';
                 return `${r.ltg_rh}% <span style="color:#cbd5e1;">|</span> ${pct(r.rh_pct)}`;
@@ -1274,9 +1356,9 @@
                       <td style="padding:8px 6px;">${flow(r)}</td>
                       <td style="padding:8px 6px;">${regimeCell(r.regime)}</td>
                       <td style="padding:8px 6px;">${anvil(r)}</td>
-                      <td style="padding:8px 6px;">${num(r.ti)} <span style="color:#cbd5e1;">|</span> ${pct(r.ti_pct)}</td>
-                      <td style="padding:8px 6px;">${rhCell(r)}</td>
-                      <td style="padding:8px 6px;">${num(r.pwat)} <span style="color:#cbd5e1;">|</span> ${pct(r.pwat_pct)}</td>
+                      ${clickCell('thompson', r, r.ti, r.ti_pct, `${num(r.ti)} <span style="color:#cbd5e1;">|</span> ${pct(r.ti_pct)}`)}
+                      ${clickCell('rh75', r, r.ltg_rh, r.rh_pct, rhCell(r))}
+                      ${clickCell('pwat', r, r.pwat, r.pwat_pct, `${num(r.pwat)} <span style="color:#cbd5e1;">|</span> ${pct(r.pwat_pct)}`)}
                       <td style="padding:8px 6px;">${ltgCell(r.ltg)}</td>
                     </tr>`;
                 }
