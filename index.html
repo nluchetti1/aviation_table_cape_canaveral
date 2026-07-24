@@ -1016,7 +1016,7 @@
         // consecutive hourly snapshots of those columns are identical and stepping run-by-run shows
         // nothing. So DPROG/DT steps by TIME at each model's own cycle cadence, and we pick the
         // stored snapshot nearest that target time.
-        const MODEL_CYCLE_H = { gfs: 6, ecmwf: 6, rrfs: 6, refs: 6, rap: 1, hrrr: 1 };
+        const MODEL_CYCLE_H = { gfs: 6, ecmwf: 6, gefs: 6, rrfs: 6, refs: 6, rap: 1, hrrr: 1 };
         const LT_STEPS = 4;   // current + 3 back
         function ltParseTs(ts) {
             if (!ts) return null;
@@ -1286,7 +1286,8 @@
             const model = document.getElementById('ltModel').value;
             const rows = (thermo.by_model && thermo.by_model[model]) || [];
             const ens = (rows[0] && /(\d+)-mem/.exec(rows[0].engine || '')) ;
-            const ensNote = ens ? `<div style="font-size:0.78rem; color:#475569; margin:2px 0 8px;">REFS = ${ens[1]}-member ensemble (mean of per-member indices, not the mean sounding).</div>` : '';
+            const ensNote = ens ? `<div style="font-size:0.78rem; color:#475569; margin:2px 0 8px;">${
+                (document.getElementById('ltModel').value || '').toUpperCase()} = ${ens[1]}-member ensemble (mean of per-member indices, not the mean sounding).</div>` : '';
             const pctColor = (v) => {
                 // low percentiles = calm/dry/stable, high = moist/unstable -> escalate cool->red
                 if (v == null) return null;
@@ -1328,10 +1329,18 @@
                 if (r.ltg_rh == null) return '—';
                 return `${r.ltg_rh}% <span style="color:#cbd5e1;">|</span> ${pct(r.rh_pct)}`;
             };
-            const ltgCell = (v) => {
+            const ltgCell = (r) => {
+                const v = r.ltg;
                 if (v == null) return '<span style="color:#94a3b8;">—</span>';
                 const c = pctColor(Math.round(v));   // same cool->red ramp as the percentiles
-                return `<span style="background:${c.bg}; color:${c.fg}; padding:1px 8px; border-radius:10px; font-weight:600;">${v}%</span>`;
+                let s = `<span style="background:${c.bg}; color:${c.fg}; padding:1px 8px; border-radius:10px; font-weight:600;">${v}%</span>`;
+                // Ensemble columns also carry the member spread, so a confident 85% reads
+                // differently from an 85% mean spanning 20-99%.
+                if (r.ltg_min != null && r.ltg_max != null) {
+                    s += `<div style="font-size:0.68rem; color:#64748b; margin-top:2px;">min ${r.ltg_min}% &middot; max ${r.ltg_max}%${
+                        r.ltg_n ? ` <span style="color:#94a3b8;">(${r.ltg_n} mem)</span>` : ''}</div>`;
+                }
+                return s;
             };
             let html = ensNote + `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
               <thead><tr style="text-align:left; color:#475569; border-bottom:2px solid #e2e8f0;">
@@ -1359,7 +1368,7 @@
                       ${clickCell('thompson', r, r.ti, r.ti_pct, `${num(r.ti)} <span style="color:#cbd5e1;">|</span> ${pct(r.ti_pct)}`)}
                       ${clickCell('rh75', r, r.ltg_rh, r.rh_pct, rhCell(r))}
                       ${clickCell('pwat', r, r.pwat, r.pwat_pct, `${num(r.pwat)} <span style="color:#cbd5e1;">|</span> ${pct(r.pwat_pct)}`)}
-                      <td style="padding:8px 6px;">${ltgCell(r.ltg)}</td>
+                      <td style="padding:8px 6px;">${ltgCell(r)}</td>
                     </tr>`;
                 }
             }
