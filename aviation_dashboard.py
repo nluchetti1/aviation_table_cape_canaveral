@@ -157,6 +157,9 @@ GEFS_MAX_FH = 168          # 3-hourly output; 168 h = 7 forecast days
 # GEFS cycles every 6 h but this pipeline runs hourly, so the fetched rows are cached against the
 # cycle and only refetched when a new cycle appears (saves ~5 of every 6 runs).
 GEFS_CACHE_ENABLED = True
+# NOMADS asks callers to pause between requests and throttles bursts; this fetch issues roughly
+# GEFS_MEMBERS x rows x 2 requests, so space them out slightly.
+GEFS_REQUEST_PAUSE_S = 0.4
 
 
 STN_COORDS = {
@@ -3751,6 +3754,21 @@ def _valid_day_fields(dd, now):
         return (f"{dd:02d}", f"{dd:02d}", f"{dd:02d}", now.month, now.year)
 
 
+_GEFS_PROBE_LOGGED = 0
+
+
+def _gefs_probe_log(d, cc, fh, status, body=""):
+    """Log the first few GEFS probe failures with their real HTTP status. Bounded so a total
+    NOMADS outage can't flood the log with 75 identical lines."""
+    global _GEFS_PROBE_LOGGED
+    if _GEFS_PROBE_LOGGED >= 4:
+        return
+    _GEFS_PROBE_LOGGED += 1
+    snippet = " ".join((body or "").split())[:140]
+    logging.warning(f"[GEFS PROBE] {d} {cc}z f{fh:03d} -> HTTP {status}"
+                    + (f" | {snippet}" if snippet else ""))
+
+
 def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
     """GEFS ensemble launch-thermo for the 10Z panel: pull each member's isobaric sounding at the
     site for the forecast hours nearest the assessment hour, compute the indices PER MEMBER, and
@@ -3788,14 +3806,26 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
                 f"&dir=%2Fgefs.{d}%2F{cc}%2Fatmos%2F{sub}")
 
     def _idx_ok(d, cc, mem, fh, ab="a"):
-        """Probe a cycle by asking the filter for one small file."""
-        try:
-            r = session.get(_url(d, cc, mem, fh, ab), timeout=20, stream=True)
-            ok = (r.status_code == 200)
-            r.close()
-            return ok
-        except Exception:
-            return False
+        """Probe a cycle by asking the filter for one small file. NOMADS returns transient 5xx and
+        throttles bursts, so retry with backoff and log the actual status the first few times —
+        a silent False here is what made an earlier run report 'no cycle' with no explanation."""
+        last = None
+        for attempt in range(3):
+            try:
+                r = session.get(_url(d, cc, mem, fh, ab), timeout=25, stream=True)
+                last = r.status_code
+                body = "" if r.status_code == 200 else (r.text or "")[:180]
+                r.close()
+                if last == 200:
+                    return True
+                if last == 404:
+                    return False          # genuinely not posted yet; try an older cycle
+                _gefs_probe_log(d, cc, fh, last, body)
+            except Exception as e:
+                last = f"exc:{type(e).__name__}"
+                _gefs_probe_log(d, cc, fh, last, str(e)[:180])
+            time.sleep(1.5 * (attempt + 1))
+        return False
 
     # newest posted GEFS cycle (00/06/12/18Z), probing back up to 24 h
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -3811,7 +3841,9 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
             cyc_dt = cand.replace(minute=0, second=0, microsecond=0)
             break
     if not cycle:
-        logging.warning("GEFS thermo: no posted cycle found on AWS; GEFS omitted from panel.")
+        logging.warning("GEFS thermo: no cycle answered on NOMADS after probing 24 h back; GEFS "
+                        "omitted from panel. NOMADS throttles bursts and returns transient 5xx - "
+                        "see the [GEFS PROBE] lines above for the actual status.")
         return {}, None
 
     cycle_key = f"{date_str}{cycle}"
@@ -3858,7 +3890,9 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
     for (_diff, fh, valid) in picks:
         rk = f"{valid.day:02d}/{valid.hour:02d}"
         per = []
-        for mem in members:
+        for mi, mem in enumerate(members):
+            if mi:
+                time.sleep(GEFS_REQUEST_PAUSE_S)   # be a good NOMADS citizen; avoids burst throttling
             local = os.path.join(CACHE_DIR, f"gefs_{mem}_{cycle}z_f{fh:03d}.grib2")
             try:
                 with open(local, "wb") as fhandle:
@@ -3890,8 +3924,15 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
         if per:
             out[rk] = _ensemble_thermo_row(per)
 
-    logging.info(f"GEFS thermo: cycle {date_str} {cycle}z, {len(members)} members, "
+    got = max((r.get("n", 0) for r in out.values()), default=0)
+    logging.info(f"GEFS thermo: cycle {date_str} {cycle}z, {got}/{len(members)} members returned, "
                  f"{len(out)} rows near {assess_hour}Z at {site.upper()} (index-of-member mean).")
+    # Don't cache a badly degraded fetch — caching is keyed to the 6-hourly cycle, so a partial
+    # result would be frozen in for hours. Returning cycle_key=None forces a retry next run.
+    if out and got < max(2, len(members) // 2):
+        logging.warning(f"GEFS thermo: only {got}/{len(members)} members returned - not caching, "
+                        f"will refetch next run.")
+        return out, None
     return out, cycle_key
 
 
