@@ -160,6 +160,11 @@ GEFS_CACHE_ENABLED = True
 # NOMADS asks callers to pause between requests and throttles bursts; this fetch issues roughly
 # GEFS_MEMBERS x rows x 2 requests, so space them out slightly.
 GEFS_REQUEST_PAUSE_S = 0.4
+# GEFS 0.5-deg carries a REDUCED isobaric set - it has none of the 975/950/900/800/750/650/550/
+# 450/350 mb levels the mesoscale pad columns use. Asking grib_filter for a level that isn't in
+# the file's inventory makes the CGI return HTTP 500, which is what silently killed the column on
+# the first live attempt. Keep this to levels GEFS actually publishes.
+GEFS_LEVELS_HPA = [1000, 925, 850, 700, 500, 400, 300, 250, 200, 150, 100]
 
 
 STN_COORDS = {
@@ -3755,6 +3760,8 @@ def _valid_day_fields(dd, now):
 
 
 _GEFS_PROBE_LOGGED = 0
+# Guard so the tier-attribution probe runs at most once per process, not once per rejected cycle.
+_GEFS_TIER_TESTED = [False]
 
 
 def _gefs_probe_log(d, cc, fh, status, body=""):
@@ -3791,39 +3798,80 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
     members = ["c00"] + [f"p{i:02d}" for i in range(1, max(1, GEFS_MEMBERS))]
 
     # GEFS is GLOBAL: one 0.5-deg GRIB message is the whole planet (~180 KB), so byte-ranging the
-    # AWS copy would pull ~1.9 GB per fetch to read a single point. NOMADS' grib_filter crops
-    # server-side to a small box around the Cape instead — ~15 KB per file, ~3 MB total. Same
-    # mechanism the GFS/RAP pad columns already use.
-    _LEV = "".join(f"&lev_{L}_mb=on" for L in PAD_LEVELS_HPA)
+    # AWS copy would pull ~850 MB per fetch to read a single point. NOMADS' grib_filter crops
+    # server-side to a small box around the Cape instead - a few KB per file. Same mechanism the
+    # GFS/RAP pad columns already use.
+    _LEV = "".join(f"&lev_{L}_mb=on" for L in GEFS_LEVELS_HPA)
     _VAR = "&var_HGT=on&var_TMP=on&var_RH=on&var_UGRD=on&var_VGRD=on"
+    _BOX = "&subregion=&leftlon=-81.5&rightlon=-79.5&toplat=29.5&bottomlat=27.5"
 
-    def _url(d, cc, mem, fh, ab):
+    def _url(d, cc, mem, fh, ab, tier=0):
+        """Build a filter URL. `tier` controls how much is asked for, so a CGI rejection can be
+        attributed to a specific component rather than guessed at:
+          0 = full request (all levels + vars + subregion)   <- what we want
+          1 = full levels/vars, NO subregion                 <- isolates the box
+          2 = one level + one var + subregion                <- isolates the level list
+          3 = one level + one var, no subregion              <- bare minimum that must work
+        """
         script = "filter_gefs_atmos_0p50a.pl" if ab == "a" else "filter_gefs_atmos_0p50b.pl"
         sub = "pgrb2ap5" if ab == "a" else "pgrb2bp5"
+        lev, var, box = _LEV, _VAR, _BOX
+        if tier == 1:
+            box = ""
+        elif tier == 2:
+            lev, var = "&lev_500_mb=on", "&var_HGT=on"
+        elif tier == 3:
+            lev, var, box = "&lev_500_mb=on", "&var_HGT=on", ""
         return (f"https://nomads.ncep.noaa.gov/cgi-bin/{script}"
-                f"?file=ge{mem}.t{cc}z.pgrb2{ab}.0p50.f{fh:03d}{_LEV}{_VAR}"
-                f"&subregion=&leftlon=-81.5&rightlon=-79.5&toplat=29.5&bottomlat=27.5"
+                f"?file=ge{mem}.t{cc}z.pgrb2{ab}.0p50.f{fh:03d}{lev}{var}{box}"
                 f"&dir=%2Fgefs.{d}%2F{cc}%2Fatmos%2F{sub}")
 
+    def _try(d, cc, mem, fh, ab, tier):
+        try:
+            r = session.get(_url(d, cc, mem, fh, ab, tier), timeout=25, stream=True)
+            st, body = r.status_code, ("" if r.status_code == 200 else (r.text or "")[:160])
+            r.close()
+            return st, body
+        except Exception as e:
+            return f"exc:{type(e).__name__}", str(e)[:160]
+
     def _idx_ok(d, cc, mem, fh, ab="a"):
-        """Probe a cycle by asking the filter for one small file. NOMADS returns transient 5xx and
-        throttles bursts, so retry with backoff and log the actual status the first few times —
-        a silent False here is what made an earlier run report 'no cycle' with no explanation."""
-        last = None
-        for attempt in range(3):
-            try:
-                r = session.get(_url(d, cc, mem, fh, ab), timeout=25, stream=True)
-                last = r.status_code
-                body = "" if r.status_code == 200 else (r.text or "")[:180]
-                r.close()
-                if last == 200:
-                    return True
-                if last == 404:
-                    return False          # genuinely not posted yet; try an older cycle
-                _gefs_probe_log(d, cc, fh, last, body)
-            except Exception as e:
-                last = f"exc:{type(e).__name__}"
-                _gefs_probe_log(d, cc, fh, last, str(e)[:180])
+        """Probe a cycle. On rejection, walk the diagnostic tiers once to attribute the failure to
+        a specific URL component - a bare 500 with no attribution is what made the first live
+        attempt a guess. The tiers are DIAGNOSTIC ONLY: tiers 1 and 3 omit `subregion`, which makes
+        the filter return whole-globe messages (~2 GB across a full fetch), so they must never be
+        used to pull data. If tier 0 is rejected we report why and skip GEFS for this run."""
+        for attempt in range(2):
+            st, body = _try(d, cc, mem, fh, ab, 0)
+            if st == 200:
+                return True
+            if st == 404:
+                return False              # genuinely not posted; try an older cycle
+            _gefs_probe_log(d, cc, fh, st, body)
+            if not _GEFS_TIER_TESTED[0]:
+                _GEFS_TIER_TESTED[0] = True
+                names = {1: "full levels/vars, NO subregion", 2: "one level+var WITH subregion",
+                         3: "one level+var, no subregion (minimal)"}
+                worked = None
+                for t in (1, 2, 3):
+                    st_t, _ = _try(d, cc, mem, fh, ab, t)
+                    logging.warning(f"[GEFS PROBE] tier {t} ({names[t]}) -> HTTP {st_t}")
+                    if st_t == 200 and worked is None:
+                        worked = t
+                if worked == 1:
+                    logging.warning("[GEFS PROBE] diagnosis: the SUBREGION box is being rejected. "
+                                    "Not falling back - without server-side cropping this fetch "
+                                    "would pull whole-globe fields (~2 GB).")
+                elif worked == 2:
+                    logging.warning("[GEFS PROBE] diagnosis: subregion is fine, so the LEVEL or VAR "
+                                    "list is being rejected - GEFS_LEVELS_HPA likely still asks for "
+                                    "a level this file doesn't carry.")
+                elif worked == 3:
+                    logging.warning("[GEFS PROBE] diagnosis: only the minimal request works; both "
+                                    "the subregion box and the level/var list are being rejected.")
+                else:
+                    logging.warning("[GEFS PROBE] diagnosis: even the minimal request fails - the "
+                                    "filter endpoint itself is unavailable for this cycle.")
             time.sleep(1.5 * (attempt + 1))
         return False
 
@@ -3872,7 +3920,8 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
         """Stream one pre-subset pgrb2a/b file into `out_fh`. GRIB2 files are just concatenated
         messages, so the a and b files can share one local file for parsing."""
         try:
-            with session.get(_url(d, cc, mem, fh, ab), timeout=45, stream=True) as r:
+            # Always tier 0: the diagnostic tiers omit `subregion` and would return global fields.
+            with session.get(_url(d, cc, mem, fh, ab, 0), timeout=45, stream=True) as r:
                 if r.status_code != 200:
                     return 0
                 n = 0
