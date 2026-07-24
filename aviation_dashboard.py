@@ -3680,15 +3680,29 @@ THOMPSON_CLIMO_XMR = {
 # hours instead of dropping the day. Exact 10Z always wins when present.
 ASSESS_HOUR_TOL = 2
 
-# How many runs of the 10Z panel to retain for its own DPROG/DT (current + 3 back).
-LAUNCH_THERMO_HISTORY_RUNS = 4
+# How many panel snapshots to retain for its DPROG/DT. The cron is hourly but the models are not:
+# GFS/ECMWF/RRFS/REFS cycle every 6 h, so consecutive hourly snapshots of those columns are
+# IDENTICAL and stepping run-by-run tells you nothing. The frontend therefore steps by TIME
+# (-6 h / -12 h for 6-hourly models, -1 h for hourly RAP/HRRR) and picks the nearest stored
+# snapshot, so this needs ~19 h of depth (3 x 6 h back) plus margin for missed runs.
+LAUNCH_THERMO_HISTORY_RUNS = 21
 
-# 700-500 mb mean RH: PLACEHOLDER pending the XMR climatology. Set RH75_PCTL_POINTS to whatever
-# ranks the data arrives at, then fill each month with one value per rank (same shape as the PWAT
-# and Thompson tables above) and the percentile badge lights up automatically. Until then the
-# column shows the RH value with a "-" percentile.
+# 700-500 mb mean RH: monthly percentile distribution (%) for XMR.
 RH75_PCTL_POINTS = CLIMO_PCTL_POINTS_15
-RH75_CLIMO_XMR = {m: None for m in range(1, 13)}
+RH75_CLIMO_XMR = {
+     1: [0.9, 2.1, 5.5, 7.4, 8.3, 11.2, 15.8, 20.9, 25.7, 33.5, 46.1, 69.7, 80.4, 94.3, 99.6],  # Jan
+     2: [1.1, 2.4, 6.1, 7.5, 9.2, 13.3, 18.3, 23.5, 29.4, 37.4, 49.9, 66.5, 81.4, 95.3, 98.9],  # Feb
+     3: [1.6, 2.7, 6.0, 7.5, 9.1, 13.5, 17.3, 22.0, 27.5, 33.7, 43.7, 62.6, 76.0, 92.2, 98.8],  # Mar
+     4: [1.8, 3.0, 6.0, 7.7, 10.1, 13.4, 17.3, 23.7, 28.8, 35.5, 44.5, 60.7, 73.3, 93.8, 99.7],  # Apr
+     5: [1.8, 3.5, 7.8, 8.5, 13.2, 17.6, 23.7, 30.5, 35.7, 43.2, 52.9, 68.6, 79.8, 92.6, 97.0],  # May
+     6: [4.1, 8.3, 13.8, 21.0, 29.8, 38.6, 45.9, 53.7, 60.5, 68.0, 75.3, 83.9, 89.7, 94.8, 97.4],  # Jun
+     7: [8.8, 11.4, 19.1, 26.8, 35.9, 43.3, 50.9, 57.4, 63.3, 69.2, 76.3, 82.2, 87.4, 94.1, 97.6],  # Jul
+     8: [3.7, 9.0, 19.3, 26.2, 37.5, 45.5, 51.6, 57.4, 63.4, 68.1, 73.6, 81.3, 86.3, 94.2, 100.0],  # Aug
+     9: [3.9, 6.2, 10.8, 15.3, 24.5, 34.5, 43.3, 52.0, 59.9, 66.6, 73.8, 82.9, 88.1, 95.1, 99.6],  # Sep
+    10: [1.7, 3.0, 6.3, 8.3, 10.8, 14.4, 19.6, 26.4, 33.3, 44.0, 57.2, 75.3, 87.7, 94.5, 99.1],  # Oct
+    11: [1.4, 2.5, 5.7, 7.8, 8.9, 11.3, 15.0, 19.9, 24.9, 31.1, 41.4, 64.6, 76.5, 92.9, 99.1],  # Nov
+    12: [1.2, 3.2, 5.4, 7.5, 8.7, 11.7, 15.2, 19.3, 25.7, 32.0, 43.0, 60.5, 77.6, 94.3, 98.6],  # Dec
+}
 
 
 def _climo_percentile(value, breaks, points):
@@ -3909,6 +3923,7 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                     "date": date_str,
                     "sort": sort_key,
                     "vhh": hh,
+                    "month": month,
                     "ltg": ltg,
                     "ltg_u": None if u_ltg is None else round(u_ltg, 2),
                     "ltg_rh": rh_ltg,
@@ -3946,6 +3961,7 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                 "date": date_str,
                 "sort": sort_key,
                 "vhh": assess_hour,
+                "month": month,
                 "ltg": r.get("ltg"),
                 "ltg_u": (None if r.get("mf_dir") is None else
                           round(rf_lightning_u_wind(r.get("mf_dir"), r.get("mf_spd")), 2)),
@@ -4230,6 +4246,14 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         "launch_thermo": launch_thermo,
         "launch_thermo_runs": thermo_runs,
         "refc_maps": refc_maps,
+        # Monthly percentile distributions, shipped so the panel can draw box-and-whisker plots
+        # from exactly the same numbers the percentile badges use.
+        "climo": {
+            "points": CLIMO_PCTL_POINTS_15,
+            "thompson": THOMPSON_CLIMO_XMR,
+            "pwat": PWAT_CLIMO_XMR,
+            "rh75": RH75_CLIMO_XMR,
+        },
     }
 
     with open(HISTORY_FILE, "w") as f:
