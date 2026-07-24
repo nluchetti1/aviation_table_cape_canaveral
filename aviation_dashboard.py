@@ -152,19 +152,20 @@ REFS_MEMBER_THERMO_ENABLED = True
 # mb, so it alone cannot produce K-Index, Lifted Index or 700-500 RH. The mid/upper temperature
 # and moisture live in pgrb2b, so BOTH files are byte-ranged and concatenated per member.
 GEFS_ENABLED = True
+GEFS_AWS_ROOT = "https://noaa-gefs-pds.s3.amazonaws.com"
 GEFS_MEMBERS = 15          # c00 control + p01..p14; spread converges quickly for airmass indices
 GEFS_MAX_FH = 168          # 3-hourly output; 168 h = 7 forecast days
 # GEFS cycles every 6 h but this pipeline runs hourly, so the fetched rows are cached against the
 # cycle and only refetched when a new cycle appears (saves ~5 of every 6 runs).
 GEFS_CACHE_ENABLED = True
-# NOMADS asks callers to pause between requests and throttles bursts; this fetch issues roughly
-# GEFS_MEMBERS x rows x 2 requests, so space them out slightly.
-GEFS_REQUEST_PAUSE_S = 0.4
-# GEFS 0.5-deg carries a REDUCED isobaric set - it has none of the 975/950/900/800/750/650/550/
-# 450/350 mb levels the mesoscale pad columns use. Asking grib_filter for a level that isn't in
-# the file's inventory makes the CGI return HTTP 500, which is what silently killed the column on
-# the first live attempt. Keep this to levels GEFS actually publishes.
+# S3 has no burst limits, but keep a tiny pause as a courtesy / connection-reuse aid.
+GEFS_REQUEST_PAUSE_S = 0.05
+# GEFS 0.5-deg carries a REDUCED isobaric set (no 975/950/900/800/750/650/550/450/350 mb). Only
+# ask for levels it actually publishes; anything else is a wasted lookup.
 GEFS_LEVELS_HPA = [1000, 925, 850, 700, 500, 400, 300, 250, 200, 150, 100]
+# The panel thermo needs only pressure/T/dewpoint/wind - geopotential height is never read, so
+# HGT is deliberately NOT fetched (that alone is ~20% of the bytes).
+GEFS_VARS = ("TMP", "RH", "UGRD", "VGRD")
 
 
 STN_COORDS = {
@@ -3759,23 +3760,6 @@ def _valid_day_fields(dd, now):
         return (f"{dd:02d}", f"{dd:02d}", f"{dd:02d}", now.month, now.year)
 
 
-_GEFS_PROBE_LOGGED = 0
-# Guard so the tier-attribution probe runs at most once per process, not once per rejected cycle.
-_GEFS_TIER_TESTED = [False]
-
-
-def _gefs_probe_log(d, cc, fh, status, body=""):
-    """Log the first few GEFS probe failures with their real HTTP status. Bounded so a total
-    NOMADS outage can't flood the log with 75 identical lines."""
-    global _GEFS_PROBE_LOGGED
-    if _GEFS_PROBE_LOGGED >= 4:
-        return
-    _GEFS_PROBE_LOGGED += 1
-    snippet = " ".join((body or "").split())[:140]
-    logging.warning(f"[GEFS PROBE] {d} {cc}z f{fh:03d} -> HTTP {status}"
-                    + (f" | {snippet}" if snippet else ""))
-
-
 def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
     """GEFS ensemble launch-thermo for the 10Z panel: pull each member's isobaric sounding at the
     site for the forecast hours nearest the assessment hour, compute the indices PER MEMBER, and
@@ -3797,83 +3781,53 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
 
     members = ["c00"] + [f"p{i:02d}" for i in range(1, max(1, GEFS_MEMBERS))]
 
-    # GEFS is GLOBAL: one 0.5-deg GRIB message is the whole planet (~180 KB), so byte-ranging the
-    # AWS copy would pull ~850 MB per fetch to read a single point. NOMADS' grib_filter crops
-    # server-side to a small box around the Cape instead - a few KB per file. Same mechanism the
-    # GFS/RAP pad columns already use.
-    _LEV = "".join(f"&lev_{L}_mb=on" for L in GEFS_LEVELS_HPA)
-    _VAR = "&var_HGT=on&var_TMP=on&var_RH=on&var_UGRD=on&var_VGRD=on"
-    _BOX = "&subregion=&leftlon=-81.5&rightlon=-79.5&toplat=29.5&bottomlat=27.5"
-
-    def _url(d, cc, mem, fh, ab, tier=0):
-        """Build a filter URL. `tier` controls how much is asked for, so a CGI rejection can be
-        attributed to a specific component rather than guessed at:
-          0 = full request (all levels + vars + subregion)   <- what we want
-          1 = full levels/vars, NO subregion                 <- isolates the box
-          2 = one level + one var + subregion                <- isolates the level list
-          3 = one level + one var, no subregion              <- bare minimum that must work
-        """
-        script = "filter_gefs_atmos_0p50a.pl" if ab == "a" else "filter_gefs_atmos_0p50b.pl"
+    # SOURCE: AWS S3, not the NOMADS grib_filter CGI. The filter would be far cheaper in bytes
+    # (server-side cropping), but by the time this runs the pipeline has already made hundreds of
+    # NOMADS requests for the GFS/RAP pad columns, HREF and HREFCT - so the filter answers every
+    # GEFS probe with "302 Over Rate Limit" and the column silently vanishes. S3 has no such limit.
+    #
+    # The tradeoff is bandwidth: a 0.5-deg message is global (~200 KB), so byte-ranging pulls whole
+    # fields to read one point. Trimmed to 4 vars x 11 levels and cached against the 6-hourly cycle
+    # that is ~0.9 GB per cycle-change, i.e. ~150 MB/run amortized - roughly a tenth of what the
+    # hourly ECMWF fetch already costs.
+    def _url(d, cc, mem, fh, ab):
         sub = "pgrb2ap5" if ab == "a" else "pgrb2bp5"
-        lev, var, box = _LEV, _VAR, _BOX
-        if tier == 1:
-            box = ""
-        elif tier == 2:
-            lev, var = "&lev_500_mb=on", "&var_HGT=on"
-        elif tier == 3:
-            lev, var, box = "&lev_500_mb=on", "&var_HGT=on", ""
-        return (f"https://nomads.ncep.noaa.gov/cgi-bin/{script}"
-                f"?file=ge{mem}.t{cc}z.pgrb2{ab}.0p50.f{fh:03d}{lev}{var}{box}"
-                f"&dir=%2Fgefs.{d}%2F{cc}%2Fatmos%2F{sub}")
+        return (f"{GEFS_AWS_ROOT}/gefs.{d}/{cc}/atmos/{sub}/"
+                f"ge{mem}.t{cc}z.pgrb2{ab}.0p50.f{fh:03d}")
 
-    def _try(d, cc, mem, fh, ab, tier):
-        try:
-            r = session.get(_url(d, cc, mem, fh, ab, tier), timeout=25, stream=True)
-            st, body = r.status_code, ("" if r.status_code == 200 else (r.text or "")[:160])
-            r.close()
-            return st, body
-        except Exception as e:
-            return f"exc:{type(e).__name__}", str(e)[:160]
+    _lvl_re = re.compile(r"^(\d+)\s*mb$")
+
+    def _wanted(entries):
+        """Pick the TMP/RH/UGRD/VGRD messages at GEFS_LEVELS_HPA out of a parsed .idx."""
+        want = []
+        for e in entries:
+            if e["short"] not in GEFS_VARS:
+                continue
+            m = _lvl_re.match((e.get("level") or "").strip())
+            if m and int(m.group(1)) in GEFS_LEVELS_HPA:
+                want.append(e)
+        return want
+
+    def _merge(entries, gap=4096):
+        """Merge byte ranges that are adjacent or nearly so. GRIB messages for one variable sit
+        contiguously in the file, so this collapses ~44 requests into a handful without pulling
+        materially more data."""
+        rngs = sorted(((e["start"], e["end"]) for e in entries), key=lambda x: x[0])
+        out = []
+        for s, e in rngs:
+            if out and out[-1][1] is not None and s - out[-1][1] <= gap:
+                out[-1] = (out[-1][0], e if e is not None else None)
+            else:
+                out.append((s, e))
+        return out
 
     def _idx_ok(d, cc, mem, fh, ab="a"):
-        """Probe a cycle. On rejection, walk the diagnostic tiers once to attribute the failure to
-        a specific URL component - a bare 500 with no attribution is what made the first live
-        attempt a guess. The tiers are DIAGNOSTIC ONLY: tiers 1 and 3 omit `subregion`, which makes
-        the filter return whole-globe messages (~2 GB across a full fetch), so they must never be
-        used to pull data. If tier 0 is rejected we report why and skip GEFS for this run."""
-        for attempt in range(2):
-            st, body = _try(d, cc, mem, fh, ab, 0)
-            if st == 200:
-                return True
-            if st == 404:
-                return False              # genuinely not posted; try an older cycle
-            _gefs_probe_log(d, cc, fh, st, body)
-            if not _GEFS_TIER_TESTED[0]:
-                _GEFS_TIER_TESTED[0] = True
-                names = {1: "full levels/vars, NO subregion", 2: "one level+var WITH subregion",
-                         3: "one level+var, no subregion (minimal)"}
-                worked = None
-                for t in (1, 2, 3):
-                    st_t, _ = _try(d, cc, mem, fh, ab, t)
-                    logging.warning(f"[GEFS PROBE] tier {t} ({names[t]}) -> HTTP {st_t}")
-                    if st_t == 200 and worked is None:
-                        worked = t
-                if worked == 1:
-                    logging.warning("[GEFS PROBE] diagnosis: the SUBREGION box is being rejected. "
-                                    "Not falling back - without server-side cropping this fetch "
-                                    "would pull whole-globe fields (~2 GB).")
-                elif worked == 2:
-                    logging.warning("[GEFS PROBE] diagnosis: subregion is fine, so the LEVEL or VAR "
-                                    "list is being rejected - GEFS_LEVELS_HPA likely still asks for "
-                                    "a level this file doesn't carry.")
-                elif worked == 3:
-                    logging.warning("[GEFS PROBE] diagnosis: only the minimal request works; both "
-                                    "the subregion box and the level/var list are being rejected.")
-                else:
-                    logging.warning("[GEFS PROBE] diagnosis: even the minimal request fails - the "
-                                    "filter endpoint itself is unavailable for this cycle.")
-            time.sleep(1.5 * (attempt + 1))
-        return False
+        """A cycle exists if its .idx is served (a few KB of text, no data transfer)."""
+        try:
+            r = session.get(_url(d, cc, mem, fh, ab) + ".idx", timeout=15)
+            return r.status_code == 200 and "TMP" in r.text
+        except Exception:
+            return False
 
     # newest posted GEFS cycle (00/06/12/18Z), probing back up to 24 h
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -3889,9 +3843,8 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
             cyc_dt = cand.replace(minute=0, second=0, microsecond=0)
             break
     if not cycle:
-        logging.warning("GEFS thermo: no cycle answered on NOMADS after probing 24 h back; GEFS "
-                        "omitted from panel. NOMADS throttles bursts and returns transient 5xx - "
-                        "see the [GEFS PROBE] lines above for the actual status.")
+        logging.warning("GEFS thermo: no cycle .idx found on AWS after probing 24 h back; "
+                        "GEFS omitted from panel.")
         return {}, None
 
     cycle_key = f"{date_str}{cycle}"
@@ -3914,24 +3867,26 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
     if not picks:
         return {}, cycle_key
 
-    want_vars = {"HGT", "TMP", "RH", "UGRD", "VGRD"}
-
     def _grab(d, cc, mem, fh, ab, out_fh):
-        """Stream one pre-subset pgrb2a/b file into `out_fh`. GRIB2 files are just concatenated
-        messages, so the a and b files can share one local file for parsing."""
+        """Byte-range the wanted messages out of one pgrb2a/b file into `out_fh`. Returns bytes
+        written. GRIB2 files are concatenated messages, so a and b can share one local file."""
         try:
-            # Always tier 0: the diagnostic tiers omit `subregion` and would return global fields.
-            with session.get(_url(d, cc, mem, fh, ab, 0), timeout=45, stream=True) as r:
-                if r.status_code != 200:
-                    return 0
-                n = 0
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        out_fh.write(chunk)
-                        n += len(chunk)
-                return n
-        except Exception as e:
-            logging.debug(f"GEFS {mem} f{fh:03d} pgrb2{ab}: {e}")
+            ir = session.get(_url(d, cc, mem, fh, ab) + ".idx", timeout=20)
+            if ir.status_code != 200:
+                return 0
+            want = _wanted(_parse_grib_idx(ir.text))
+            if not want:
+                return 0
+            n = 0
+            for s, e in _merge(want):
+                rng = f"bytes={s}-{'' if e is None else e}"
+                rr = session.get(_url(d, cc, mem, fh, ab), headers={"Range": rng}, timeout=60)
+                if rr.status_code in (200, 206) and rr.content:
+                    out_fh.write(rr.content)
+                    n += len(rr.content)
+            return n
+        except Exception as exc:
+            logging.debug(f"GEFS {mem} f{fh:03d} pgrb2{ab}: {exc}")
             return 0
 
     out = {}
@@ -3941,7 +3896,7 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
         per = []
         for mi, mem in enumerate(members):
             if mi:
-                time.sleep(GEFS_REQUEST_PAUSE_S)   # be a good NOMADS citizen; avoids burst throttling
+                time.sleep(GEFS_REQUEST_PAUSE_S)   # brief courtesy pause; S3 has no burst limit
             local = os.path.join(CACHE_DIR, f"gefs_{mem}_{cycle}z_f{fh:03d}.grib2")
             try:
                 with open(local, "wb") as fhandle:
@@ -3949,10 +3904,11 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
                     n_b = _grab(date_str, cycle, mem, fh, "b", fhandle)
                 if not probed:
                     # One-time check: pgrb2a carries TMP/RH only at 1000/925/850, so a zero-byte
-                    # or missing b file would silently blank Thompson and 700-500 RH for the whole
-                    # GEFS column. Log both sizes so that failure mode is visible immediately.
-                    logging.info(f"[GEFS PROBE] {mem} f{fh:03d}: pgrb2a {n_a/1024:.1f} KB + "
-                                 f"pgrb2b {n_b/1024:.1f} KB (mid/upper TMP+RH come from the b file).")
+                    # b file would silently blank Thompson and 700-500 RH for the whole GEFS
+                    # column. Log both sizes so that failure mode is visible immediately.
+                    logging.info(f"[GEFS PROBE] {mem} f{fh:03d}: pgrb2a {n_a/1024:.0f} KB + "
+                                 f"pgrb2b {n_b/1024:.0f} KB via S3 byte-range "
+                                 f"(mid/upper TMP+RH come from the b file).")
                     probed = True
                 if (n_a + n_b) == 0:
                     continue
