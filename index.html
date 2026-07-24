@@ -184,6 +184,7 @@
         let refcMaps = null;          // {row_key: "maps/refc/....png"} — NWS-scale reflectivity
         let launchThermoRuns = null;  // [{timestamp, thermo}] — panel dprog/dt, current + 3 back
         let ltRunIdx = 0;             // which run the panel is currently showing
+        let climoTables = null;       // {points, thompson, pwat, rh75} — monthly percentile dists
         let ctWindow = '4hr';  // toggles between '4hr' and '1hr' for the persistent CT column
         let activeMetric = 'mom_mean';
         let activeStn = 'kxmr';
@@ -216,6 +217,7 @@
                 refsCumulusMaps10 = (payload.href_maps_latest && payload.href_maps_latest.refs_cumulus_maps10) || null;
                 launchThermo = payload.launch_thermo || null;
                 launchThermoRuns = payload.launch_thermo_runs || null;
+                climoTables = payload.climo || null;
                 refcMaps = payload.refc_maps || null;
 
                 // Diagnostic: how many hours carry a real calibrated-thunder map per window.
@@ -1010,19 +1012,53 @@
         function hidePopup() { popupCard.style.display = "none"; }
 
         // ---- 10Z Synoptic panel (mean flow / regime / anvil / Thompson / RH / PWAT / lightning) ----
-        function ltActiveThermo() {
-            if (launchThermoRuns && launchThermoRuns[ltRunIdx] && launchThermoRuns[ltRunIdx].thermo) {
-                return launchThermoRuns[ltRunIdx].thermo;
+        // The cron is hourly but the models are not. GFS/ECMWF/RRFS/REFS cycle every 6 h, so
+        // consecutive hourly snapshots of those columns are identical and stepping run-by-run shows
+        // nothing. So DPROG/DT steps by TIME at each model's own cycle cadence, and we pick the
+        // stored snapshot nearest that target time.
+        const MODEL_CYCLE_H = { gfs: 6, ecmwf: 6, rrfs: 6, refs: 6, rap: 1, hrrr: 1 };
+        const LT_STEPS = 4;   // current + 3 back
+        function ltParseTs(ts) {
+            if (!ts) return null;
+            const d = new Date(String(ts).replace(' UTC', 'Z').replace(' ', 'T'));
+            return isNaN(d.getTime()) ? null : d;
+        }
+        function ltStepHours(model) { return MODEL_CYCLE_H[model] || 1; }
+        function ltResolveRun(model, k) {
+            // k = 0 is always the current run; k>0 targets (k * cycle) hours before it.
+            if (!launchThermoRuns || !launchThermoRuns.length) {
+                return { thermo: launchThermo, timestamp: null, offset: 0, exact: true };
             }
-            return launchThermo;
+            if (k === 0) {
+                return { thermo: launchThermoRuns[0].thermo || launchThermo,
+                         timestamp: launchThermoRuns[0].timestamp, offset: 0, exact: true };
+            }
+            const stepH = ltStepHours(model);
+            const t0 = ltParseTs(launchThermoRuns[0].timestamp);
+            if (!t0) return { thermo: null, timestamp: null, offset: -k * stepH, exact: false };
+            const target = new Date(t0.getTime() - k * stepH * 3600 * 1000);
+            let best = null, bestDiff = Infinity;
+            for (const r of launchThermoRuns) {
+                const t = ltParseTs(r.timestamp);
+                if (!t) continue;
+                const diff = Math.abs(t.getTime() - target.getTime());
+                if (diff < bestDiff) { bestDiff = diff; best = r; }
+            }
+            // Accept only if within half a step of the target, else report the gap honestly.
+            const tolMs = Math.max(stepH * 0.5, 0.75) * 3600 * 1000;
+            const ok = best && bestDiff <= tolMs;
+            return { thermo: ok ? best.thermo : null, timestamp: ok ? best.timestamp : null,
+                     offset: -k * stepH, exact: ok,
+                     actualH: best ? Math.round((ltParseTs(best.timestamp) - t0) / 36e5) : null };
+        }
+        function ltActiveThermo() {
+            const sel = document.getElementById('ltModel');
+            const model = sel ? sel.value : null;
+            const r = ltResolveRun(model, ltRunIdx);
+            return r.thermo || (launchThermoRuns && launchThermoRuns[0] && launchThermoRuns[0].thermo) || launchThermo;
         }
         function setLaunchThermoRun(i) {
             ltRunIdx = i;
-            const t = ltActiveThermo();
-            const sel = document.getElementById('ltModel');
-            const prev = sel.value;
-            sel.innerHTML = (t.models || []).map(m => `<option value="${m}">${m.toUpperCase()}</option>`).join('');
-            if ((t.models || []).includes(prev)) sel.value = prev;   // keep the model when stepping runs
             renderLaunchThermoRuns();
             renderLaunchThermo();
         }
@@ -1030,15 +1066,26 @@
             const el = document.getElementById('ltRuns');
             if (!el) return;
             if (!launchThermoRuns || launchThermoRuns.length < 2) { el.innerHTML = ''; return; }
-            el.innerHTML = launchThermoRuns.map((r, i) => {
-                const label = i === 0 ? 'Current Run' : `Run -${i}`;
+            const sel = document.getElementById('ltModel');
+            const model = sel ? sel.value : null;
+            const stepH = ltStepHours(model);
+            let html = '';
+            for (let i = 0; i < LT_STEPS; i++) {
+                const r = ltResolveRun(model, i);
+                const label = i === 0 ? 'Current Run' : `\u2212${i * stepH} h`;
                 const on = (i === ltRunIdx);
-                return `<button onclick="setLaunchThermoRun(${i})" title="${r.timestamp || ''}"
+                const dead = (i > 0 && !r.exact);
+                html += `<button onclick="setLaunchThermoRun(${i})" title="${r.timestamp || 'no snapshot near this offset yet'}"
                     style="border:1px solid ${on ? '#1e3a5f' : '#cbd5e1'}; background:${on ? '#1e3a5f' : '#fff'};
-                           color:${on ? '#fff' : '#1e3a5f'}; border-radius:6px; padding:3px 10px; margin-right:6px;
-                           cursor:pointer; font-size:0.8rem; font-weight:${on ? '600' : '400'};">${label}</button>`;
-            }).join('') + `<span style="color:#94a3b8; font-size:0.75rem; margin-left:4px;">${
-                (launchThermoRuns[ltRunIdx] || {}).timestamp || ''}</span>`;
+                           color:${on ? '#fff' : (dead ? '#cbd5e1' : '#1e3a5f')}; border-radius:6px; padding:3px 10px;
+                           margin-right:6px; cursor:pointer; font-size:0.8rem; font-weight:${on ? '600' : '400'};">${label}</button>`;
+            }
+            const cur = ltResolveRun(model, ltRunIdx);
+            const note = (ltRunIdx > 0 && !cur.exact)
+                ? `<span style="color:#b45309; font-size:0.75rem; margin-left:4px;">no snapshot near \u2212${ltRunIdx * stepH} h yet</span>`
+                : `<span style="color:#94a3b8; font-size:0.75rem; margin-left:4px;">${cur.timestamp || ''}
+                     ${model ? `&middot; ${model.toUpperCase()} cycles every ${stepH} h` : ''}</span>`;
+            el.innerHTML = html + note;
         }
         function showLaunchThermo() {
             if (!launchThermo || !(launchThermo.models || []).length) {
@@ -1055,6 +1102,109 @@
             document.getElementById('ltModal').style.display = 'flex';
         }
         function hideLaunchThermo() { document.getElementById('ltModal').style.display = 'none'; }
+
+        // ---- Monthly climatology box-and-whisker, drawn from the same percentile tables the
+        // percentile badges use, with this run's forecast days overlaid as red dots. ----
+        const LT_BOX_VARS = {
+            thompson: { label: 'Thompson Index (C)',            unit: '',   get: r => r.ti },
+            rh75:     { label: '700-500mb Average RH (%)',      unit: '%',  get: r => r.ltg_rh },
+            pwat:     { label: 'PWAT (inches)',                 unit: ' in', get: r => r.pwat },
+        };
+        function ltBoxPlotSVG(varName) {
+            const cfg = LT_BOX_VARS[varName];
+            const tbl = (climoTables || {})[varName];
+            const pts = (climoTables || {}).points;
+            if (!cfg || !tbl || !pts) return null;
+            const iOf = p => pts.indexOf(p);
+            const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+            const stat = {};
+            let lo = Infinity, hi = -Infinity;
+            for (let m = 1; m <= 12; m++) {
+                const v = tbl[m] || tbl[String(m)];
+                if (!v) continue;
+                stat[m] = {
+                    min: v[iOf(0)], w1: v[iOf(1)],
+                    q25: (v[iOf(20)] + v[iOf(30)]) / 2,     // interpolate 25th from the 20/30 points
+                    med: v[iOf(50)],
+                    q75: (v[iOf(70)] + v[iOf(80)]) / 2,     // and 75th from 70/80
+                    w99: v[iOf(99)], max: v[iOf(100)]
+                };
+                lo = Math.min(lo, v[iOf(0)]); hi = Math.max(hi, v[iOf(100)]);
+            }
+            if (!Object.keys(stat).length) return null;
+
+            // this run's rows for the selected model
+            const thermo = ltActiveThermo();
+            const model = document.getElementById('ltModel').value;
+            const rows = ((thermo.by_model || {})[model] || [])
+                .map(r => ({ m: r.month, v: cfg.get(r), lbl: r.date }))
+                .filter(d => d.m != null && d.v != null);
+            rows.forEach(d => { lo = Math.min(lo, d.v); hi = Math.max(hi, d.v); });
+
+            const W = 900, H = 430, ml = 62, mr = 18, mt = 26, mb = 62;
+            const pw = W - ml - mr, ph = H - mt - mb;
+            const pad = (hi - lo) * 0.04 || 1;
+            const y0 = lo - pad, y1 = hi + pad;
+            const X = m => ml + pw * ((m - 0.5) / 12);
+            const Y = v => mt + ph * (1 - (v - y0) / (y1 - y0));
+            const bw = (pw / 12) * 0.52;
+
+            let s = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px; font-family:system-ui,sans-serif;">`;
+            s += `<rect x="0" y="0" width="${W}" height="${H}" fill="#ffffff"/>`;
+            // y grid + labels
+            for (let i = 0; i <= 6; i++) {
+                const v = y0 + (y1 - y0) * i / 6, yy = Y(v);
+                s += `<line x1="${ml}" y1="${yy}" x2="${W - mr}" y2="${yy}" stroke="#e2e8f0" stroke-width="1"/>`;
+                s += `<text x="${ml - 8}" y="${yy + 3.5}" text-anchor="end" font-size="10" fill="#64748b">${
+                    Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(Math.abs(y1 - y0) < 5 ? 2 : 1)}</text>`;
+            }
+            // boxes
+            for (let m = 1; m <= 12; m++) {
+                const st = stat[m]; if (!st) continue;
+                const cx = X(m), x0 = cx - bw / 2;
+                s += `<line x1="${cx}" y1="${Y(st.w99)}" x2="${cx}" y2="${Y(st.q75)}" stroke="#334155" stroke-width="1"/>`;
+                s += `<line x1="${cx}" y1="${Y(st.w1)}" x2="${cx}" y2="${Y(st.q25)}" stroke="#334155" stroke-width="1"/>`;
+                s += `<line x1="${cx - bw * 0.28}" y1="${Y(st.w99)}" x2="${cx + bw * 0.28}" y2="${Y(st.w99)}" stroke="#334155" stroke-width="1"/>`;
+                s += `<line x1="${cx - bw * 0.28}" y1="${Y(st.w1)}" x2="${cx + bw * 0.28}" y2="${Y(st.w1)}" stroke="#334155" stroke-width="1"/>`;
+                s += `<rect x="${x0}" y="${Y(st.q75)}" width="${bw}" height="${Math.max(1, Y(st.q25) - Y(st.q75))}"
+                        fill="#3b7ea1" fill-opacity="0.85" stroke="#1e3a5f" stroke-width="1"/>`;
+                s += `<line x1="${x0}" y1="${Y(st.med)}" x2="${x0 + bw}" y2="${Y(st.med)}" stroke="#0f172a" stroke-width="1.6"/>`;
+                s += `<circle cx="${cx}" cy="${Y(st.min)}" r="2" fill="none" stroke="#94a3b8" stroke-width="0.8"/>`;
+                s += `<circle cx="${cx}" cy="${Y(st.max)}" r="2" fill="none" stroke="#94a3b8" stroke-width="0.8"/>`;
+                s += `<text x="${cx}" y="${H - mb + 16}" text-anchor="middle" font-size="10" fill="#475569">${MN[m - 1]}</text>`;
+            }
+            // this run's days, spread within the month slot when several share it
+            const byM = {};
+            rows.forEach(d => { (byM[d.m] = byM[d.m] || []).push(d); });
+            Object.keys(byM).forEach(m => {
+                const grp = byM[m], n = grp.length;
+                grp.forEach((d, i) => {
+                    const off = n === 1 ? 0 : (i - (n - 1) / 2) * Math.min(bw / Math.max(1, n - 1), 11);
+                    const cx = X(+m) + off, cy = Y(d.v);
+                    s += `<circle cx="${cx}" cy="${cy}" r="4.2" fill="#dc2626" stroke="#ffffff" stroke-width="1.2"/>`;
+                    s += `<title>${d.lbl}: ${d.v}${cfg.unit}</title>`;
+                    s += `<text x="${cx}" y="${cy - 8}" text-anchor="middle" font-size="8.5" fill="#dc2626" font-weight="600">${d.lbl.split(' ')[1]}</text>`;
+                });
+            });
+            s += `<text x="${W / 2}" y="16" text-anchor="middle" font-size="12" font-weight="700" fill="#0f172a">Monthly Distribution of ${cfg.label}</text>`;
+            s += `<text x="${W / 2}" y="${H - 8}" text-anchor="middle" font-size="10" fill="#475569">Month</text>`;
+            s += `</svg>`;
+            return s;
+        }
+        function showBoxPlot(varName) {
+            const svg = ltBoxPlotSVG(varName);
+            const body = document.getElementById('bpBody');
+            const model = document.getElementById('ltModel').value;
+            if (!svg) { body.innerHTML = '<div style="padding:20px; color:#94a3b8;">No climatology available for that variable.</div>'; }
+            else {
+                body.innerHTML = svg + `<div style="font-size:0.78rem; color:#64748b; margin-top:8px;">
+                    Box = 25th\u201375th percentile, line = median, whiskers = 1st/99th, open circles = record min/max
+                    (XMR climatology). <span style="color:#dc2626; font-weight:600;">Red dots</span> are this run's
+                    ${model.toUpperCase()} forecast days, placed in their own month.</div>`;
+            }
+            document.getElementById('bpModal').style.display = 'flex';
+        }
+        function hideBoxPlot() { document.getElementById('bpModal').style.display = 'none'; }
         function renderLaunchThermo() {
             const thermo = ltActiveThermo();
             const model = document.getElementById('ltModel').value;
@@ -1107,9 +1257,12 @@
                 <th style="padding:8px 6px;">1000–700 mb Mean Flow</th>
                 <th style="padding:8px 6px;">Flow Regime</th>
                 <th style="padding:8px 6px;">Anvil Flow (300–150 mb)</th>
-                <th style="padding:8px 6px;">Thompson Index</th>
-                <th style="padding:8px 6px;">700–500 mb RH</th>
-                <th style="padding:8px 6px;">PWAT (in)</th>
+                <th onclick="showBoxPlot('thompson')" title="Click for the monthly climatology box plot"
+                    style="padding:8px 6px; cursor:pointer; text-decoration:underline dotted;">Thompson Index</th>
+                <th onclick="showBoxPlot('rh75')" title="Click for the monthly climatology box plot"
+                    style="padding:8px 6px; cursor:pointer; text-decoration:underline dotted;">700–500 mb RH</th>
+                <th onclick="showBoxPlot('pwat')" title="Click for the monthly climatology box plot"
+                    style="padding:8px 6px; cursor:pointer; text-decoration:underline dotted;">PWAT (in)</th>
                 <th style="padding:8px 6px;">Cizek Lightning Probability</th>
               </tr></thead><tbody>`;
             if (!rows.length) {
@@ -1141,12 +1294,22 @@
           <div style="font-weight:700; color:#1e3a5f;">10Z Synoptic — <span id="ltSite">KXMR</span></div>
           <div style="display:flex; align-items:center; gap:8px;">
             <label style="font-size:0.85rem; color:#475569;">Model:</label>
-            <select id="ltModel" onchange="renderLaunchThermo()" style="padding:4px 8px; border:1px solid #cbd5e1; border-radius:6px;"></select>
+            <select id="ltModel" onchange="renderLaunchThermoRuns(); renderLaunchThermo();" style="padding:4px 8px; border:1px solid #cbd5e1; border-radius:6px;"></select>
             <button onclick="hideLaunchThermo()" style="border:none; background:#e2e8f0; border-radius:6px; padding:4px 10px; cursor:pointer;">✕</button>
           </div>
         </div>
         <div id="ltRuns" style="padding:10px 18px 0; display:flex; align-items:center; flex-wrap:wrap;"></div>
         <div id="ltBody" style="padding:6px 18px 18px;"></div>
+      </div>
+    </div>
+    <div id="bpModal" onclick="if(event.target===this)hideBoxPlot()"
+         style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.6); z-index:1100; align-items:flex-start; justify-content:center;">
+      <div style="background:#fff; margin-top:6vh; max-width:980px; width:96%; max-height:86vh; overflow:auto; border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,0.35);">
+        <div style="display:flex; align-items:center; justify-content:space-between; padding:12px 18px; border-bottom:1px solid #e2e8f0;">
+          <div style="font-weight:700; color:#1e3a5f;">Climatology &mdash; XMR</div>
+          <button onclick="hideBoxPlot()" style="border:none; background:#e2e8f0; border-radius:6px; padding:4px 10px; cursor:pointer;">✕</button>
+        </div>
+        <div id="bpBody" style="padding:14px 18px 18px;"></div>
       </div>
     </div>
 </body>
