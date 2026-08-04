@@ -7,6 +7,7 @@ import re
 import requests
 import concurrent.futures
 import threading
+import random
 import logging
 import pygrib
 import numpy as np
@@ -29,6 +30,28 @@ STATIONS = ["kdab", "kxmr", "kmlb", "kfpr", "kpbi"]
 # point-extracted from ECMWF Open Data, so it must NOT be swept into the BUFKIT/NOMADS loops.
 MODELS = ["gfs", "rap", "hrrr", "ecmwf"]
 BUFKIT_MODELS = ["gfs", "rap", "hrrr"]
+
+# ---- PSU BUFKIT politeness ------------------------------------------------------------
+# PSU's BUFKIT server throttles hard, and when a burst of parallel requests arrives from a
+# single IP (exactly what a GitHub Actions runner looks like) it stops answering altogether:
+# every in-flight request read-times-out at the same instant, then subsequent ones can't even
+# open a connection. Four things keep us under its radar:
+#   1. LOW CONCURRENCY, enforced by a semaphore rather than just a small pool, so the cap
+#      holds no matter how the executor is sized.
+#   2. A BROWSER USER-AGENT. The default python-requests UA gets dropped on the floor.
+#   3. A JITTERED STAGGER before each request, so 15 tasks don't align into a burst.
+#   4. EXPONENTIAL BACKOFF WITH JITTER, so retries don't fire in lockstep and re-trigger
+#      the same throttle that caused the first failure.
+BUFKIT_MAX_CONCURRENCY = 2      # simultaneous connections to PSU. Do not raise casually.
+BUFKIT_ATTEMPTS = 4             # total tries per station-model
+BUFKIT_CONNECT_TIMEOUT = 12     # seconds to establish the TCP connection
+BUFKIT_READ_TIMEOUT = 45        # seconds to receive the body once connected
+BUFKIT_STAGGER_S = (0.4, 1.8)   # random pre-request pause, seconds
+BUFKIT_BACKOFF_BASE_S = 4.0     # first retry waits ~4 s, then ~8, ~16 (x0.6-1.4 jitter)
+BUFKIT_USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64; rv:120.0) "
+                     "Gecko/20100101 Firefox/120.0")
+# Hard gate shared by every worker thread.
+_BUFKIT_GATE = threading.Semaphore(BUFKIT_MAX_CONCURRENCY)
 
 # ---- ECMWF Open Data (IFS HRES 0.25°, CC-BY-4.0) additive global column ----
 ECMWF_ENABLED = True
@@ -1833,24 +1856,127 @@ def parse_time_series_bufkit(bufkit_text):
 
 
 def fetch_station_model(session, stn, model):
+    """Pull one station-model BUFKIT profile from PSU, politely.
+
+    Returns (stn, model, hourly_data). An empty dict means the fetch failed or the file
+    wasn't posted; run_pipeline will try to carry the previous run's column forward rather
+    than render a blank column.
+    """
     download_id = "xmr" if stn == "kxmr" else stn
     model_prefix = "gfs3" if model == "gfs" else model
-    url = f"http://www.meteo.psu.edu/bufkit/data/{model.upper()}/latest/{model_prefix}_{download_id}.buf"
-    # PSU's BUFKIT server intermittently times out; retry a few times with backoff and a
-    # longer timeout before giving up, so a transient hiccup doesn't drop a whole column.
-    for attempt in range(3):
-        try:
-            response = session.get(url, timeout=25)
-            if response.status_code == 200:
-                return stn, model, parse_time_series_bufkit(response.text)
-            break
-        except Exception as e:
-            if attempt < 2:
-                import time as _t
-                _t.sleep(2 * (attempt + 1))
-                continue
-            logging.error(f"Error fetching {stn} {model} after retries: {e}")
+    # https, not http: PSU redirects anyway, and the redirect costs an extra round trip
+    # against a server that is already rate-limiting us.
+    url = (f"https://www.meteo.psu.edu/bufkit/data/{model.upper()}/latest/"
+           f"{model_prefix}_{download_id}.buf")
+    headers = {
+        "User-Agent": BUFKIT_USER_AGENT,
+        "Accept": "text/plain,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    last = "no attempt made"
+    with _BUFKIT_GATE:
+        # Stagger inside the gate so the two permitted slots don't fire simultaneously.
+        time.sleep(random.uniform(*BUFKIT_STAGGER_S))
+        for attempt in range(BUFKIT_ATTEMPTS):
+            try:
+                r = session.get(url, headers=headers,
+                                timeout=(BUFKIT_CONNECT_TIMEOUT, BUFKIT_READ_TIMEOUT))
+                if r.status_code == 200:
+                    body = r.text
+                    if body and "STID" in body:
+                        data = parse_time_series_bufkit(body)
+                        if data:
+                            return stn, model, data
+                        last = f"200 OK ({len(body)} B) but no parseable profiles"
+                    else:
+                        # A throttle page or truncated body can still come back 200.
+                        last = f"200 OK but body is not BUFKIT ({len(body or '')} B)"
+                elif r.status_code == 404:
+                    # Genuinely not posted (some models skip some sites). Don't burn retries.
+                    logging.warning(f"BUFKIT {stn}/{model}: 404, file not posted.")
+                    return stn, model, {}
+                elif r.status_code in (403, 429, 500, 502, 503, 504):
+                    # These are exactly the throttle codes worth backing off on — the old
+                    # code `break`-ed here and never retried them.
+                    last = f"HTTP {r.status_code} (throttled)"
+                else:
+                    last = f"HTTP {r.status_code}"
+            except Exception as e:
+                last = f"{type(e).__name__}"
+
+            if attempt < BUFKIT_ATTEMPTS - 1:
+                wait = BUFKIT_BACKOFF_BASE_S * (2 ** attempt) * random.uniform(0.6, 1.4)
+                logging.info(f"BUFKIT {stn}/{model}: {last}; retry "
+                             f"{attempt + 2}/{BUFKIT_ATTEMPTS} in {wait:.1f}s")
+                time.sleep(wait)
+
+    logging.error(f"BUFKIT {stn}/{model} failed after {BUFKIT_ATTEMPTS} attempts ({last}).")
     return stn, model, {}
+
+
+def _row_is_future(row_key, now_utc):
+    """True when a 'DD/HH' row key is at or after the current hour (same wrap-safe rule
+    run_pipeline uses to trim the live BUFKIT rows)."""
+    try:
+        d, h = map(int, row_key.split("/"))
+    except Exception:
+        return True
+    if d < now_utc.day and now_utc.day - d < 25:
+        return False
+    if d == now_utc.day and h < now_utc.hour:
+        return False
+    return True
+
+
+def _prior_run_station_data():
+    """Newest stored run's station block from history.json, as (data, timestamp)."""
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            payload = json.load(f)
+        runs = payload.get("runs", []) if isinstance(payload, dict) else payload
+        for r in (runs or []):
+            d = (r or {}).get("data") or {}
+            if d:
+                return d, r.get("timestamp")
+    except Exception:
+        pass
+    return {}, None
+
+
+def carry_forward_missing(sounding_matrix, models_to_check=None):
+    """When PSU throttles us out of an entire airport column, reuse the newest stored rows
+    for that (station, model) instead of rendering a blank column. Only EMPTY columns are
+    filled — a partial fetch is never overwritten — and only forecast hours still in the
+    future are carried, so nothing rots into the past. Each carried profile is tagged with
+    the run it came from, which the frontend surfaces as a stale marker.
+
+    A carried BUFKIT column is a genuinely older forecast, not a nowcast: treat it as the
+    last known good run, and note that RRFS/REFS/ECMWF in the same row are current."""
+    prior, ts = _prior_run_station_data()
+    if not prior:
+        return 0
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    filled = 0
+    for stn, mdls in sounding_matrix.items():
+        for mdl in (models_to_check or list(mdls.keys())):
+            if mdls.get(mdl):
+                continue  # this column fetched fine
+            old = ((prior.get(stn) or {}).get(mdl)) or {}
+            carried = {}
+            for rk, prof in old.items():
+                if isinstance(prof, dict) and _row_is_future(rk, now_utc):
+                    p = dict(prof)
+                    p["stale"] = p.get("stale") or ts or "a previous run"
+                    carried[rk] = p
+            if carried:
+                mdls[mdl] = carried
+                filled += 1
+                logging.warning(f"Carried forward {stn}/{mdl}: {len(carried)} future hours "
+                                f"from {ts} (BUFKIT fetch returned nothing this run).")
+    if filled:
+        logging.warning(f"{filled} BUFKIT column(s) carried forward and flagged stale.")
+    return filled
 
 
 # ---------------------------------------------------------------------------
@@ -4534,7 +4660,15 @@ def run_pipeline():
 
     temp_time_rows_set = set()
     with requests.Session() as session:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # Our own backoff handles retries; let urllib3 fail fast rather than silently
+        # stacking a second retry layer on top of an already-throttled host.
+        session.mount("https://", requests.adapters.HTTPAdapter(
+            pool_connections=BUFKIT_MAX_CONCURRENCY,
+            pool_maxsize=BUFKIT_MAX_CONCURRENCY,
+            max_retries=0))
+        # The pool is sized to the semaphore so we don't park a dozen threads on a gate
+        # they can't pass; _BUFKIT_GATE is the hard guarantee either way.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=BUFKIT_MAX_CONCURRENCY) as executor:
             futures = [
                 executor.submit(fetch_station_model, session, s, m)
                 for s in STATIONS
@@ -4545,6 +4679,17 @@ def run_pipeline():
                 if data:
                     sounding_matrix[stn][model] = data
                     temp_time_rows_set.update(data.keys())
+
+    ok = sum(1 for s in STATIONS for m in BUFKIT_MODELS if sounding_matrix[s].get(m))
+    total = len(STATIONS) * len(BUFKIT_MODELS)
+    logging.info(f"BUFKIT: {ok}/{total} station-model columns fetched.")
+    if ok < total:
+        # PSU throttling should degrade the board, not blank it.
+        carry_forward_missing(sounding_matrix, models_to_check=BUFKIT_MODELS)
+        for s in STATIONS:
+            for m in BUFKIT_MODELS:
+                temp_time_rows_set.update((sounding_matrix[s].get(m) or {}).keys())
+
 
     time_rows = sorted(list(temp_time_rows_set))
     now_utc = datetime.datetime.now(datetime.timezone.utc)
