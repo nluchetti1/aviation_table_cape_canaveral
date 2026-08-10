@@ -8,3 +8,4 @@ metpy
 dask
 pygrib
 cartopy
+ecmwf-opendata
