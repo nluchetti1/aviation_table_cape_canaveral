@@ -95,7 +95,13 @@ ECMWF_ENS_CACHE_ENABLED = True
 # current run.
 SKEWT_ENABLED = True
 SKEWT_SITE = "kxmr"
-SKEWT_MAX_HOURS = 48       # forecast hours per model to export
+# Per-model cap on the number of PROFILES exported (not forecast hours — an hourly model
+# gets 1 profile per hour, ECMWF at 3-hourly gets 1 per 3 hours, so the same number buys a
+# very different horizon). At 96 an hourly model reaches f96 and ECMWF exports its full
+# 3-hourly range. Cost is roughly 0.7 KB and one MetPy parcel calculation per profile, so
+# raising this grows soundings.json and the run time in a straight line.
+SKEWT_MAX_PROFILES = 96
+SKEWT_MAX_HOURS = SKEWT_MAX_PROFILES   # back-compat alias
 SKEWT_TOP_HPA = 100        # drop levels above this; nothing in the panel needs the stratosphere
 SKEWT_FILE = "soundings.json"
 
@@ -4742,7 +4748,7 @@ def _cape_numpy(layers):
     return out
 
 
-def build_soundings_export(combined_data, site="kxmr", max_hours=SKEWT_MAX_HOURS):
+def build_soundings_export(combined_data, site="kxmr", max_hours=SKEWT_MAX_PROFILES):
     """Compact per-model, per-hour soundings at one site, for the frontend skew-T.
 
     Must run BEFORE generate_aviation_dashboard strips `_layers`, since it reuses exactly the
@@ -4762,6 +4768,9 @@ def build_soundings_export(combined_data, site="kxmr", max_hours=SKEWT_MAX_HOURS
     for mdl, rows in models.items():
         if not isinstance(rows, dict):
             continue
+        # Cap on profile COUNT, so an hourly model and a 3-hourly one reach different
+        # horizons from the same number. That is intentional: the point is to export what
+        # each model actually has, not to truncate them all to the shortest.
         keys = sorted(rows.keys(), key=lambda k: _row_sort_key(k))[:max_hours]
         prof_out = {}
         for rk in keys:
