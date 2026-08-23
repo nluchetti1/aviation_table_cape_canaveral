@@ -1929,14 +1929,22 @@
 
         // --- wind barbs ------------------------------------------------------------------
         // Standard barbs: 50 kt pennant, 10 kt full barb, 5 kt half barb.
+        // Barb colour tracks speed, so a jet core is findable without reading every feather.
+        function skBarbColor(spd) {
+            if (spd >= 50) return '#7c3aed';
+            if (spd >= 35) return '#dc2626';
+            if (spd >= 20) return '#ea580c';
+            return '#334155';
+        }
         function skBarb(x, y, dir, spd) {
             if (dir == null || spd == null) return '';
             if (spd < 2.5) return `<circle cx="${x}" cy="${y}" r="3.5" fill="none" stroke="#334155" stroke-width="1"/>`;
+            const BC = skBarbColor(spd);
             const L = 26;
             const rad = (dir + 180) * Math.PI / 180;   // barb points INTO the wind
             const dx = Math.sin(rad), dy = -Math.cos(rad);
             const ex = x + dx * L, ey = y + dy * L;
-            let s = `<line x1="${x}" y1="${y}" x2="${ex.toFixed(1)}" y2="${ey.toFixed(1)}" stroke="#334155" stroke-width="1.1"/>`;
+            let s = `<line x1="${x}" y1="${y}" x2="${ex.toFixed(1)}" y2="${ey.toFixed(1)}" stroke="${BC}" stroke-width="1.2"/>`;
             // perpendicular direction for the feathers
             const px = -dy, py = dx;
             let rem = Math.round(spd / 5) * 5;
@@ -1945,19 +1953,97 @@
             while (rem >= 50) {
                 const bx = ex - dx * pos, by = ey - dy * pos;
                 const b2x = ex - dx * (pos + stepPx * 1.6), b2y = ey - dy * (pos + stepPx * 1.6);
-                s += `<polygon points="${bx.toFixed(1)},${by.toFixed(1)} ${(bx + px * 10).toFixed(1)},${(by + py * 10).toFixed(1)} ${b2x.toFixed(1)},${b2y.toFixed(1)}" fill="#334155"/>`;
+                s += `<polygon points="${bx.toFixed(1)},${by.toFixed(1)} ${(bx + px * 10).toFixed(1)},${(by + py * 10).toFixed(1)} ${b2x.toFixed(1)},${b2y.toFixed(1)}" fill="${BC}"/>`;
                 pos += stepPx * 2; rem -= 50;
             }
             while (rem >= 10) {
                 const bx = ex - dx * pos, by = ey - dy * pos;
-                s += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${(bx + px * 10).toFixed(1)}" y2="${(by + py * 10).toFixed(1)}" stroke="#334155" stroke-width="1.1"/>`;
+                s += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${(bx + px * 10).toFixed(1)}" y2="${(by + py * 10).toFixed(1)}" stroke="${BC}" stroke-width="1.2"/>`;
                 pos += stepPx; rem -= 10;
             }
             if (rem >= 5) {
                 const bx = ex - dx * Math.max(pos, stepPx), by = ey - dy * Math.max(pos, stepPx);
-                s += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${(bx + px * 5.5).toFixed(1)}" y2="${(by + py * 5.5).toFixed(1)}" stroke="#334155" stroke-width="1.1"/>`;
+                s += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${(bx + px * 5.5).toFixed(1)}" y2="${(by + py * 5.5).toFixed(1)}" stroke="${BC}" stroke-width="1.2"/>`;
             }
             return s;
+        }
+
+        // Pressure at which the environmental temperature first crosses `target` (degC),
+        // interpolated in log-p. Used for the freezing level and the charging layer.
+        function skCrossP(T, target) {
+            for (let i = 0; i < T.length - 1; i++) {
+                const a = T[i], b = T[i + 1];
+                if ((a[0] >= target && b[0] <= target) || (a[0] <= target && b[0] >= target)) {
+                    if (a[0] === b[0]) return a[1];
+                    const f = (a[0] - target) / (a[0] - b[0]);
+                    return Math.exp(Math.log(a[1]) + f * (Math.log(b[1]) - Math.log(a[1])));
+                }
+            }
+            return null;
+        }
+
+        // The 0 to -20 C layer is where graupel/ice collisions charge a cloud, so its depth
+        // and height are what a launch forecaster reads a sounding for. Shaded as a band and
+        // labelled with its thickness in kft.
+        function skChargingLayer(T, lv) {
+            const p0 = skCrossP(T, 0), p20 = skCrossP(T, -20);
+            if (!p0 || !p20) return '';
+            const yTop = skY(p20), yBot = skY(p0);
+            const hAt = (p) => {
+                for (let i = 0; i < lv.length - 1; i++) {
+                    const a = lv[i], b = lv[i + 1];
+                    if (a[1] == null || b[1] == null) continue;
+                    if (a[0] >= p && p >= b[0]) {
+                        const f = (Math.log(a[0]) - Math.log(p)) / (Math.log(a[0]) - Math.log(b[0]));
+                        return a[1] + f * (b[1] - a[1]);
+                    }
+                }
+                return null;
+            };
+            const hTop = hAt(p20), hBot = hAt(p0);
+            const depth = (hTop != null && hBot != null) ? ((hTop - hBot) / 1000).toFixed(1) : null;
+            let g = `<rect x="${SK_L}" y="${yTop.toFixed(1)}" width="${SK_W + SK_SKEW}" height="${(yBot - yTop).toFixed(1)}" fill="#38bdf8" opacity="0.10"/>`;
+            g += `<line x1="${SK_L}" y1="${yBot.toFixed(1)}" x2="${SK_L + SK_W + SK_SKEW}" y2="${yBot.toFixed(1)}" stroke="#0284c7" stroke-width="1.1" opacity="0.9"/>`;
+            g += `<line x1="${SK_L}" y1="${yTop.toFixed(1)}" x2="${SK_L + SK_W + SK_SKEW}" y2="${yTop.toFixed(1)}" stroke="#0284c7" stroke-width="1.1" opacity="0.9" stroke-dasharray="5 4"/>`;
+            const mid = (yTop + yBot) / 2;
+            g += `<text x="${SK_L + SK_W + SK_SKEW - 6}" y="${mid.toFixed(1)}" text-anchor="end" font-size="9.5" font-weight="700" fill="#0369a1">charging layer${depth ? ' \u00b7 ' + depth + ' kft' : ''}</text>`;
+            g += `<text x="${SK_L + SK_W + SK_SKEW - 6}" y="${(yBot - 4).toFixed(1)}" text-anchor="end" font-size="9" fill="#0284c7">0\u00b0C ${Math.round(p0)} hPa${hBot != null ? ' \u00b7 ' + (hBot / 1000).toFixed(1) + ' kft' : ''}</text>`;
+            return g;
+        }
+
+        // Hodograph: the wind vectors through the lowest ~8 km, which is where the turning
+        // that matters for storm mode and for transporting an anvil actually happens.
+        function skHodograph(lv, x0, y0, r) {
+            const pts = [];
+            lv.forEach(row => {
+                const [p, h, t, d, dir, spd] = row;
+                if (dir == null || spd == null || h == null) return;
+                if (h > 26000) return;
+                const rad = dir * Math.PI / 180;
+                pts.push({ u: -spd * Math.sin(rad), v: -spd * Math.cos(rad), h: h });
+            });
+            if (pts.length < 3) return '';
+            const maxS = Math.max(30, Math.ceil(Math.max(...pts.map(q => Math.hypot(q.u, q.v))) / 10) * 10);
+            const sc = r / maxS;
+            let g = `<g transform="translate(${x0},${y0})">`;
+            g += `<rect x="${-r - 12}" y="${-r - 12}" width="${2 * r + 24}" height="${2 * r + 30}" fill="#fff" stroke="#cbd5e1" stroke-width="0.8" rx="4"/>`;
+            for (let ring = 10; ring <= maxS; ring += 10) {
+                g += `<circle cx="0" cy="0" r="${(ring * sc).toFixed(1)}" fill="none" stroke="#e2e8f0" stroke-width="0.7"/>`;
+                g += `<text x="2" y="${(-ring * sc - 1.5).toFixed(1)}" font-size="7.5" fill="#94a3b8">${ring}</text>`;
+            }
+            g += `<line x1="${-r}" y1="0" x2="${r}" y2="0" stroke="#cbd5e1" stroke-width="0.7"/>`;
+            g += `<line x1="0" y1="${-r}" x2="0" y2="${r}" stroke="#cbd5e1" stroke-width="0.7"/>`;
+            // Colour the trace by height so the low-level turning is separable by eye.
+            const seg = (h) => h < 3300 ? '#dc2626' : h < 9800 ? '#ea580c' : '#2563eb';
+            for (let i = 0; i < pts.length - 1; i++) {
+                const a = pts[i], b = pts[i + 1];
+                g += `<line x1="${(a.u * sc).toFixed(1)}" y1="${(-a.v * sc).toFixed(1)}" x2="${(b.u * sc).toFixed(1)}" y2="${(-b.v * sc).toFixed(1)}" stroke="${seg(a.h)}" stroke-width="2" stroke-linecap="round"/>`;
+            }
+            const s0 = pts[0];
+            g += `<circle cx="${(s0.u * sc).toFixed(1)}" cy="${(-s0.v * sc).toFixed(1)}" r="3" fill="#111827"/>`;
+            g += `<text x="0" y="${r + 20}" text-anchor="middle" font-size="8.5" fill="#64748b">hodograph (kt) \u00b7 sfc\u20131 / 1\u20133 / 3\u20138 km</text>`;
+            g += `</g>`;
+            return g;
         }
 
         // --- the plot --------------------------------------------------------------------
@@ -1990,6 +2076,24 @@
                 <defs><clipPath id="skclip"><rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}"/></clipPath></defs>
                 <rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}" fill="#fff" stroke="#94a3b8" stroke-width="1"/>`;
             s += skBackground();
+            s += skChargingLayer(T, lv);
+
+            // Height axis (kft MSL) down the left edge, beside the pressure labels. Pressure
+            // is what the model speaks; height is what a pilot and a launch console speak.
+            [[1000, null], [850, null], [700, null], [500, null], [400, null], [300, null], [250, null], [200, null]].forEach(([pp]) => {
+                let hh = null;
+                for (let i = 0; i < lv.length - 1; i++) {
+                    const a = lv[i], b = lv[i + 1];
+                    if (a[1] == null || b[1] == null) continue;
+                    if (a[0] >= pp && pp >= b[0]) {
+                        const f = (Math.log(a[0]) - Math.log(pp)) / (Math.log(a[0]) - Math.log(b[0]));
+                        hh = a[1] + f * (b[1] - a[1]);
+                        break;
+                    }
+                }
+                if (hh == null) return;
+                s += `<text x="${SK_L - 5}" y="${(skY(pp) + 12).toFixed(1)}" text-anchor="end" font-size="8" fill="#a3a3a3">${(hh / 1000).toFixed(0)}kft</text>`;
+            });
 
             // shade CAPE / CIN between the parcel and the environment
             if (parcel.length) {
@@ -2031,8 +2135,12 @@
                 s += `<path clip-path="url(#skclip)" d="${skPath(parcel)}" stroke="#111827" stroke-width="1.3" fill="none" stroke-dasharray="5 4"/>`;
             }
 
-            s += `<path clip-path="url(#skclip)" d="${skPath(Td)}" stroke="#16a34a" stroke-width="2.2" fill="none"/>`;
-            s += `<path clip-path="url(#skclip)" d="${skPath(T)}" stroke="#dc2626" stroke-width="2.2" fill="none"/>`;
+            // White casing under each trace so it stays readable where it crosses the
+            // adiabats and the shaded areas.
+            s += `<path clip-path="url(#skclip)" d="${skPath(Td)}" stroke="#ffffff" stroke-width="5" fill="none" stroke-linejoin="round" opacity="0.85"/>`;
+            s += `<path clip-path="url(#skclip)" d="${skPath(T)}" stroke="#ffffff" stroke-width="5" fill="none" stroke-linejoin="round" opacity="0.85"/>`;
+            s += `<path clip-path="url(#skclip)" d="${skPath(Td)}" stroke="#15803d" stroke-width="2.6" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`;
+            s += `<path clip-path="url(#skclip)" d="${skPath(T)}" stroke="#dc2626" stroke-width="2.6" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`;
 
             // level markers for LCL / LFC / EL
             [['lcl_p', 'LCL', '#0891b2'], ['lfc_p', 'LFC', '#b45309'], ['el_p', 'EL', '#7c3aed']].forEach(([k, lab, col]) => {
@@ -2056,6 +2164,8 @@
             });
 
             s += `<text x="${SK_L + (SK_W + SK_SKEW) / 2}" y="${SK_T0 + SK_H + 28}" text-anchor="middle" font-size="10" fill="#64748b">Temperature (\u00b0C)</text>`;
+            // Hodograph tucked into the dry upper-left corner, where the traces never reach.
+            s += skHodograph(lv, SK_L + 96, SK_T0 + 86, 62);
             s += `</svg>`;
             return s;
         }
