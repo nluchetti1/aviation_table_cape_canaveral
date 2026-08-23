@@ -2590,9 +2590,10 @@
                 <input type="range" min="0" max="${hours.length - 1}" value="${skewHourIdx}"
                        oninput="skewHourIdx=parseInt(this.value,10); skRenderCompare();" style="width:100%; margin-bottom:4px;">
                 <div style="display:flex; justify-content:center; gap:8px; margin-bottom:10px;">
-                    <button class="dprog-btn" onclick="skewHourIdx=Math.max(0,skewHourIdx-1); skRenderCompare();">&laquo; Prev</button>
+                    <button class="dprog-btn" onclick="skStepHour(-1)">&laquo; Prev</button>
                     <span style="font-size:0.78rem; color:#94a3b8; align-self:center;">hour ${skewHourIdx + 1} of ${hours.length}</span>
-                    <button class="dprog-btn" onclick="skewHourIdx=Math.min(${hours.length - 1},skewHourIdx+1); skRenderCompare();">Next &raquo;</button>
+                    <button class="dprog-btn" onclick="skStepHour(1)">Next &raquo;</button>
+                    <span style="font-size:0.72rem; color:#cbd5e1; align-self:center; margin-left:6px;" title="Arrow keys step the hour; Home/End jump to the ends; Esc closes">&#8592; &#8594; keys</span>
                 </div>
                 ${note}${cnote}
                 <div style="display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap;">
@@ -2665,9 +2666,10 @@
                 <input type="range" min="0" max="${hours.length - 1}" value="${skewHourIdx}"
                        oninput="skewHourIdx=parseInt(this.value,10); skRender();" style="width:100%; margin-bottom:4px;">
                 <div style="display:flex; justify-content:center; gap:8px; margin-bottom:10px;">
-                    <button class="dprog-btn" onclick="skewHourIdx=Math.max(0,skewHourIdx-1); skRender();">&laquo; Prev</button>
+                    <button class="dprog-btn" onclick="skStepHour(-1)">&laquo; Prev</button>
                     <span style="font-size:0.78rem; color:#94a3b8; align-self:center;">hour ${skewHourIdx + 1} of ${hours.length}</span>
-                    <button class="dprog-btn" onclick="skewHourIdx=Math.min(${hours.length - 1},skewHourIdx+1); skRender();">Next &raquo;</button>
+                    <button class="dprog-btn" onclick="skStepHour(1)">Next &raquo;</button>
+                    <span style="font-size:0.72rem; color:#cbd5e1; align-self:center; margin-left:6px;" title="Arrow keys step the hour; Home/End jump to the ends; Esc closes">&#8592; &#8594; keys</span>
                 </div>
                 ${warn}
                 <div style="display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap;">
@@ -2677,6 +2679,51 @@
         }
 
         function closeSkew() { document.getElementById('skModal').style.display = 'none'; }
+
+        // ---- keyboard navigation ---------------------------------------------------------
+        // Left/Right step the forecast hour, Home/End jump to the ends, Escape closes.
+        //
+        // Two things this has to get right:
+        //   1. NO DOUBLE-STEPPING. An <input type="range"> already moves itself on arrow keys
+        //      when focused, so if the event came from the slider (or any other control) this
+        //      handler stands down and lets the native behaviour run. Handling both would
+        //      advance two hours per press.
+        //   2. The re-render replaces the slider element, so focus cannot be relied on to
+        //      persist. The listener is on `document` and attached once, not per render.
+        function skStepHour(delta) {
+            const hours = skewCompare ? skCmpHours() : skHoursFor(skewModel);
+            if (!hours.length) return;
+            const next = Math.max(0, Math.min(skewHourIdx + delta, hours.length - 1));
+            if (next === skewHourIdx) return;      // already at an end; nothing to redraw
+            skewHourIdx = next;
+            if (skewCompare) skRenderCompare(); else skRender();
+        }
+        function skJumpHour(which) {
+            const hours = skewCompare ? skCmpHours() : skHoursFor(skewModel);
+            if (!hours.length) return;
+            skewHourIdx = (which === 'end') ? hours.length - 1 : 0;
+            if (skewCompare) skRenderCompare(); else skRender();
+        }
+
+        document.addEventListener('keydown', (e) => {
+            const sk = document.getElementById('skModal');
+            if (!sk || sk.style.display !== 'flex') return;
+            if (e.altKey || e.ctrlKey || e.metaKey) return;
+            // Let form controls keep their own key behaviour (the range input steps itself,
+            // and a focused <select> uses arrows to change the model).
+            const t = e.target;
+            if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
+            switch (e.key) {
+                case 'ArrowLeft':  e.preventDefault(); skStepHour(-1); break;
+                case 'ArrowRight': e.preventDefault(); skStepHour(1); break;
+                case 'Home':       e.preventDefault(); skJumpHour('start'); break;
+                case 'End':        e.preventDefault(); skJumpHour('end'); break;
+                case 'Escape':     e.preventDefault(); closeSkew(); break;
+                default: break;
+            }
+        });
+
+
 
         window.onload = initDashboard;
     </script>
