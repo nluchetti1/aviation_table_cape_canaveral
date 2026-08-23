@@ -2011,38 +2011,31 @@
             return g;
         }
 
-        // Hodograph: the wind vectors through the lowest ~8 km, which is where the turning
-        // that matters for storm mode and for transporting an anvil actually happens.
-        function skHodograph(lv, x0, y0, r) {
-            const pts = [];
-            lv.forEach(row => {
-                const [p, h, t, d, dir, spd] = row;
-                if (dir == null || spd == null || h == null) return;
-                if (h > 26000) return;
-                const rad = dir * Math.PI / 180;
-                pts.push({ u: -spd * Math.sin(rad), v: -spd * Math.cos(rad), h: h });
+        // Sub-labels for the LLCC isotherm heights inside the charging layer. These are the
+        // same -5/-10/-15/-20 C heights the matrix carries as columns, so the sounding and
+        // the table read the same numbers. Kept deliberately faint: they are reference marks
+        // inside an already-shaded band, not the point of the plot.
+        function skChargeIsotherms(T, lv) {
+            const hAt = (p) => {
+                for (let i = 0; i < lv.length - 1; i++) {
+                    const a = lv[i], b = lv[i + 1];
+                    if (a[1] == null || b[1] == null) continue;
+                    if (a[0] >= p && p >= b[0]) {
+                        const f = (Math.log(a[0]) - Math.log(p)) / (Math.log(a[0]) - Math.log(b[0]));
+                        return a[1] + f * (b[1] - a[1]);
+                    }
+                }
+                return null;
+            };
+            let g = '';
+            [-5, -10, -15, -20].forEach(tt => {
+                const p = skCrossP(T, tt);
+                if (!p || p < SK_P_TOP || p > SK_P_BOT) return;
+                const y = skY(p);
+                const h = hAt(p);
+                g += `<line x1="${SK_L}" y1="${y.toFixed(1)}" x2="${SK_L + SK_W + SK_SKEW}" y2="${y.toFixed(1)}" stroke="#0284c7" stroke-width="0.7" stroke-dasharray="2 5" opacity="0.42"/>`;
+                g += `<text x="${SK_L + 5}" y="${(y - 2.5).toFixed(1)}" font-size="8" fill="#0284c7" opacity="0.62">\u2212${Math.abs(tt)}\u00b0C${h != null ? '  ' + (h / 1000).toFixed(1) + ' kft' : ''}</text>`;
             });
-            if (pts.length < 3) return '';
-            const maxS = Math.max(30, Math.ceil(Math.max(...pts.map(q => Math.hypot(q.u, q.v))) / 10) * 10);
-            const sc = r / maxS;
-            let g = `<g transform="translate(${x0},${y0})">`;
-            g += `<rect x="${-r - 12}" y="${-r - 12}" width="${2 * r + 24}" height="${2 * r + 30}" fill="#fff" stroke="#cbd5e1" stroke-width="0.8" rx="4"/>`;
-            for (let ring = 10; ring <= maxS; ring += 10) {
-                g += `<circle cx="0" cy="0" r="${(ring * sc).toFixed(1)}" fill="none" stroke="#e2e8f0" stroke-width="0.7"/>`;
-                g += `<text x="2" y="${(-ring * sc - 1.5).toFixed(1)}" font-size="7.5" fill="#94a3b8">${ring}</text>`;
-            }
-            g += `<line x1="${-r}" y1="0" x2="${r}" y2="0" stroke="#cbd5e1" stroke-width="0.7"/>`;
-            g += `<line x1="0" y1="${-r}" x2="0" y2="${r}" stroke="#cbd5e1" stroke-width="0.7"/>`;
-            // Colour the trace by height so the low-level turning is separable by eye.
-            const seg = (h) => h < 3300 ? '#dc2626' : h < 9800 ? '#ea580c' : '#2563eb';
-            for (let i = 0; i < pts.length - 1; i++) {
-                const a = pts[i], b = pts[i + 1];
-                g += `<line x1="${(a.u * sc).toFixed(1)}" y1="${(-a.v * sc).toFixed(1)}" x2="${(b.u * sc).toFixed(1)}" y2="${(-b.v * sc).toFixed(1)}" stroke="${seg(a.h)}" stroke-width="2" stroke-linecap="round"/>`;
-            }
-            const s0 = pts[0];
-            g += `<circle cx="${(s0.u * sc).toFixed(1)}" cy="${(-s0.v * sc).toFixed(1)}" r="3" fill="#111827"/>`;
-            g += `<text x="0" y="${r + 20}" text-anchor="middle" font-size="8.5" fill="#64748b">hodograph (kt) \u00b7 sfc\u20131 / 1\u20133 / 3\u20138 km</text>`;
-            g += `</g>`;
             return g;
         }
 
@@ -2077,6 +2070,7 @@
                 <rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}" fill="#fff" stroke="#94a3b8" stroke-width="1"/>`;
             s += skBackground();
             s += skChargingLayer(T, lv);
+            s += skChargeIsotherms(T, lv);
 
             // Height axis (kft MSL) down the left edge, beside the pressure labels. Pressure
             // is what the model speaks; height is what a pilot and a launch console speak.
@@ -2164,8 +2158,6 @@
             });
 
             s += `<text x="${SK_L + (SK_W + SK_SKEW) / 2}" y="${SK_T0 + SK_H + 28}" text-anchor="middle" font-size="10" fill="#64748b">Temperature (\u00b0C)</text>`;
-            // Hodograph tucked into the dry upper-left corner, where the traces never reach.
-            s += skHodograph(lv, SK_L + 96, SK_T0 + 86, 62);
             s += `</svg>`;
             return s;
         }
@@ -2248,7 +2240,335 @@
             skRender();
         }
 
+
+        // ---- multi-model overlay -----------------------------------------------------
+        // Fixed model -> colour map. Tied to the model, never to selection order, so a trace
+        // never changes colour when the selection changes.
+        const SK_CMP_COLORS = {
+            hrrr: '#dc2626', rap: '#ea580c', gfs: '#2563eb',
+            ecmwf: '#7c3aed', rrfs: '#0891b2', refs: '#15803d',
+        };
+        let skewCompare = false;
+        let skewCmpModels = [];      // model keys currently ticked
+
+        function skCmpColor(m) { return SK_CMP_COLORS[m] || '#475569'; }
+
+        // Height (ft) at a pressure, interpolated in log-p from the level list.
+        function skHeightAt(lv, p) {
+            for (let i = 0; i < lv.length - 1; i++) {
+                const a = lv[i], b = lv[i + 1];
+                if (a[1] == null || b[1] == null) continue;
+                if (a[0] >= p && p >= b[0]) {
+                    const f = (Math.log(a[0]) - Math.log(p)) / (Math.log(a[0]) - Math.log(b[0]));
+                    return a[1] + f * (b[1] - a[1]);
+                }
+            }
+            return null;
+        }
+
+        // Charging-layer geometry for one profile: freezing level, -20 C level, and the depth
+        // between them, all in kft. This is the LLCC-relevant read and the main reason to
+        // compare soundings side by side rather than one at a time.
+        function skChargeStats(entry) {
+            const T = [];
+            (entry.lv || []).forEach(r => { if (r[0] != null && r[2] != null) T.push([r[2], r[0]]); });
+            if (T.length < 3) return {};
+            const p0 = skCrossP(T, 0), p20 = skCrossP(T, -20);
+            const h0 = p0 ? skHeightAt(entry.lv, p0) : null;
+            const h20 = p20 ? skHeightAt(entry.lv, p20) : null;
+            return {
+                t0: h0 == null ? null : h0 / 1000,
+                t20: h20 == null ? null : h20 / 1000,
+                depth: (h0 != null && h20 != null) ? (h20 - h0) / 1000 : null,
+            };
+        }
+
+        // Every forecast hour present in ANY selected model.
+        function skCmpHours() {
+            const set = new Set();
+            skewCmpModels.forEach(m => skHoursFor(m).forEach(h => set.add(h)));
+            return Array.from(set).sort((a, b) => {
+                const [da, ha] = a.split('/').map(Number), [db, hb] = b.split('/').map(Number);
+                let fa = da, fb = db;
+                if (Math.abs(da - db) > 15) { if (da < db) fa += 32; else fb += 32; }
+                return fa !== fb ? fa - fb : ha - hb;
+            });
+        }
+
+        function skewCompareSVG(picked) {
+            // picked: [{model, entry}]
+            const barbCols = picked.length;
+            const wTop = SK_L + SK_W + SK_SKEW + 16;
+            const totalW = wTop + Math.max(46, barbCols * 26 + 20);
+            let s = `<svg viewBox="0 0 ${totalW} ${SK_T0 + SK_H + 34}" width="100%" style="max-width:860px;">
+                <defs><clipPath id="skclip"><rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}"/></clipPath></defs>
+                <rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}" fill="#fff" stroke="#94a3b8" stroke-width="1"/>`;
+            s += skBackground();
+
+            // Per-model freezing / -20 C tick marks at the left edge, in the model's colour.
+            // A shaded band is meaningless with several models, but the LEVELS still matter,
+            // so each model gets a short tick instead of a full-width line.
+            picked.forEach((pk, idx) => {
+                const T = [];
+                (pk.entry.lv || []).forEach(r => { if (r[0] != null && r[2] != null) T.push([r[2], r[0]]); });
+                if (T.length < 3) return;
+                [[0, 5], [-20, 5]].forEach(([tt, len]) => {
+                    const p = skCrossP(T, tt);
+                    if (!p || p < SK_P_TOP || p > SK_P_BOT) return;
+                    const y = skY(p);
+                    const x = SK_L + 2 + idx * 7;
+                    s += `<line x1="${x}" y1="${(y - len).toFixed(1)}" x2="${x}" y2="${(y + len).toFixed(1)}" stroke="${skCmpColor(pk.model)}" stroke-width="2.4" opacity="0.85"/>`;
+                });
+            });
+
+            // Traces: temperature solid, dewpoint dashed, one colour per model.
+            picked.forEach(pk => {
+                const T = [], Td = [];
+                (pk.entry.lv || []).forEach(r => {
+                    const [p, h, t, d] = r;
+                    if (p == null || t == null || p < SK_P_TOP) return;
+                    T.push([t, p]);
+                    if (d != null) Td.push([Math.min(d, t), p]);
+                });
+                if (T.length < 3) return;
+                const c = skCmpColor(pk.model);
+                s += `<path clip-path="url(#skclip)" d="${skPath(Td)}" stroke="${c}" stroke-width="1.7" fill="none" stroke-dasharray="5 4" opacity="0.85" stroke-linejoin="round"/>`;
+                s += `<path clip-path="url(#skclip)" d="${skPath(T)}" stroke="${c}" stroke-width="2.3" fill="none" stroke-linejoin="round" stroke-linecap="round"/>`;
+            });
+
+            // Legend, top-left inside the frame where the traces are always cold and far right.
+            const lw = 104, lh = 16 + picked.length * 14;
+            s += `<rect x="${SK_L + 8}" y="${SK_T0 + 8}" width="${lw}" height="${lh}" fill="#ffffff" stroke="#cbd5e1" stroke-width="0.8" rx="4" opacity="0.94"/>`;
+            picked.forEach((pk, i) => {
+                const yy = SK_T0 + 22 + i * 14;
+                s += `<line x1="${SK_L + 15}" y1="${yy - 3}" x2="${SK_L + 31}" y2="${yy - 3}" stroke="${skCmpColor(pk.model)}" stroke-width="2.3"/>`;
+                s += `<text x="${SK_L + 36}" y="${yy}" font-size="9" fill="${skCmpColor(pk.model)}" font-weight="700">${ltLabel(pk.model)}</text>`;
+            });
+            s += `<text x="${SK_L + 15}" y="${SK_T0 + 22 + picked.length * 14 + 1}" font-size="7.5" fill="#94a3b8">solid T \u00b7 dashed Td</text>`;
+
+            // Wind barbs, one column per model.
+            picked.forEach((pk, idx) => {
+                const x = wTop + idx * 26;
+                const c = skCmpColor(pk.model);
+                s += `<line x1="${x}" y1="${SK_T0}" x2="${x}" y2="${SK_T0 + SK_H}" stroke="#e2e8f0" stroke-width="0.8"/>`;
+                s += `<text x="${x}" y="${SK_T0 - 2}" text-anchor="middle" font-size="7.5" font-weight="700" fill="${c}">${ltLabel(pk.model).slice(0, 5)}</text>`;
+                let lastY = -99;
+                (pk.entry.lv || []).forEach(r => {
+                    const [p, h, t, d, dir, spd] = r;
+                    if (p == null || p < SK_P_TOP || dir == null || spd == null) return;
+                    const y = skY(p);
+                    if (Math.abs(y - lastY) < 26) return;
+                    lastY = y;
+                    // Shorter barbs in compare mode so adjacent columns don't collide.
+                    s += skBarbShort(x, y, dir, spd, c);
+                });
+            });
+
+            s += `<text x="${SK_L + (SK_W + SK_SKEW) / 2}" y="${SK_T0 + SK_H + 28}" text-anchor="middle" font-size="10" fill="#64748b">Temperature (\u00b0C)</text>`;
+            s += `</svg>`;
+            return s;
+        }
+
+        // Compact barb for the multi-model columns: same encoding, shorter staff.
+        function skBarbShort(x, y, dir, spd, col) {
+            if (dir == null || spd == null) return '';
+            if (spd < 2.5) return `<circle cx="${x}" cy="${y}" r="2.6" fill="none" stroke="${col}" stroke-width="1"/>`;
+            const L = 17, st = 3.2, fl = 7;
+            const rad = (dir + 180) * Math.PI / 180;
+            const dx = Math.sin(rad), dy = -Math.cos(rad);
+            const ex = x + dx * L, ey = y + dy * L;
+            let s = `<line x1="${x}" y1="${y}" x2="${ex.toFixed(1)}" y2="${ey.toFixed(1)}" stroke="${col}" stroke-width="1"/>`;
+            const px = -dy, py = dx;
+            let rem = Math.round(spd / 5) * 5, pos = 0;
+            while (rem >= 50) {
+                const bx = ex - dx * pos, by = ey - dy * pos;
+                const b2x = ex - dx * (pos + st * 1.5), b2y = ey - dy * (pos + st * 1.5);
+                s += `<polygon points="${bx.toFixed(1)},${by.toFixed(1)} ${(bx + px * fl).toFixed(1)},${(by + py * fl).toFixed(1)} ${b2x.toFixed(1)},${b2y.toFixed(1)}" fill="${col}"/>`;
+                pos += st * 2; rem -= 50;
+            }
+            while (rem >= 10) {
+                const bx = ex - dx * pos, by = ey - dy * pos;
+                s += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${(bx + px * fl).toFixed(1)}" y2="${(by + py * fl).toFixed(1)}" stroke="${col}" stroke-width="1"/>`;
+                pos += st; rem -= 10;
+            }
+            if (rem >= 5) {
+                const bx = ex - dx * Math.max(pos, st), by = ey - dy * Math.max(pos, st);
+                s += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${(bx + px * fl * 0.55).toFixed(1)}" y2="${(by + py * fl * 0.55).toFixed(1)}" stroke="${col}" stroke-width="1"/>`;
+            }
+            return s;
+        }
+
+        // Comparison table: parameters down, models across, with a spread column. Spread is
+        // the plain max-minus-min across the models that actually reported a value, and it is
+        // shaded once it passes a threshold that means something for that field.
+        const SK_CMP_ROWS = [
+            { k: 'sbcape', lab: 'SBCAPE', unit: '', dp: 0, watch: 500, split: 1200, grp: 'Parcel' },
+            { k: 'sbcin', lab: 'SBCIN', unit: '', dp: 0, watch: 50, split: 125 },
+            { k: 'mlcape', lab: 'MLCAPE', unit: '', dp: 0, watch: 500, split: 1200 },
+            { k: 'lcl_p', lab: 'LCL', unit: ' hPa', dp: 0, watch: 25, split: 50, grp: 'Levels' },
+            { k: 'lfc_p', lab: 'LFC', unit: ' hPa', dp: 0, watch: 50, split: 100 },
+            { k: 'el_p', lab: 'EL', unit: ' hPa', dp: 0, watch: 50, split: 100 },
+            { k: '_t0', lab: '0\u00b0C hgt', unit: ' kft', dp: 1, watch: 1.0, split: 2.0, grp: 'Charging layer' },
+            { k: '_t20', lab: '\u221220\u00b0C hgt', unit: ' kft', dp: 1, watch: 1.0, split: 2.0 },
+            { k: '_depth', lab: 'depth', unit: ' kft', dp: 1, watch: 1.0, split: 2.0 },
+            { k: 'k_index', lab: 'K-Index', unit: '', dp: 1, watch: 5, split: 10, grp: 'Indices' },
+            { k: 'lifted_index', lab: 'Lifted Index', unit: '', dp: 1, watch: 2, split: 4 },
+            { k: 'thompson', lab: 'Thompson', unit: '', dp: 1, watch: 5, split: 10 },
+            { k: 'pwat_in', lab: 'PWAT', unit: ' in', dp: 2, watch: 0.25, split: 0.5 },
+            { k: 'rh_700_500', lab: '700\u2013500 RH', unit: '%', dp: 0, watch: 10, split: 20 },
+        ];
+
+        function skCompareTable(picked) {
+            const vals = {};
+            picked.forEach(pk => {
+                const p = pk.entry.p || {};
+                const cs = skChargeStats(pk.entry);
+                vals[pk.model] = Object.assign({}, p, { _t0: cs.t0, _t20: cs.t20, _depth: cs.depth });
+            });
+            const head = picked.map(pk =>
+                `<th style="padding:4px 5px; text-align:right; color:${skCmpColor(pk.model)}; font-size:0.74rem; font-weight:700;">${ltLabel(pk.model)}</th>`).join('');
+            let rows = '';
+            SK_CMP_ROWS.forEach(r => {
+                if (r.grp) {
+                    rows += `<tr><td colspan="${picked.length + 2}" style="padding:7px 0 2px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0; font-size:0.76rem;">${r.grp}</td></tr>`;
+                }
+                const got = picked.map(pk => {
+                    const v = vals[pk.model][r.k];
+                    return (v == null || isNaN(v)) ? null : Number(v);
+                });
+                const real = got.filter(v => v != null);
+                const spread = real.length >= 2 ? Math.max(...real) - Math.min(...real) : null;
+                const cells = got.map(v =>
+                    `<td style="padding:3px 5px; text-align:right; font-weight:600;">${v == null ? '\u2014' : v.toFixed(r.dp) + r.unit}</td>`).join('');
+                let sp = '<span style="color:#cbd5e1;">\u2014</span>';
+                if (spread != null) {
+                    const sty = spread >= r.split ? 'background:#fee2e2; color:#991b1b;'
+                              : spread >= r.watch ? 'background:#fef3c7; color:#78350f;'
+                              : 'color:#94a3b8;';
+                    sp = `<span style="${sty} padding:1px 6px; border-radius:9px; font-weight:600;">${spread.toFixed(r.dp)}</span>`;
+                }
+                rows += `<tr><td style="padding:3px 6px 3px 0; color:#475569; white-space:nowrap;">${r.lab}</td>${cells}<td style="padding:3px 0 3px 6px; text-align:right; font-size:0.76rem;">${sp}</td></tr>`;
+            });
+            return `<table style="width:100%; border-collapse:collapse; font-size:0.8rem;">
+                <thead><tr><th></th>${head}<th style="padding:4px 0 4px 6px; text-align:right; color:#94a3b8; font-size:0.72rem;">spread</th></tr></thead>
+                <tbody>${rows}</tbody></table>
+                <div style="font-size:0.7rem; color:#94a3b8; margin-top:8px;">
+                    Spread is max minus min across the models reporting a value. Amber and red mark
+                    differences large enough to change the read; thresholds are per-field, not a
+                    single percentage. Parcel theory is computed server-side per model, so a spread
+                    here is genuine model disagreement rather than a difference in method.
+                </div>`;
+        }
+
+        function skRenderCompare() {
+            const body = document.getElementById('skBody');
+            const all = Object.keys(soundings.models);
+            const boxes = all.map(m => `
+                <label style="display:inline-flex; align-items:center; gap:4px; font-size:0.8rem;
+                       padding:2px 7px; border:1px solid ${skewCmpModels.includes(m) ? skCmpColor(m) : '#cbd5e1'};
+                       border-radius:14px; cursor:pointer; color:${skewCmpModels.includes(m) ? skCmpColor(m) : '#64748b'};
+                       font-weight:${skewCmpModels.includes(m) ? 700 : 400};">
+                    <input type="checkbox" ${skewCmpModels.includes(m) ? 'checked' : ''}
+                           onchange="skToggleCmp('${m}')" style="margin:0; width:13px; height:13px;">
+                    ${ltLabel(m)}</label>`).join(' ');
+
+            const modelOpts = all.map(m => `<option value="${m}">${ltLabel(m)}</option>`).join('')
+                + `<option value="__cmp__" selected>\u2696 Compare models\u2026</option>`;
+
+            if (skewCmpModels.length < 2) {
+                body.innerHTML = `
+                    <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap;">
+                        <label style="font-size:0.85rem; font-weight:600;">Model:</label>
+                        <select onchange="skPickModel(this.value)" style="padding:3px 8px; border:1px solid #cbd5e1; border-radius:6px;">${modelOpts}</select>
+                    </div>
+                    <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px;">${boxes}</div>
+                    <div style="padding:18px; color:#b45309;">Tick at least two models to overlay.</div>`;
+                return;
+            }
+
+            const hours = skCmpHours();
+            if (!hours.length) {
+                body.innerHTML = '<div style="padding:20px; color:#b45309;">No profiles for the selected models.</div>';
+                return;
+            }
+            skewHourIdx = Math.max(0, Math.min(skewHourIdx, hours.length - 1));
+            const hk = hours[skewHourIdx];
+
+            const picked = [];
+            const missing = [];
+            skewCmpModels.forEach(m => {
+                const e = (soundings.models[m] || {})[hk];
+                if (e && e.lv && e.lv.length >= 3) picked.push({ model: m, entry: e });
+                else missing.push(m);
+            });
+
+            if (!picked.length) {
+                body.innerHTML = `<div style="padding:20px; color:#b45309;">None of the selected models has a profile at ${hk}Z.</div>`;
+                return;
+            }
+
+            const note = missing.length
+                ? `<div style="background:#fef3c7; color:#78350f; padding:5px 8px; border-radius:4px; font-size:0.76rem; margin-bottom:8px;">
+                     No profile at ${hk}Z for <strong>${missing.map(ltLabel).join(', ')}</strong> — that model runs shorter
+                     than the others, so this hour is beyond its range rather than missing data.</div>`
+                : '';
+            const coarse = picked.filter(pk => pk.entry.coarse);
+            const cnote = coarse.length
+                ? `<div style="background:#ede9fe; color:#4c1d95; padding:5px 8px; border-radius:4px; font-size:0.76rem; margin-bottom:8px;">
+                     <strong>${coarse.map(pk => ltLabel(pk.model)).join(', ')}</strong> ${coarse.length === 1 ? 'is' : 'are'} on
+                     mandatory isobaric levels. Vertically coarse columns will look smoother than the others here —
+                     that is resolution, not a genuinely different airmass.</div>`
+                : '';
+
+            body.innerHTML = `
+                <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px; flex-wrap:wrap;">
+                    <label style="font-size:0.85rem; font-weight:600;">Model:</label>
+                    <select onchange="skPickModel(this.value)" style="padding:3px 8px; border:1px solid #cbd5e1; border-radius:6px;">${modelOpts}</select>
+                    <span style="margin-left:auto; font-weight:700; color:#2563eb;">${hk}Z</span>
+                </div>
+                <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;">${boxes}</div>
+                <input type="range" min="0" max="${hours.length - 1}" value="${skewHourIdx}"
+                       oninput="skewHourIdx=parseInt(this.value,10); skRenderCompare();" style="width:100%; margin-bottom:4px;">
+                <div style="display:flex; justify-content:center; gap:8px; margin-bottom:10px;">
+                    <button class="dprog-btn" onclick="skewHourIdx=Math.max(0,skewHourIdx-1); skRenderCompare();">&laquo; Prev</button>
+                    <span style="font-size:0.78rem; color:#94a3b8; align-self:center;">hour ${skewHourIdx + 1} of ${hours.length}</span>
+                    <button class="dprog-btn" onclick="skewHourIdx=Math.min(${hours.length - 1},skewHourIdx+1); skRenderCompare();">Next &raquo;</button>
+                </div>
+                ${note}${cnote}
+                <div style="display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap;">
+                    <div style="flex:1 1 540px; min-width:340px;">${skewCompareSVG(picked)}</div>
+                    <div style="flex:1 1 330px; min-width:290px;">${skCompareTable(picked)}</div>
+                </div>`;
+        }
+
+        function skToggleCmp(m) {
+            const i = skewCmpModels.indexOf(m);
+            if (i >= 0) skewCmpModels.splice(i, 1); else skewCmpModels.push(m);
+            // Keep a stable display order regardless of the order they were ticked.
+            const order = Object.keys(soundings.models);
+            skewCmpModels.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+            skRenderCompare();
+        }
+
+        function skPickModel(v) {
+            if (v === '__cmp__') {
+                skewCompare = true;
+                if (skewCmpModels.length < 2) {
+                    const all = Object.keys(soundings.models);
+                    skewCmpModels = all.slice(0, Math.min(3, all.length));
+                }
+                skewHourIdx = 0;
+                skRenderCompare();
+            } else {
+                skewCompare = false;
+                skewModel = v;
+                skewHourIdx = 0;
+                skRender();
+            }
+        }
+
         function skRender() {
+            if (skewCompare) { skRenderCompare(); return; }
             const body = document.getElementById('skBody');
             const models = Object.keys(soundings.models);
             const hours = skHoursFor(skewModel);
@@ -2261,7 +2581,8 @@
             const entry = soundings.models[skewModel][hk];
 
             const modelOpts = models.map(m =>
-                `<option value="${m}"${m === skewModel ? ' selected' : ''}>${ltLabel(m)}</option>`).join('');
+                `<option value="${m}"${m === skewModel ? ' selected' : ''}>${ltLabel(m)}</option>`).join('')
+                + `<option value="__cmp__">\u2696 Compare models\u2026</option>`;
             const cyc = cycleLabel(cycleFor('kxmr', skewModel));
             const warn = entry.coarse
                 ? `<div style="background:#ede9fe; color:#4c1d95; padding:5px 8px; border-radius:4px; font-size:0.76rem; margin-bottom:8px;">
@@ -2275,7 +2596,7 @@
             body.innerHTML = `
                 <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap;">
                     <label style="font-size:0.85rem; font-weight:600;">Model:</label>
-                    <select onchange="skewModel=this.value; skewHourIdx=0; skRender();"
+                    <select onchange="skPickModel(this.value)"
                             style="padding:3px 8px; border:1px solid #cbd5e1; border-radius:6px;">${modelOpts}</select>
                     ${cyc ? `<span style="font-size:0.78rem; color:#475569;">run <strong>${cyc}</strong></span>` : ''}
                     <span style="margin-left:auto; font-weight:700; color:#2563eb;">${hk}Z</span>
