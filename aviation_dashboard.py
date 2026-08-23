@@ -284,7 +284,21 @@ RRFS_LATENCY_H = 4           # approx hours before a cycle's files are complete 
 # grib-filter, which was silently failing the cycle probe.
 HRRR_AWS_ROOT = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
 HRRR_EXTENDED_CYCLES = [0, 6, 12, 18]
-HRRR_LATENCY_H = 3
+# Use EVERY hourly HRRR cycle, not only the extended ones.
+#
+# Restricting to 00/06/12/18z guaranteed an f48 column, but at a cost that is wrong for an
+# aviation board: with the latency below, the HRRR could be up to ~9 h old just before the
+# next extended cycle cleared — by which point seven newer HRRR runs existed and the column
+# was the stalest thing on the page. HRRR's whole value is that it is 3 km and hourly.
+#
+# With this on, the newest cycle is taken and its natural depth accepted: f48 on the extended
+# cycles, f18 on the others. The long range is already covered by GFS, ECMWF, RRFS and REFS,
+# so nothing is really lost, and the near-term column is never more than ~2-3 h old.
+# Set False to restore the old always-f48 behaviour.
+HRRR_ALL_CYCLES = True
+# Hours before a cycle is considered complete enough to read. HRRR f18 lands roughly 50-60 min
+# after cycle time and f48 nearer 110 min, so 2 h clears both.
+HRRR_LATENCY_H = 2
 
 # The exact REFS ensemble-mean filename ordering has drifted across the pre-op feed. We probe
 # these candidate patterns (formatted with cycle `c` and forecast-hour ints) once per run and
@@ -2126,6 +2140,11 @@ def _grib_levels_to_layers(levels):
         u = f.get("u")
         v = f.get("v")
         sknt = math.hypot(u, v) * 1.943844 if (u is not None and v is not None) else 0.0
+        # Meteorological FROM-direction, recovered from the components. Every consumer of the
+        # matrix reads u/v directly (LLWS, mean flow, anvil flow), so this stayed None for
+        # years without anyone noticing — until the skew-T tried to draw wind barbs off a
+        # GRIB column and every barb silently vanished.
+        drct = (math.degrees(math.atan2(-u, -v)) % 360.0) if (u is not None and v is not None) else None
         # GRIB geopotential height (gpm) -> feet if present, else barometric fallback.
         hght_ft = f["hgt"] * 3.280839895 if "hgt" in f else pressure_to_height_ft(pres)
         layers.append({
@@ -2136,7 +2155,7 @@ def _grib_levels_to_layers(levels):
             "depr": tmpc - dwpt,
             "rh": rh,  # native GRIB RH (%), used directly for RH>=95% cloud detection
             "sknt": sknt,
-            "drct": None,
+            "drct": drct,
             "u": u * 1.943844 if u is not None else None,  # m/s -> kt
             "v": v * 1.943844 if v is not None else None,
         })
@@ -2458,7 +2477,8 @@ def _rrfs_determine_cycle(session, model_kind):
     # HRRR only reaches f48 on the 00/06/12/18z extended cycles; restrict to those so we
     # never pick an odd-hour cycle that stops at f18.
     if model_kind == "hrrr":
-        cycle_hours, latency_h = HRRR_EXTENDED_CYCLES, HRRR_LATENCY_H
+        cycle_hours = list(range(24)) if HRRR_ALL_CYCLES else HRRR_EXTENDED_CYCLES
+        latency_h = HRRR_LATENCY_H
     else:
         cycle_hours, latency_h = RRFS_CYCLE_HOURS, RRFS_LATENCY_H
 
@@ -2599,8 +2619,13 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
             cycle_init = datetime.datetime.strptime(f"{date_str}{cycle}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
             # RRFS/REFS/HRRR all provide hourly forecast output; request the full window and let
             # any missing hour 404 on its .idx probe (so exact availability is never hardcoded).
-            # HRRR only reaches f48 even on extended cycles, so don't chase f49-60 for it.
-            kind_max_fh = 48 if kind == "hrrr" else RRFS_MAX_FH
+            # HRRR tops out at f48 even on extended cycles, so never chase f49-60 for it —
+            # and on a non-extended cycle it stops at f18, so asking for 48 would fire 30
+            # pointless .idx probes an hour. The depth follows the cycle actually chosen.
+            if kind == "hrrr":
+                kind_max_fh = 48 if int(cycle) in HRRR_EXTENDED_CYCLES else 18
+            else:
+                kind_max_fh = RRFS_MAX_FH
             f_hours = list(range(1, kind_max_fh + 1))
 
             logging.info(f"Fetching {kind.upper()} columns from AWS ({len(all_coords)} sites): {date_str} {cycle}z, {len(f_hours)} hours")
