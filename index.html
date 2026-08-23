@@ -57,6 +57,9 @@
         /* A cell carried forward from an earlier run because PSU BUFKIT failed this pass.
            Deliberately understated — the value is still a real forecast, just an older one. */
         .cell-stale { border-bottom: 3px double #94a3b8 !important; }
+        /* A column served from mandatory-level GRIB because no BUFKIT sounding was available.
+           Distinct from .cell-stale: the data is CURRENT, just vertically coarser. */
+        .cell-coarse { border-bottom: 2px dotted #a78bfa !important; }
         .cell-stale::after { content: "*"; position: absolute; top: 0px; right: 3px; font-size: 0.62rem; color: #64748b; font-weight: bold; line-height: 1; }
 
         #hover-popup-card { position: absolute; z-index: 500; background: #ffffff; color: #1e293b; border: 2px solid #3b82f6; border-radius: 6px; padding: 12px; width: 310px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none; pointer-events: none; font-size: 0.8rem; line-height: 1.4; }
@@ -114,6 +117,7 @@
             <a onclick="updateMetric('cuP_neg20_10nm')" id="nav-cuP_neg20_10nm">Cu P(top≥−20°C, 10nm)</a>
             <a onclick="updateMetric('ct_thunder')" id="nav-ct_thunder">Cal. Thunder Map</a>
             <a onclick="showLaunchThermo()" id="nav-launch_thermo">10Z Synoptic</a>
+            <a onclick="showSkewT()" id="nav-skewt" title="Skew-T soundings at KXMR by model and forecast hour">Skew-T</a>
         </div>
         <div class="station-selector">
             <label for="stn-dropdown">Station:</label>
@@ -190,12 +194,56 @@
         let launchThermoRuns = null;  // [{timestamp, thermo}] — panel dprog/dt, current + 3 back
         let ltRunIdx = 0;             // which run the panel is currently showing
         let climoTables = null;       // {points, thompson, pwat, rh75} — monthly percentile dists
+        let modelCycles = null;       // which model RUN produced each matrix column
+        let panelCycles = null;       // ditto for the panel-only ensembles (GEFS, ECMWF ENS)
         let ctWindow = '4hr';  // toggles between '4hr' and '1hr' for the persistent CT column
         let activeMetric = 'mom_mean';
         let activeStn = 'kxmr';
         const popupCard = document.getElementById("hover-popup-card");
 
         const aviationMetrics = ['mom_mean', 'mom_max', 'ceiling', 'vis', 'shear'];
+
+        // ---- model run (cycle) labels ---------------------------------------------------
+        // A column is only as current as the run behind it. Two models can sit side by side
+        // in the same row with six hours between their initialisations, which changes how
+        // much weight each deserves — so the run is shown rather than left to be assumed.
+        function cycleFor(site, model) {
+            if (!modelCycles) return null;
+            const m = modelCycles[(site || '').toLowerCase()];
+            return (m && m[(model || '').toLowerCase()]) || null;
+        }
+        // 'YYYYMMDDHH' -> '12Z'
+        function cycleLabel(key) {
+            if (!key || key.length < 10) return null;
+            return key.slice(8, 10) + 'Z';
+        }
+        // Hours between a cycle and now, for flagging a column that has fallen behind.
+        function cycleAgeH(key) {
+            if (!key || key.length < 10) return null;
+            const d = new Date(Date.UTC(+key.slice(0,4), +key.slice(4,6)-1, +key.slice(6,8), +key.slice(8,10)));
+            if (isNaN(d.getTime())) return null;
+            return (Date.now() - d.getTime()) / 3600000;
+        }
+        // Rapidly-updating models going stale matters more than slow ones: a 9-hour-old HRRR
+        // is a problem, a 9-hour-old GFS is normal.
+        const CYCLE_STALE_H = { hrrr: 4, rap: 4, rrfs: 5, refs: 9, gfs: 9, ecmwf: 15, gefs: 9, ecens: 15 };
+        function cycleIsStale(model, key) {
+            const age = cycleAgeH(key);
+            if (age == null) return false;
+            return age > (CYCLE_STALE_H[(model || '').toLowerCase()] || 12);
+        }
+        function cycleTag(site, model) {
+            const key = cycleFor(site, model);
+            const lab = cycleLabel(key);
+            if (!lab) return '';
+            const stale = cycleIsStale(model, key);
+            const age = cycleAgeH(key);
+            const col = stale ? '#fca5a5' : 'rgba(255,255,255,0.82)';
+            const title = `Run ${key.slice(0,4)}-${key.slice(4,6)}-${key.slice(6,8)} ${lab}` +
+                          (age != null ? ` — ${age.toFixed(1)} h old` : '') +
+                          (stale ? ' (older than expected for this model)' : '');
+            return `<br><span title="${title}" style="font-weight:normal; font-size:0.7em; color:${col};">${lab}${stale ? ' \u26a0' : ''}</span>`;
+        }
         const launchMetrics = ['hght_p5c', 'hght_0c', 'hght_5c', 'hght_10c', 'hght_15c', 'hght_20c', 'cloud_top', 'cloud_thick', 'thick_layer', 'cuP_neg10_5nm', 'cuP_neg20_10nm', 'ct_thunder'];
 
         // Launch pads + the two GRIB airfields (KTTS, KCOF) have no dedicated HREF lightning
@@ -223,6 +271,8 @@
                 launchThermo = payload.launch_thermo || null;
                 launchThermoRuns = payload.launch_thermo_runs || null;
                 climoTables = payload.climo || null;
+                modelCycles = payload.model_cycles || null;   // {site: {model: 'YYYYMMDDHH'}}
+                panelCycles = payload.panel_cycles || null;   // {model: 'YYYYMMDDHH'} panel-only ensembles
                 refcMaps = payload.refc_maps || null;
 
                 // Diagnostic: how many hours carry a real calibrated-thunder map per window.
@@ -418,7 +468,9 @@
                 let extra = "";
                 if (m === "rrfs" || m === "refs") extra = " style='background:#1e3a5f; color:white;'";
                 else if (m === "ecmwf") extra = " style='background:#5b21b6; color:white;'";
-                return `<th${extra}>${modelHeaders[m]}</th>`;
+                // The ECMWF/REFS headers already carry a resolution sub-label; the run tag is
+                // appended after it so both read on their own line.
+                return `<th${extra}>${modelHeaders[m]}${cycleTag(lowerStn, m)}</th>`;
             }).join("");
 
             if (isLaunchMode) {
@@ -519,9 +571,11 @@
                     // Columns carried forward from an earlier run (PSU BUFKIT throttled us out
                     // of this fetch) get a double underline + asterisk so a stale forecast is
                     // never mistaken for a current one.
-                    const staleCls = profile.stale ? " cell-stale" : "";
+                    const staleCls = (profile.stale ? " cell-stale" : "")
+                                   + (profile.coarse ? " cell-coarse" : "");
                     const staleTitle = profile.stale
-                        ? ` title="Carried forward from ${profile.stale} — BUFKIT fetch failed this run"` : "";
+                        ? ` title="Carried forward from ${profile.stale} — BUFKIT fetch failed this run"`
+                        : (profile.coarse ? ` title="${profile.coarse} — mandatory isobaric levels, so shear is a bulk estimate"` : "");
 
                     tr.innerHTML += `<td id="${cellId}" class="${props.cls}${staleCls}"${staleTitle} style="cursor:help;">${props.txt}</td>`;
 
@@ -787,6 +841,7 @@
                     <div class="legend-item cell-shear-40"><span>Strong Shear</span><span>≥ 40 kt Magnitude</span></div>
                     
                     <div class="explanation-box">
+                        <span style="color:#64748b; font-size:0.92em; display:block; margin-bottom:10px;"><em>A cell with a <strong>dotted violet underline</strong> is served from mandatory-level GRIB rather than a BUFKIT sounding. PSU closed public access to its BUFKIT archive in August 2026, so the airport HRRR column now falls back to the same AWS isobaric data the pads use. The values are current; they're just vertically coarser, which matters most for wind shear.</em></span>
                         <span style="color:#64748b; font-size:0.92em; display:block; margin-bottom:10px;"><em>A cell with a <strong>double underline and an asterisk*</strong> was carried forward from an earlier run: PSU's BUFKIT server throttled the fetch, so the last good column is shown rather than a blank one. It is a real forecast, just an older cycle — hover for the run it came from. Only the BUFKIT columns (GFS/RAP/HRRR at airports) can go stale this way; RRFS, REFS, ECMWF and the pads come from AWS/ECMWF and are unaffected.</em></span>
                         <strong>Aviation Parameter Definitions &amp; Methodology:</strong><br><br>
                         • <strong>PBL Mom Mean:</strong> The mean wind through the mixed layer (mean layer wind), using the BUFKIT momentum-transfer technique to define the mixed-layer depth.<br><br>
@@ -815,6 +870,7 @@
                     <div class="legend-item ltg-high"><span>-20°C Breach</span><span>Cloud Top ≥ -20°C</span></div>
 
                     <div class="explanation-box">
+                        <span style="color:#64748b; font-size:0.92em; display:block; margin-bottom:10px;"><em>A cell with a <strong>dotted violet underline</strong> is served from mandatory-level GRIB rather than a BUFKIT sounding. PSU closed public access to its BUFKIT archive in August 2026, so the airport HRRR column now falls back to the same AWS isobaric data the pads use. The values are current; they're just vertically coarser, which matters most for wind shear.</em></span>
                         <span style="color:#64748b; font-size:0.92em; display:block; margin-bottom:10px;"><em>A cell with a <strong>double underline and an asterisk*</strong> was carried forward from an earlier run: PSU's BUFKIT server throttled the fetch, so the last good column is shown rather than a blank one. It is a real forecast, just an older cycle — hover for the run it came from. Only the BUFKIT columns (GFS/RAP/HRRR at airports) can go stale this way; RRFS, REFS, ECMWF and the pads come from AWS/ECMWF and are unaffected.</em></span>
                         <strong>Launch Commit Criteria (LCC) Guides &amp; Methodology:</strong><br><br>
                         • <strong>Isotherm Profiles (+5/0/-5/-10/-15/-20°C Height):</strong> The profile is scanned for each target isotherm; the height (kft) is linearly interpolated between the two sounding levels that bracket that temperature. These delineate the charging zones where triboelectric (ice/graupel collision) charging and natural/triggered lightning are most favorable.<br><br>
@@ -838,7 +894,12 @@
                 ? `<div style="margin-bottom:6px; padding:4px 6px; background:#fef3c7; color:#78350f; border-radius:3px; font-size:0.75rem;">
                      <strong>Carried forward</strong> from ${p.stale} — PSU BUFKIT did not respond this run.
                      RRFS/REFS/ECMWF in the same row are current.</div>`
-                : "";
+                : (p.coarse
+                ? `<div style="margin-bottom:6px; padding:4px 6px; background:#ede9fe; color:#4c1d95; border-radius:3px; font-size:0.75rem;">
+                     <strong>${p.coarse}</strong> — current data, but on mandatory isobaric levels rather than a
+                     ~40-level BUFKIT sounding. Vertical resolution is coarser, which matters most for
+                     low-level shear and thin cloud layers.</div>`
+                : "");
             if (isAviation) {
                 let shearVal = parseFloat(p.shear);
                 let shearTxt = !isNaN(shearVal) ? shearVal.toFixed(0) + ' kt' : p.shear;
@@ -1073,6 +1134,7 @@
         function ltSetCmp(slot, val) {
             if (slot === 'A') ltCmpA = val; else ltCmpB = val;
             ltRenderCmpPickers();
+            ltRenderCycle();
             renderLaunchThermoRuns();
             renderLaunchThermo();
         }
@@ -1169,7 +1231,40 @@
             renderLaunchThermoRuns();
             renderLaunchThermo();
         }
+        // Which model RUN the 10Z panel is showing for the selected model. Matrix columns and
+        // panel-only ensembles live in different registries, so both are consulted.
+        function ltCycleFor(model) {
+            const m = (model || '').toLowerCase();
+            if (panelCycles && panelCycles[m]) return panelCycles[m];
+            return cycleFor('kxmr', m);
+        }
+        function ltRenderCycle() {
+            const host = document.getElementById('ltCycle');
+            if (!host) return;
+            const sel = document.getElementById('ltModel');
+            const model = sel ? sel.value : null;
+            // In compare mode both members are labelled, each in its own slot colour.
+            const list = (typeof ltIsCompare === 'function' && ltIsCompare())
+                ? ltCmpSeries().map(x => ({ key: x.key, label: x.label, color: x.color }))
+                : [{ key: model, label: ltLabel(model), color: '#475569' }];
+            const parts = [];
+            list.forEach(item => {
+                const ck = ltCycleFor(item.key);
+                const lab = cycleLabel(ck);
+                if (!lab) return;
+                const age = cycleAgeH(ck);
+                const stale = cycleIsStale(item.key, ck);
+                parts.push(`<span title="Run ${ck} — ${age != null ? age.toFixed(1) + ' h old' : 'age unknown'}"
+                    style="font-size:0.78rem; color:${stale ? '#b45309' : item.color}; font-weight:600;">
+                    ${item.label} ${lab}${stale ? ' \u26a0' : ''}</span>`);
+            });
+            host.innerHTML = parts.length
+                ? `<span style="color:#94a3b8; font-size:0.78rem;">run:</span> ${parts.join('<span style="color:#cbd5e1;"> · </span>')}`
+                : '';
+        }
+
         function renderLaunchThermoRuns() {
+            ltRenderCycle();
             const el = document.getElementById('ltRuns');
             if (!el) return;
             if (!launchThermoRuns || launchThermoRuns.length < 2) { el.innerHTML = ''; return; }
@@ -1734,6 +1829,363 @@
             document.getElementById('ltBody').innerHTML = html;
         }
 
+        // ================= SKEW-T =========================================================
+        // Drawn as SVG in the browser rather than rendered to PNG server-side. A PNG per
+        // model per forecast hour would be ~290 images regenerated hourly and committed to
+        // git, which would bloat the repository without bound; SVG also lets the hour slider
+        // scrub instantly instead of reloading images.
+        let soundings = null;        // {site, models:{model:{'DD/HH':{lv,p,coarse,stale}}}}
+        let skewModel = null;
+        let skewHourIdx = 0;
+        let skewLoaded = false;
+
+        // --- thermodynamic helpers (kept minimal; the heavy lifting is backend MetPy) -----
+        const SK_P_BOT = 1050, SK_P_TOP = 100;
+        const SK_T_MIN = -50, SK_T_MAX = 45;   // deg C along the bottom axis
+        const SK_W = 560, SK_H = 520, SK_L = 46, SK_T0 = 14;
+        const SK_SKEW = 300;                    // px of rightward tilt from bottom to top
+
+        function skY(p) {
+            return SK_T0 + SK_H * (Math.log(p / SK_P_TOP) / Math.log(SK_P_BOT / SK_P_TOP));
+        }
+        function skX(t, p) {
+            const frac = (skY(p) - SK_T0) / SK_H;           // 1 at bottom, 0 at top
+            return SK_L + ((t - SK_T_MIN) / (SK_T_MAX - SK_T_MIN)) * SK_W + SK_SKEW * (1 - frac);
+        }
+        // Saturation vapour pressure (hPa), Bolton.
+        function skEs(tc) { return 6.112 * Math.exp(17.67 * tc / (tc + 243.5)); }
+        function skMixr(tc, p) { const e = skEs(tc); return 622 * e / Math.max(1e-6, p - e); }  // g/kg
+        // Dewpoint that yields mixing ratio w (g/kg) at pressure p — for the mixing-ratio lines.
+        function skTdFromW(w, p) {
+            const e = (w / 622) * p / (1 + w / 622);
+            const l = Math.log(Math.max(1e-6, e) / 6.112);
+            return 243.5 * l / (17.67 - l);
+        }
+        function skDryAdiabat(thetaK, p) { return thetaK * Math.pow(p / 1000, 0.2854) - 273.15; }
+        // Pseudoadiabatic lapse rate, degC per hPa.
+        function skMoistLapse(tc, p) {
+            const tk = tc + 273.15, w = skMixr(tc, p) / 1000;
+            const num = 1 + (2.501e6 * w) / (287 * tk);
+            const den = 1 + (2.501e6 * 2.501e6 * w * 0.622) / (1004 * 287 * tk * tk);
+            return (287 * tk / (1004 * p)) * (num / den);
+        }
+        // Integrate a moist adiabat downward-to-upward from (t,p) to pTop.
+        function skMoistPath(t, p, pTop, step) {
+            step = step || 10;
+            const pts = [[t, p]];
+            let tc = t, pp = p;
+            while (pp > pTop) {
+                const dp = Math.min(step, pp - pTop);
+                tc -= skMoistLapse(tc, pp) * dp;
+                pp -= dp;
+                pts.push([tc, pp]);
+            }
+            return pts;
+        }
+
+        function skPath(pts) {
+            return pts.map((q, i) => `${i ? 'L' : 'M'}${skX(q[0], q[1]).toFixed(1)},${skY(q[1]).toFixed(1)}`).join(' ');
+        }
+
+        // --- background ------------------------------------------------------------------
+        function skBackground() {
+            const clip = 'clip-path="url(#skclip)"';
+            let g = '';
+            // isobars
+            [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100].forEach(p => {
+                const y = skY(p);
+                g += `<line x1="${SK_L}" y1="${y}" x2="${SK_L + SK_W + SK_SKEW}" y2="${y}" stroke="#cbd5e1" stroke-width="0.8"/>`;
+                g += `<text x="${SK_L - 5}" y="${y + 3}" text-anchor="end" font-size="9" fill="#64748b">${p}</text>`;
+            });
+            // skewed isotherms
+            for (let t = -110; t <= 50; t += 10) {
+                const pts = [[t, SK_P_BOT], [t, SK_P_TOP]];
+                const zero = (t === 0);
+                g += `<path ${clip} d="${skPath(pts)}" stroke="${zero ? '#0ea5e9' : '#e2e8f0'}" stroke-width="${zero ? 1.4 : 0.8}" fill="none"/>`;
+                if (t >= SK_T_MIN && t <= SK_T_MAX) {
+                    g += `<text x="${skX(t, SK_P_BOT)}" y="${SK_T0 + SK_H + 12}" text-anchor="middle" font-size="9" fill="#64748b">${t}</text>`;
+                }
+            }
+            // dry adiabats
+            for (let th = 250; th <= 440; th += 10) {
+                const pts = [];
+                for (let p = SK_P_BOT; p >= SK_P_TOP; p -= 25) pts.push([skDryAdiabat(th, p), p]);
+                g += `<path ${clip} d="${skPath(pts)}" stroke="#fbbf24" stroke-width="0.6" fill="none" opacity="0.55"/>`;
+            }
+            // moist adiabats
+            for (let t0 = -20; t0 <= 40; t0 += 5) {
+                g += `<path ${clip} d="${skPath(skMoistPath(t0, 1000, SK_P_TOP, 25))}" stroke="#34d399" stroke-width="0.6" fill="none" opacity="0.5" stroke-dasharray="none"/>`;
+            }
+            // mixing ratio lines (g/kg)
+            [1, 2, 4, 7, 10, 16, 24, 32].forEach(w => {
+                const pts = [];
+                for (let p = SK_P_BOT; p >= 400; p -= 25) pts.push([skTdFromW(w, p), p]);
+                g += `<path ${clip} d="${skPath(pts)}" stroke="#38bdf8" stroke-width="0.7" fill="none" opacity="0.55" stroke-dasharray="3 3"/>`;
+                const lp = 620;
+                g += `<text ${clip} x="${skX(skTdFromW(w, lp), lp)}" y="${skY(lp)}" font-size="8" fill="#0284c7" text-anchor="middle">${w}</text>`;
+            });
+            return g;
+        }
+
+        // --- wind barbs ------------------------------------------------------------------
+        // Standard barbs: 50 kt pennant, 10 kt full barb, 5 kt half barb.
+        function skBarb(x, y, dir, spd) {
+            if (dir == null || spd == null) return '';
+            if (spd < 2.5) return `<circle cx="${x}" cy="${y}" r="3.5" fill="none" stroke="#334155" stroke-width="1"/>`;
+            const L = 26;
+            const rad = (dir + 180) * Math.PI / 180;   // barb points INTO the wind
+            const dx = Math.sin(rad), dy = -Math.cos(rad);
+            const ex = x + dx * L, ey = y + dy * L;
+            let s = `<line x1="${x}" y1="${y}" x2="${ex.toFixed(1)}" y2="${ey.toFixed(1)}" stroke="#334155" stroke-width="1.1"/>`;
+            // perpendicular direction for the feathers
+            const px = -dy, py = dx;
+            let rem = Math.round(spd / 5) * 5;
+            let pos = 0;
+            const stepPx = 4.5;
+            while (rem >= 50) {
+                const bx = ex - dx * pos, by = ey - dy * pos;
+                const b2x = ex - dx * (pos + stepPx * 1.6), b2y = ey - dy * (pos + stepPx * 1.6);
+                s += `<polygon points="${bx.toFixed(1)},${by.toFixed(1)} ${(bx + px * 10).toFixed(1)},${(by + py * 10).toFixed(1)} ${b2x.toFixed(1)},${b2y.toFixed(1)}" fill="#334155"/>`;
+                pos += stepPx * 2; rem -= 50;
+            }
+            while (rem >= 10) {
+                const bx = ex - dx * pos, by = ey - dy * pos;
+                s += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${(bx + px * 10).toFixed(1)}" y2="${(by + py * 10).toFixed(1)}" stroke="#334155" stroke-width="1.1"/>`;
+                pos += stepPx; rem -= 10;
+            }
+            if (rem >= 5) {
+                const bx = ex - dx * Math.max(pos, stepPx), by = ey - dy * Math.max(pos, stepPx);
+                s += `<line x1="${bx.toFixed(1)}" y1="${by.toFixed(1)}" x2="${(bx + px * 5.5).toFixed(1)}" y2="${(by + py * 5.5).toFixed(1)}" stroke="#334155" stroke-width="1.1"/>`;
+            }
+            return s;
+        }
+
+        // --- the plot --------------------------------------------------------------------
+        function skewSVG(entry) {
+            const lv = entry.lv || [];
+            const T = [], Td = [];
+            lv.forEach(r => {
+                const [p, h, t, d] = r;
+                if (p == null || t == null) return;
+                if (p < SK_P_TOP) return;
+                T.push([t, p]);
+                if (d != null) Td.push([Math.min(d, t), p]);
+            });
+            if (T.length < 3) return '<div style="padding:20px;color:#94a3b8;">Profile too thin to plot.</div>';
+
+            // Parcel path: dry adiabat to the LCL, pseudoadiabat above. The LCL comes from the
+            // backend (MetPy where available), so the drawn parcel matches the printed CAPE.
+            const prm = entry.p || {};
+            let parcel = [];
+            const sfc = T[0], sfcTd = Td.length ? Td[0] : null;
+            if (sfc && sfcTd && prm.lcl_p) {
+                const thK = (sfc[0] + 273.15) * Math.pow(1000 / sfc[1], 0.2854);
+                for (let p = sfc[1]; p >= prm.lcl_p; p -= 5) parcel.push([skDryAdiabat(thK, p), p]);
+                const tl = skDryAdiabat(thK, prm.lcl_p);
+                parcel = parcel.concat(skMoistPath(tl, prm.lcl_p, SK_P_TOP, 10));
+            }
+
+            const wTop = SK_L + SK_W + SK_SKEW + 16;
+            let s = `<svg viewBox="0 0 ${wTop + 46} ${SK_T0 + SK_H + 34}" width="100%" style="max-width:820px;">
+                <defs><clipPath id="skclip"><rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}"/></clipPath></defs>
+                <rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}" fill="#fff" stroke="#94a3b8" stroke-width="1"/>`;
+            s += skBackground();
+
+            // shade CAPE / CIN between the parcel and the environment
+            if (parcel.length) {
+                const envAt = (p) => {
+                    for (let i = 0; i < T.length - 1; i++) {
+                        const a = T[i], b = T[i + 1];
+                        if ((a[1] >= p && p >= b[1])) {
+                            const f = (Math.log(a[1]) - Math.log(p)) / (Math.log(a[1]) - Math.log(b[1]));
+                            return a[0] + f * (b[0] - a[0]);
+                        }
+                    }
+                    return null;
+                };
+                let pos = [], neg = [];
+                parcel.forEach(q => {
+                    const te = envAt(q[1]);
+                    if (te == null) return;
+                    (q[0] > te ? pos : neg).push([q, te]);
+                });
+                const band = (arr, fill) => {
+                    if (arr.length < 2) return '';
+                    const up = arr.map(z => `${skX(z[0][0], z[0][1]).toFixed(1)},${skY(z[0][1]).toFixed(1)}`);
+                    const dn = arr.slice().reverse().map(z => `${skX(z[1], z[0][1]).toFixed(1)},${skY(z[0][1]).toFixed(1)}`);
+                    return `<polygon clip-path="url(#skclip)" points="${up.concat(dn).join(' ')}" fill="${fill}" opacity="0.28"/>`;
+                };
+                // Split the positive area into contiguous runs so separated layers don't join.
+                let run = [];
+                pos.forEach((z, i) => {
+                    run.push(z);
+                    const brk = (i === pos.length - 1) || (pos[i + 1][0][1] > z[0][1]);
+                    if (brk) { s += band(run, '#ef4444'); run = []; }
+                });
+                run = [];
+                neg.forEach((z, i) => {
+                    run.push(z);
+                    const brk = (i === neg.length - 1) || (neg[i + 1][0][1] > z[0][1]);
+                    if (brk) { s += band(run, '#3b82f6'); run = []; }
+                });
+                s += `<path clip-path="url(#skclip)" d="${skPath(parcel)}" stroke="#111827" stroke-width="1.3" fill="none" stroke-dasharray="5 4"/>`;
+            }
+
+            s += `<path clip-path="url(#skclip)" d="${skPath(Td)}" stroke="#16a34a" stroke-width="2.2" fill="none"/>`;
+            s += `<path clip-path="url(#skclip)" d="${skPath(T)}" stroke="#dc2626" stroke-width="2.2" fill="none"/>`;
+
+            // level markers for LCL / LFC / EL
+            [['lcl_p', 'LCL', '#0891b2'], ['lfc_p', 'LFC', '#b45309'], ['el_p', 'EL', '#7c3aed']].forEach(([k, lab, col]) => {
+                const p = prm[k];
+                if (!p || p < SK_P_TOP || p > SK_P_BOT) return;
+                const y = skY(p);
+                s += `<line x1="${SK_L}" y1="${y}" x2="${SK_L + SK_W + SK_SKEW}" y2="${y}" stroke="${col}" stroke-width="1" stroke-dasharray="6 4" opacity="0.85"/>`;
+                s += `<text x="${SK_L + 4}" y="${y - 3}" font-size="9" font-weight="700" fill="${col}">${lab} ${Math.round(p)}</text>`;
+            });
+
+            // wind barbs, thinned so they don't overlap
+            s += `<line x1="${wTop}" y1="${SK_T0}" x2="${wTop}" y2="${SK_T0 + SK_H}" stroke="#cbd5e1" stroke-width="1"/>`;
+            let lastY = -99;
+            lv.forEach(r => {
+                const [p, h, t, d, dir, spd] = r;
+                if (p == null || p < SK_P_TOP || dir == null || spd == null) return;
+                const y = skY(p);
+                if (Math.abs(y - lastY) < 22) return;
+                lastY = y;
+                s += skBarb(wTop, y, dir, spd);
+            });
+
+            s += `<text x="${SK_L + (SK_W + SK_SKEW) / 2}" y="${SK_T0 + SK_H + 28}" text-anchor="middle" font-size="10" fill="#64748b">Temperature (\u00b0C)</text>`;
+            s += `</svg>`;
+            return s;
+        }
+
+        function skParamsPanel(entry) {
+            const p = entry.p || {};
+            const row = (lab, val, unit, hint) => {
+                const v = (val == null) ? '\u2014' : `${val}${unit || ''}`;
+                return `<tr><td style="padding:3px 8px 3px 0; color:#475569;">${lab}</td>
+                        <td style="padding:3px 0; font-weight:700; text-align:right;">${v}</td>
+                        <td style="padding:3px 0 3px 8px; color:#94a3b8; font-size:0.72rem;">${hint || ''}</td></tr>`;
+            };
+            const capeCol = (c) => c == null ? '' : (c >= 2500 ? 'color:#991b1b;' : c >= 1000 ? 'color:#b45309;' : '');
+            return `<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">
+                <tr><td colspan="3" style="padding-top:2px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0;">Parcel</td></tr>
+                ${row('SBCAPE', p.sbcape, ' J/kg', 'surface parcel')}
+                ${row('SBCIN', p.sbcin, ' J/kg', 'inhibition')}
+                ${row('MLCAPE', p.mlcape, ' J/kg', 'mixed layer')}
+                ${row('MLCIN', p.mlcin, ' J/kg', '')}
+                <tr><td colspan="3" style="padding-top:8px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0;">Levels</td></tr>
+                ${row('LCL', p.lcl_p, ' hPa', 'cloud base')}
+                ${row('LFC', p.lfc_p, ' hPa', 'free convection')}
+                ${row('EL', p.el_p, ' hPa', 'equilibrium')}
+                <tr><td colspan="3" style="padding-top:8px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0;">Indices</td></tr>
+                ${row('K-Index', p.k_index, '', '')}
+                ${row('Lifted Index', p.lifted_index, '', 'mixed-layer')}
+                ${row('Thompson', p.thompson, '', 'KI \u2212 LI')}
+                ${row('PWAT', p.pwat_in, ' in', '')}
+                ${row('700\u2013500 RH', p.rh_700_500 == null ? null : Math.round(p.rh_700_500), '%', '')}
+            </table>
+            <div style="font-size:0.7rem; color:#94a3b8; margin-top:8px;">
+                Parcel theory computed server-side${p.cape_engine ? ' via ' + p.cape_engine : ''}.
+                Shaded red is positive area (CAPE), blue is negative (CIN); the dashed black line is
+                the surface parcel.
+            </div>`;
+        }
+
+        // --- data + UI -------------------------------------------------------------------
+        async function skLoad() {
+            if (skewLoaded) return;
+            skewLoaded = true;
+            try {
+                const r = await fetch('soundings.json?t=' + Date.now());
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                soundings = await r.json();
+            } catch (e) {
+                soundings = null;
+                console.warn('soundings.json unavailable:', e);
+            }
+        }
+
+        function skHoursFor(model) {
+            const m = (soundings && soundings.models && soundings.models[model]) || {};
+            return Object.keys(m).sort((a, b) => {
+                const [da, ha] = a.split('/').map(Number), [db, hb] = b.split('/').map(Number);
+                let fa = da, fb = db;
+                if (Math.abs(da - db) > 15) { if (da < db) fa += 32; else fb += 32; }
+                return fa !== fb ? fa - fb : ha - hb;
+            });
+        }
+
+        async function showSkewT() {
+            const modal = document.getElementById('skModal');
+            modal.style.display = 'flex';
+            const body = document.getElementById('skBody');
+            body.innerHTML = '<div style="padding:24px; color:#64748b;">Loading soundings\u2026</div>';
+            await skLoad();
+
+            if (!soundings || !soundings.models || !Object.keys(soundings.models).length) {
+                body.innerHTML = `<div style="padding:20px; color:#b45309;">
+                    <strong>soundings.json not found.</strong> The skew-T reads a file written by the
+                    pipeline alongside <code>history.json</code>. Re-run <code>aviation_dashboard.py</code>
+                    and make sure <code>soundings.json</code> is committed with the other outputs.</div>`;
+                return;
+            }
+            const models = Object.keys(soundings.models);
+            if (!skewModel || !models.includes(skewModel)) skewModel = models.includes('hrrr') ? 'hrrr' : models[0];
+            const hours = skHoursFor(skewModel);
+            if (skewHourIdx >= hours.length) skewHourIdx = 0;
+            skRender();
+        }
+
+        function skRender() {
+            const body = document.getElementById('skBody');
+            const models = Object.keys(soundings.models);
+            const hours = skHoursFor(skewModel);
+            if (!hours.length) {
+                body.innerHTML = '<div style="padding:20px; color:#b45309;">No profiles for that model.</div>';
+                return;
+            }
+            skewHourIdx = Math.max(0, Math.min(skewHourIdx, hours.length - 1));
+            const hk = hours[skewHourIdx];
+            const entry = soundings.models[skewModel][hk];
+
+            const modelOpts = models.map(m =>
+                `<option value="${m}"${m === skewModel ? ' selected' : ''}>${ltLabel(m)}</option>`).join('');
+            const cyc = cycleLabel(cycleFor('kxmr', skewModel));
+            const warn = entry.coarse
+                ? `<div style="background:#ede9fe; color:#4c1d95; padding:5px 8px; border-radius:4px; font-size:0.76rem; margin-bottom:8px;">
+                     <strong>${entry.coarse}</strong> — mandatory isobaric levels only, so the profile is
+                     vertically coarse. Parcel calculations off a sparse column carry real error, especially
+                     near the LCL and any shallow inversion.</div>`
+                : (entry.stale
+                ? `<div style="background:#fef3c7; color:#78350f; padding:5px 8px; border-radius:4px; font-size:0.76rem; margin-bottom:8px;">
+                     <strong>Carried forward</strong> from ${entry.stale} — not the current run.</div>` : '');
+
+            body.innerHTML = `
+                <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap;">
+                    <label style="font-size:0.85rem; font-weight:600;">Model:</label>
+                    <select onchange="skewModel=this.value; skewHourIdx=0; skRender();"
+                            style="padding:3px 8px; border:1px solid #cbd5e1; border-radius:6px;">${modelOpts}</select>
+                    ${cyc ? `<span style="font-size:0.78rem; color:#475569;">run <strong>${cyc}</strong></span>` : ''}
+                    <span style="margin-left:auto; font-weight:700; color:#2563eb;">${hk}Z</span>
+                </div>
+                <input type="range" min="0" max="${hours.length - 1}" value="${skewHourIdx}"
+                       oninput="skewHourIdx=parseInt(this.value,10); skRender();" style="width:100%; margin-bottom:4px;">
+                <div style="display:flex; justify-content:center; gap:8px; margin-bottom:10px;">
+                    <button class="dprog-btn" onclick="skewHourIdx=Math.max(0,skewHourIdx-1); skRender();">&laquo; Prev</button>
+                    <span style="font-size:0.78rem; color:#94a3b8; align-self:center;">hour ${skewHourIdx + 1} of ${hours.length}</span>
+                    <button class="dprog-btn" onclick="skewHourIdx=Math.min(${hours.length - 1},skewHourIdx+1); skRender();">Next &raquo;</button>
+                </div>
+                ${warn}
+                <div style="display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap;">
+                    <div style="flex:1 1 560px; min-width:340px;">${skewSVG(entry)}</div>
+                    <div style="flex:0 1 260px; min-width:230px;">${skParamsPanel(entry)}</div>
+                </div>`;
+        }
+
+        function closeSkew() { document.getElementById('skModal').style.display = 'none'; }
+
         window.onload = initDashboard;
     </script>
     <div id="ltModal" onclick="if(event.target===this)hideLaunchThermo()"
@@ -1745,6 +2197,7 @@
             <label style="font-size:0.85rem; color:#475569;">Model:</label>
             <select id="ltModel" onchange="ltRenderCmpPickers(); renderLaunchThermoRuns(); renderLaunchThermo();" style="padding:4px 8px; border:1px solid #cbd5e1; border-radius:6px;"></select>
             <span id="ltCmpPick" style="display:none; align-items:center; gap:5px;"></span>
+            <span id="ltCycle" style="margin-left:10px;"></span>
             <button onclick="hideLaunchThermo()" style="border:none; background:#e2e8f0; border-radius:6px; padding:4px 10px; cursor:pointer;">✕</button>
           </div>
         </div>
@@ -1761,6 +2214,19 @@
         </div>
         <div id="bpBody" style="padding:14px 18px 18px;"></div>
       </div>
+    </div>
+    <div id="skModal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.55);
+         align-items:flex-start; justify-content:center; z-index:920; padding:24px 14px; overflow:auto;">
+        <div style="background:#fff; border-radius:10px; max-width:1120px; width:100%; padding:16px 20px;
+             box-shadow:0 10px 40px rgba(0,0,0,0.3);">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                <strong style="font-size:1.02rem;">Skew-T / Log-P &mdash; KXMR</strong>
+                <button onclick="closeSkew()" style="border:1px solid #cbd5e1; background:#f8fafc;
+                        border-radius:6px; padding:3px 10px; cursor:pointer;">&times;</button>
+            </div>
+            <div id="skBody"></div>
+        </div>
+    </div>
     </div>
 </body>
 </html>
