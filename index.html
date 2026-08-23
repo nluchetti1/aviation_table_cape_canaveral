@@ -2065,7 +2065,7 @@
             }
 
             const wTop = SK_L + SK_W + SK_SKEW + 16;
-            let s = `<svg viewBox="0 0 ${wTop + 46} ${SK_T0 + SK_H + 34}" width="100%" style="max-width:820px;">
+            let s = `<svg viewBox="0 0 ${wTop + 46} ${SK_T0 + SK_H + 34}" width="100%" style="max-width:1080px;">
                 <defs><clipPath id="skclip"><rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}"/></clipPath></defs>
                 <rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}" fill="#fff" stroke="#94a3b8" stroke-width="1"/>`;
             s += skBackground();
@@ -2244,9 +2244,13 @@
         // ---- multi-model overlay -----------------------------------------------------
         // Fixed model -> colour map. Tied to the model, never to selection order, so a trace
         // never changes colour when the selection changes.
+        // Hues chosen for separation, not prettiness. The first pass had HRRR red beside RAP
+        // orange, which read as the same colour on a laptop panel at trace width. The four
+        // most-compared models now sit on opposite sides of the wheel: red, green, blue,
+        // violet. Amber and cyan fill the two remaining slots.
         const SK_CMP_COLORS = {
-            hrrr: '#dc2626', rap: '#ea580c', gfs: '#2563eb',
-            ecmwf: '#7c3aed', rrfs: '#0891b2', refs: '#15803d',
+            hrrr: '#dc2626', rap: '#059669', gfs: '#2563eb',
+            ecmwf: '#7c3aed', rrfs: '#d97706', refs: '#0891b2',
         };
         let skewCompare = false;
         let skewCmpModels = [];      // model keys currently ticked
@@ -2317,7 +2321,7 @@
             const barbCols = picked.length;
             const wTop = SK_L + SK_W + SK_SKEW + 16;
             const totalW = wTop + Math.max(46, barbCols * 26 + 20);
-            let s = `<svg viewBox="0 0 ${totalW} ${SK_T0 + SK_H + 34}" width="100%" style="max-width:860px;">
+            let s = `<svg viewBox="0 0 ${totalW} ${SK_T0 + SK_H + 34}" width="100%" style="max-width:1080px;">
                 <defs><clipPath id="skclip"><rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}"/></clipPath></defs>
                 <rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}" fill="#fff" stroke="#94a3b8" stroke-width="1"/>`;
             s += skBackground();
@@ -2358,7 +2362,7 @@
             s += `<rect x="${SK_L + 8}" y="${SK_T0 + 8}" width="${lw}" height="${lh}" fill="#ffffff" stroke="#cbd5e1" stroke-width="0.8" rx="4" opacity="0.94"/>`;
             picked.forEach((pk, i) => {
                 const yy = SK_T0 + 22 + i * 14;
-                s += `<line x1="${SK_L + 15}" y1="${yy - 3}" x2="${SK_L + 31}" y2="${yy - 3}" stroke="${skCmpColor(pk.model)}" stroke-width="2.3"/>`;
+                s += `<line x1="${SK_L + 15}" y1="${yy - 3}" x2="${SK_L + 33}" y2="${yy - 3}" stroke="${skCmpColor(pk.model)}" stroke-width="3.4" stroke-linecap="round"/>`;
                 s += `<text x="${SK_L + 36}" y="${yy}" font-size="9" fill="${skCmpColor(pk.model)}" font-weight="700">${ltLabel(pk.model)}</text>`;
             });
             s += `<text x="${SK_L + 15}" y="${SK_T0 + 22 + picked.length * 14 + 1}" font-size="7.5" fill="#94a3b8">solid T \u00b7 dashed Td</text>`;
@@ -2442,8 +2446,12 @@
                 const cs = skChargeStats(pk.entry);
                 vals[pk.model] = Object.assign({}, p, { _t0: cs.t0, _t20: cs.t20, _depth: cs.depth });
             });
+            // The page-wide `th` rule is a solid blue with white text, which made the GFS
+            // header (blue) invisible against it. Every header cell in this table overrides
+            // the background explicitly so the model colour is what's read.
+            const thBase = 'background:#f8fafc; border-bottom:2px solid #e2e8f0; position:static;';
             const head = picked.map(pk =>
-                `<th style="padding:4px 5px; text-align:right; color:${skCmpColor(pk.model)}; font-size:0.74rem; font-weight:700;">${ltLabel(pk.model)}</th>`).join('');
+                `<th style="${thBase} padding:4px 5px; text-align:right; color:${skCmpColor(pk.model)}; font-size:0.74rem; font-weight:700;">${ltLabel(pk.model)}</th>`).join('');
             let rows = '';
             SK_CMP_ROWS.forEach(r => {
                 if (r.grp) {
@@ -2468,7 +2476,7 @@
             });
             return `<div style="overflow-x:auto; -webkit-overflow-scrolling:touch;">
                 <table style="width:100%; border-collapse:collapse; font-size:0.8rem; min-width:340px;">
-                <thead><tr><th></th>${head}<th style="padding:4px 0 4px 6px; text-align:right; color:#94a3b8; font-size:0.72rem;">spread</th></tr></thead>
+                <thead><tr><th style="${thBase}"></th>${head}<th style="${thBase} padding:4px 6px; text-align:right; color:#64748b; font-size:0.72rem;">spread</th></tr></thead>
                 <tbody>${rows}</tbody></table></div>
                 <div style="font-size:0.7rem; color:#94a3b8; margin-top:8px;">
                     Spread is max minus min across the models reporting a value. Amber and red mark
@@ -2588,8 +2596,8 @@
                 </div>
                 ${note}${cnote}
                 <div style="display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap;">
-                    <div style="flex:1 1 540px; min-width:340px;">${skewCompareSVG(picked)}</div>
-                    <div style="flex:1 1 330px; min-width:290px;">${skCompareTable(picked)}</div>
+                    <div style="flex:3 1 660px; min-width:340px;">${skewCompareSVG(picked)}</div>
+                    <div style="flex:1 1 360px; min-width:300px;">${skCompareTable(picked)}</div>
                 </div>`;
         }
 
@@ -2663,8 +2671,8 @@
                 </div>
                 ${warn}
                 <div style="display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap;">
-                    <div style="flex:1 1 560px; min-width:340px;">${skewSVG(entry)}</div>
-                    <div style="flex:0 1 260px; min-width:230px;">${skParamsPanel(entry)}</div>
+                    <div style="flex:3 1 680px; min-width:340px;">${skewSVG(entry)}</div>
+                    <div style="flex:1 1 290px; min-width:250px;">${skParamsPanel(entry)}</div>
                 </div>`;
         }
 
@@ -2701,7 +2709,7 @@
     </div>
     <div id="skModal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.55);
          align-items:flex-start; justify-content:center; z-index:920; padding:24px 14px; overflow:auto;">
-        <div style="background:#fff; border-radius:10px; max-width:1120px; width:100%; padding:16px 20px;
+        <div style="background:#fff; border-radius:10px; max-width:1680px; width:98%; padding:16px 20px;
              box-shadow:0 10px 40px rgba(0,0,0,0.3);">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
                 <strong style="font-size:1.02rem;">Skew-T / Log-P &mdash; KXMR</strong>
