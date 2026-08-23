@@ -2284,6 +2284,23 @@
         }
 
         // Every forecast hour present in ANY selected model.
+
+        // True until the model selection changes and a fresh opening hour is needed.
+        let skCmpNeedsSeek = true;
+
+        // How many selected models carry a profile at each hour, and the best index to open
+        // on: the first fully-covered hour, else the earliest best-covered one.
+        function skCmpCoverage(hours) {
+            return hours.map(h => skewCmpModels.filter(m => (soundings.models[m] || {})[h]).length);
+        }
+        function skCmpBestHourIdx(hours) {
+            const cov = skCmpCoverage(hours);
+            const full = cov.indexOf(skewCmpModels.length);
+            if (full >= 0) return full;
+            const best = Math.max(...cov, 0);
+            return Math.max(0, cov.indexOf(best));
+        }
+
         function skCmpHours() {
             const set = new Set();
             skewCmpModels.forEach(m => skHoursFor(m).forEach(h => set.add(h)));
@@ -2449,9 +2466,10 @@
                 }
                 rows += `<tr><td style="padding:3px 6px 3px 0; color:#475569; white-space:nowrap;">${r.lab}</td>${cells}<td style="padding:3px 0 3px 6px; text-align:right; font-size:0.76rem;">${sp}</td></tr>`;
             });
-            return `<table style="width:100%; border-collapse:collapse; font-size:0.8rem;">
+            return `<div style="overflow-x:auto; -webkit-overflow-scrolling:touch;">
+                <table style="width:100%; border-collapse:collapse; font-size:0.8rem; min-width:340px;">
                 <thead><tr><th></th>${head}<th style="padding:4px 0 4px 6px; text-align:right; color:#94a3b8; font-size:0.72rem;">spread</th></tr></thead>
-                <tbody>${rows}</tbody></table>
+                <tbody>${rows}</tbody></table></div>
                 <div style="font-size:0.7rem; color:#94a3b8; margin-top:8px;">
                     Spread is max minus min across the models reporting a value. Amber and red mark
                     differences large enough to change the read; thresholds are per-field, not a
@@ -2491,6 +2509,18 @@
                 body.innerHTML = '<div style="padding:20px; color:#b45309;">No profiles for the selected models.</div>';
                 return;
             }
+            // Land on an hour where the comparison is actually a comparison.
+            //
+            // The hour list is the UNION across selected models, and models sit on different
+            // cycles: a 06Z ECMWF starts hours before an 11Z HRRR does. Opening on index 0
+            // therefore opened on the earliest hour ANY model had — typically one where only
+            // that single model was plotted and every spread read as an em dash. The opening
+            // index is now the first fully-covered hour, or failing that the best-covered one.
+            // Once the user scrubs, their position is kept.
+            if (skCmpNeedsSeek) {
+                skewHourIdx = skCmpBestHourIdx(hours);
+                skCmpNeedsSeek = false;
+            }
             skewHourIdx = Math.max(0, Math.min(skewHourIdx, hours.length - 1));
             const hk = hours[skewHourIdx];
 
@@ -2507,11 +2537,31 @@
                 return;
             }
 
-            const note = missing.length
-                ? `<div style="background:#fef3c7; color:#78350f; padding:5px 8px; border-radius:4px; font-size:0.76rem; margin-bottom:8px;">
-                     No profile at ${hk}Z for <strong>${missing.map(ltLabel).join(', ')}</strong> — that model runs shorter
-                     than the others, so this hour is beyond its range rather than missing data.</div>`
-                : '';
+            // Say WHY a model is absent. Being before a model's first forecast hour and being
+            // past its last are completely different situations — the first means that model's
+            // run initialised later and has not reached this hour, the second means its run
+            // has ended. The old wording called both "runs shorter", which was wrong and
+            // actively confusing in the leading-edge case.
+            let note = '';
+            if (missing.length) {
+                const before = [], after = [], none = [];
+                const i = hours.indexOf(hk);
+                missing.forEach(m => {
+                    const hs = skHoursFor(m);
+                    if (!hs.length) { none.push(m); return; }
+                    const iFirst = hours.indexOf(hs[0]);
+                    const iLast = hours.indexOf(hs[hs.length - 1]);
+                    if (i < iFirst) before.push(m);
+                    else if (i > iLast) after.push(m);
+                    else none.push(m);
+                });
+                const bits = [];
+                if (before.length) bits.push(`<strong>${before.map(ltLabel).join(', ')}</strong> ${before.length === 1 ? 'has' : 'have'} not reached this hour yet (later cycle)`);
+                if (after.length) bits.push(`<strong>${after.map(ltLabel).join(', ')}</strong> ${after.length === 1 ? 'ends' : 'end'} before this hour`);
+                if (none.length) bits.push(`<strong>${none.map(ltLabel).join(', ')}</strong> ${none.length === 1 ? 'has' : 'have'} no profile here`);
+                note = `<div style="background:#fef3c7; color:#78350f; padding:5px 8px; border-radius:4px; font-size:0.76rem; margin-bottom:8px;">
+                     Not plotted at ${hk}Z: ${bits.join('; ')}.</div>`;
+            }
             const coarse = picked.filter(pk => pk.entry.coarse);
             const cnote = coarse.length
                 ? `<div style="background:#ede9fe; color:#4c1d95; padding:5px 8px; border-radius:4px; font-size:0.76rem; margin-bottom:8px;">
@@ -2525,6 +2575,8 @@
                     <label style="font-size:0.85rem; font-weight:600;">Model:</label>
                     <select onchange="skPickModel(this.value)" style="padding:3px 8px; border:1px solid #cbd5e1; border-radius:6px;">${modelOpts}</select>
                     <span style="margin-left:auto; font-weight:700; color:#2563eb;">${hk}Z</span>
+                    <span style="font-size:0.75rem; color:${picked.length === skewCmpModels.length ? '#15803d' : '#b45309'}; font-weight:600;">
+                        ${picked.length}/${skewCmpModels.length} models</span>
                 </div>
                 <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;">${boxes}</div>
                 <input type="range" min="0" max="${hours.length - 1}" value="${skewHourIdx}"
@@ -2544,6 +2596,7 @@
         function skToggleCmp(m) {
             const i = skewCmpModels.indexOf(m);
             if (i >= 0) skewCmpModels.splice(i, 1); else skewCmpModels.push(m);
+            skCmpNeedsSeek = true;
             // Keep a stable display order regardless of the order they were ticked.
             const order = Object.keys(soundings.models);
             skewCmpModels.sort((a, b) => order.indexOf(a) - order.indexOf(b));
@@ -2557,7 +2610,7 @@
                     const all = Object.keys(soundings.models);
                     skewCmpModels = all.slice(0, Math.min(3, all.length));
                 }
-                skewHourIdx = 0;
+                skCmpNeedsSeek = true;
                 skRenderCompare();
             } else {
                 skewCompare = false;
