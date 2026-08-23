@@ -87,6 +87,18 @@ ECMWF_ENS_PARAMS = ["t", "r", "u", "v"]   # gh omitted; heights fall back to bar
 # cycle and only refetched when a new one posts (~0.9 GB / 6 min when it does).
 ECMWF_ENS_CACHE_ENABLED = True
 
+# ---- Skew-T sounding export -----------------------------------------------------------
+# Ships the KXMR profiles the matrix was already built from into a SEPARATE soundings.json,
+# so the frontend can draw an interactive skew-T per model per forecast hour. Kept out of
+# history.json deliberately: that file carries five runs of history, and folding ~290 full
+# profiles into each snapshot would multiply its size for data only ever wanted for the
+# current run.
+SKEWT_ENABLED = True
+SKEWT_SITE = "kxmr"
+SKEWT_MAX_HOURS = 48       # forecast hours per model to export
+SKEWT_TOP_HPA = 100        # drop levels above this; nothing in the panel needs the stratosphere
+SKEWT_FILE = "soundings.json"
+
 # ---- Convective (cumulus) mask for the Thick Cloud Layer / Max Layer Thickness LLCC ----
 # The Thick Cloud Layer rule targets STRATIFORM decks; cumulus is governed by its own LLCC rule.
 # We use HRRR composite reflectivity as a convection detector: where a convective core sits within
@@ -214,6 +226,10 @@ GEFS_LEVELS_HPA = [1000, 925, 850, 700, 500, 400, 300, 250, 200, 150, 100]
 # The panel thermo needs only pressure/T/dewpoint/wind - geopotential height is never read, so
 # HGT is deliberately NOT fetched (that alone is ~20% of the bytes).
 GEFS_VARS = ("TMP", "RH", "UGRD", "VGRD")
+# Minimum members required before a forecast day is allowed into the panel. A row built from
+# one or two members has no meaningful spread — its min/max collapse toward the mean, which
+# reads as high confidence when it actually means "almost no data". Rows under this are dropped.
+GEFS_MIN_MEMBERS_PER_ROW = 8
 
 
 STN_COORDS = {
@@ -293,6 +309,51 @@ MAPS_DIR = "./maps"
 
 # Global cache for static grid indices to maximize ThreadPool performance
 _GRID_INDEX_CACHE = {}
+
+# ---- Model run (cycle) registry -------------------------------------------------------
+# Which model CYCLE produced each column, keyed (site, model) -> "YYYYMMDDHH". Every fetch
+# path records here as it resolves its cycle, and the payload carries the result so the
+# frontend can label a column "HRRR (12Z)" rather than leaving the user to guess whether
+# they are looking at the 12Z run or a six-hour-old one. Populated per site because the same
+# model name can come from different sources at different sites — HRRR is BUFKIT at the
+# airports and AWS at the pads, and those are not always the same cycle.
+_MODEL_CYCLES = {}
+
+
+def _record_cycle(site, model, cycle_key):
+    """Register the cycle behind one (site, model) column. cycle_key is 'YYYYMMDDHH'."""
+    if not site or not model or not cycle_key:
+        return
+    _MODEL_CYCLES[(str(site).lower(), str(model).lower())] = str(cycle_key)
+
+
+def _cycles_payload():
+    """Reshape the registry into {site: {model: cycle}} for history.json."""
+    out = {}
+    for (site, model), cyc in _MODEL_CYCLES.items():
+        out.setdefault(site, {})[model] = cyc
+    return out
+
+
+def _bufkit_init_cycle(bufkit_text):
+    """Model initialisation time from a BUFKIT file, as 'YYYYMMDDHH'.
+
+    BUFKIT carries one block per forecast hour, each stamped with its VALID time; the file
+    has no explicit init field, so the earliest valid time is f000 and therefore the cycle.
+    Two-digit years are resolved against the current century.
+    """
+    stamps = re.findall(r"TIME\s*=\s*(\d{6})/(\d{4})", bufkit_text or "")
+    best = None
+    for d, t in stamps:
+        try:
+            yy, mm, dd = int(d[0:2]), int(d[2:4]), int(d[4:6])
+            hh = int(t[0:2])
+            dt = datetime.datetime(2000 + yy, mm, dd, hh, tzinfo=datetime.timezone.utc)
+        except Exception:
+            continue
+        if best is None or dt < best:
+            best = dt
+    return best.strftime("%Y%m%d%H") if best else None
 
 
 def purge_workspace(cache_dir=CACHE_DIR):
@@ -1912,6 +1973,7 @@ def fetch_station_model(session, stn, model):
                     if body and "STID" in body:
                         data = parse_time_series_bufkit(body)
                         if data:
+                            _record_cycle(stn, model, _bufkit_init_cycle(body))
                             return stn, model, data
                         last = f"200 OK ({len(body)} B) but no parseable profiles"
                     else:
@@ -2272,6 +2334,8 @@ def fetch_all_pad_soundings():
             f_hours = list(range(step, max_fh + 1, step))
 
             logging.info(f"Fetching {model.upper()} pad columns: {date_str} {cycle}z, {len(f_hours)} hours")
+            for _pid in LAUNCH_PADS:
+                _record_cycle(_pid, model, f"{date_str}{cycle}")
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                 futures = []
                 for idx, fh in enumerate(f_hours):
@@ -2540,6 +2604,8 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
             f_hours = list(range(1, kind_max_fh + 1))
 
             logging.info(f"Fetching {kind.upper()} columns from AWS ({len(all_coords)} sites): {date_str} {cycle}z, {len(f_hours)} hours")
+            for _sid in all_coords:
+                _record_cycle(_sid, kind, f"{date_str}{cycle}")
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 futures = []
                 for idx, fh in enumerate(f_hours):
@@ -2609,6 +2675,10 @@ def fetch_all_ecmwf_soundings():
             target=target,
         )
         init_dt = getattr(result, "datetime", None)
+        if init_dt is not None:
+            _ec_cycle = init_dt.strftime("%Y%m%d%H")
+            for _sid in list(LAUNCH_PADS) + list(STATIONS):
+                _record_cycle(_sid, "ecmwf", _ec_cycle)
         size_kib = os.path.getsize(target) // 1024 if os.path.exists(target) else 0
         logging.info(f"ECMWF IFS: retrieved {size_kib} KiB, init {init_dt}, {len(steps)} steps.")
     except Exception as e:
@@ -3980,23 +4050,52 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
         except Exception:
             return False
 
-    # newest posted GEFS cycle (00/06/12/18Z), probing back up to 24 h
+    def _deepest_fh_for(cyc):
+        """The largest forecast hour this cycle needs to cover every 10Z day in range."""
+        best = 0
+        for fh in range(3, GEFS_MAX_FH + 1, 3):
+            v = cyc + datetime.timedelta(hours=fh)
+            if abs(v.hour - assess_hour) <= ASSESS_HOUR_TOL:
+                best = fh
+        return best
+
+    # Newest COMPLETE GEFS cycle, probing back up to 24 h.
+    #
+    # The previous version probed f003 only. GEFS posts progressively over roughly an hour,
+    # so f003 appears long before f168 — an hourly cron firing mid-post would accept the new
+    # cycle, then find the deep forecast hours missing and silently produce a 2-3 day panel
+    # instead of 7. Probing the DEEPEST hour the panel actually needs (plus a mid-range
+    # member, since members also trickle) means an in-progress cycle is skipped and the
+    # previous complete one is used until the new one has fully landed.
     now = datetime.datetime.now(datetime.timezone.utc)
     date_str = cycle = None
     cyc_dt = None
+    skipped_partial = None
     for back in range(0, 25):
         cand = now - datetime.timedelta(hours=back)
         if cand.hour not in (0, 6, 12, 18):
             continue
         d, cc = cand.strftime("%Y%m%d"), f"{cand.hour:02d}"
-        if _idx_ok(d, cc, "c00", 3):
-            date_str, cycle = d, cc
-            cyc_dt = cand.replace(minute=0, second=0, microsecond=0)
-            break
+        cand0 = cand.replace(minute=0, second=0, microsecond=0)
+        if not _idx_ok(d, cc, "c00", 3):
+            continue                      # cycle hasn't started posting at all
+        deep = _deepest_fh_for(cand0)
+        last_mem = members[-1]
+        if deep and not (_idx_ok(d, cc, "c00", deep) and _idx_ok(d, cc, last_mem, deep)):
+            # Started but not finished. Remember it so the log explains the fallback.
+            if skipped_partial is None:
+                skipped_partial = f"{d} {cc}z"
+            continue
+        date_str, cycle = d, cc
+        cyc_dt = cand0
+        break
     if not cycle:
-        logging.warning("GEFS thermo: no cycle .idx found on AWS after probing 24 h back; "
+        logging.warning("GEFS thermo: no COMPLETE cycle found on AWS after probing 24 h back; "
                         "GEFS omitted from panel.")
         return {}, None
+    if skipped_partial:
+        logging.info(f"GEFS thermo: cycle {skipped_partial} is still posting "
+                     f"(deep forecast hours absent) — using {date_str} {cycle}z instead.")
 
     cycle_key = f"{date_str}{cycle}"
     if GEFS_CACHE_ENABLED and isinstance(cache, dict) and cache.get("cycle") == cycle_key and cache.get("rows"):
@@ -4041,6 +4140,7 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
             return 0
 
     out = {}
+    dropped_rows = []
     probed = False
     for (_diff, fh, valid) in picks:
         rk = f"{valid.day:02d}/{valid.hour:02d}"
@@ -4077,17 +4177,38 @@ def fetch_gefs_member_thermo(site="kxmr", assess_hour=10, cache=None):
                         os.remove(local)
                     except Exception:
                         pass
-        if per:
+        # A row built from one or two members is not an ensemble — it is a single run wearing
+        # an ensemble's label, and it was reaching the panel as a legitimate-looking final day
+        # (its spread collapses to zero, which reads as high confidence rather than no data).
+        # Rows below the floor are dropped outright.
+        if per and len(per) >= GEFS_MIN_MEMBERS_PER_ROW:
             out[rk] = _ensemble_thermo_row(per)
+        elif per:
+            dropped_rows.append((rk, len(per)))
 
-    got = max((r.get("n", 0) for r in out.values()), default=0)
-    logging.info(f"GEFS thermo: cycle {date_str} {cycle}z, {got}/{len(members)} members returned, "
-                 f"{len(out)} rows near {assess_hour}Z at {site.upper()} (index-of-member mean).")
-    # Don't cache a badly degraded fetch — caching is keyed to the 6-hourly cycle, so a partial
-    # result would be frozen in for hours. Returning cycle_key=None forces a retry next run.
-    if out and got < max(2, len(members) // 2):
-        logging.warning(f"GEFS thermo: only {got}/{len(members)} members returned - not caching, "
-                        f"will refetch next run.")
+    if dropped_rows:
+        logging.warning("GEFS thermo: dropped %s under-populated row(s) (need >=%d members): %s"
+                        % (len(dropped_rows), GEFS_MIN_MEMBERS_PER_ROW,
+                           ", ".join(f"{rk} had {n}" for rk, n in dropped_rows)))
+
+    # Report the WEAKEST row, not the strongest. The old code took max() across rows, so a
+    # single full row masked a final day built from one member — exactly the case that made
+    # the panel look complete when it wasn't.
+    counts = [r.get("n", 0) for r in out.values()]
+    worst = min(counts) if counts else 0
+    best = max(counts) if counts else 0
+    logging.info(f"GEFS thermo: cycle {date_str} {cycle}z, members per row {worst}-{best} of "
+                 f"{len(members)}, {len(out)} rows near {assess_hour}Z at {site.upper()} "
+                 f"(index-of-member mean).")
+
+    # Only cache a result that is actually worth freezing for the next six hours: every row
+    # adequately populated AND the expected number of days present. Anything less returns
+    # cycle_key=None, which forces a refetch on the next run instead.
+    expected_days = len(picks)
+    complete = (out and worst >= max(2, len(members) // 2) and len(out) >= expected_days)
+    if not complete:
+        logging.warning(f"GEFS thermo: incomplete (rows {len(out)}/{expected_days}, weakest row "
+                        f"{worst}/{len(members)} members) — not caching, will refetch next run.")
         return out, None
     return out, cycle_key
 
@@ -4424,6 +4545,251 @@ def fetch_ecmwf_ens_member_thermo(site="kxmr", assess_hour=10, cache=None):
         logging.warning(f"ECMWF ENS: only {got}/{len(members)} members returned — not caching.")
         return out, None
     return out, cycle_key
+
+def _convective_params(layers):
+    """CAPE/CIN/LCL/LFC/EL for one profile, plus the existing KI/LI/Thompson/PWAT.
+
+    Surface-based AND mixed-layer parcels are both returned: at the Cape the two diverge
+    sharply on a sea-breeze day, and which one matters depends on whether the forcing is
+    surface convergence or elevated. Returns {} when the profile is too thin to trust.
+
+    MetPy is the reference path. The numpy fallback below it computes CAPE/CIN by direct
+    integration; it agrees with MetPy to within a few percent on well-resolved soundings but
+    degrades on coarse mandatory-level columns, so the engine used is always reported.
+    """
+    try:
+        good = sorted([L for L in layers
+                       if L.get("pres") and L.get("tmpc") is not None and L.get("dwpt") is not None],
+                      key=lambda x: -x["pres"])
+        if len(good) < 5:
+            return {}
+        out = {}
+        if _HAVE_METPY:
+            try:
+                import metpy.calc as mc
+                from metpy.units import units as u
+                p = np.array([L["pres"] for L in good]) * u.hPa
+                T = np.array([L["tmpc"] for L in good]) * u.degC
+                Td = np.array([min(L["dwpt"], L["tmpc"]) for L in good]) * u.degC
+
+                def _f(q, nd=1):
+                    try:
+                        v = float(np.atleast_1d(q.magnitude)[0])
+                        return None if (v != v) else round(v, nd)
+                    except Exception:
+                        return None
+
+                sbcape, sbcin = mc.surface_based_cape_cin(p, T, Td)
+                out["sbcape"] = _f(sbcape, 0)
+                out["sbcin"] = _f(sbcin, 0)
+                try:
+                    mlcape, mlcin = mc.mixed_layer_cape_cin(p, T, Td,
+                                                            depth=_ML_DEPTH_HPA * u.hPa)
+                    out["mlcape"] = _f(mlcape, 0)
+                    out["mlcin"] = _f(mlcin, 0)
+                except Exception:
+                    pass
+                lcl_p, lcl_t = mc.lcl(p[0], T[0], Td[0])
+                out["lcl_p"] = _f(lcl_p, 1)
+                try:
+                    prof = mc.parcel_profile(p, T[0], Td[0])
+                    lfc_p, _ = mc.lfc(p, T, Td, parcel_temperature_profile=prof)
+                    el_p, _ = mc.el(p, T, Td, parcel_temperature_profile=prof)
+                    out["lfc_p"] = _f(lfc_p, 1)
+                    out["el_p"] = _f(el_p, 1)
+                except Exception:
+                    pass
+                out["cape_engine"] = "metpy"
+            except Exception as e:
+                logging.debug(f"MetPy convective params failed, falling back: {e}")
+
+        if "sbcape" not in out:
+            out.update(_cape_numpy(good))
+            out["cape_engine"] = "numpy"
+
+        # Reuse the existing index calculation so the skew-T panel and the 10Z panel can
+        # never disagree about Thompson or PWAT for the same profile.
+        base = compute_launch_thermo(layers) or {}
+        for k in ("k_index", "lifted_index", "thompson", "pwat_in", "rh_700_500"):
+            if base.get(k) is not None:
+                out[k] = base[k]
+        return out
+    except Exception:
+        return {}
+
+
+def _cape_numpy(layers):
+    """Surface-parcel CAPE/CIN/LCL/LFC/EL by direct integration, for when MetPy is absent.
+
+    Lifts the surface parcel dry-adiabatically to its LCL, then along a pseudoadiabat, and
+    integrates g*(Tv_parcel - Tv_env)/Tv_env through the column. Virtual temperature is used
+    rather than plain temperature — ignoring it understates CAPE by roughly 10% in the moist
+    Florida boundary layer.
+
+    Two things this gets right that a naive integration does not:
+      * Below the LCL the parcel's MIXING RATIO is conserved, not its dewpoint. Recomputing
+        saturation mixing ratio at each level instead inflates the parcel's virtual
+        temperature and badly overstates CAPE.
+      * CIN is only meaningful up to the LFC. If the parcel never becomes buoyant, there is
+        no LFC and no CAPE, and integrating negative area to the tropopause produces a
+        meaningless five-figure CIN — so the search stops at CIN_SEARCH_TOP_HPA and reports
+        no LFC instead.
+    """
+    CIN_SEARCH_TOP_HPA = 450.0   # above this with no LFC, the parcel is not going anywhere
+    out = {}
+    try:
+        p0 = layers[0]["pres"]; t0 = layers[0]["tmpc"]; td0 = min(layers[0]["dwpt"], t0)
+        tk = t0 + 273.15; tdk = td0 + 273.15
+        tlcl = 1.0 / (1.0 / (tdk - 56.0) + math.log(tk / tdk) / 800.0) + 56.0  # Bolton 1980
+        theta = tk * (1000.0 / p0) ** 0.2854
+        p_lcl = 1000.0 * (tlcl / theta) ** (1.0 / 0.2854)
+        out["lcl_p"] = round(p_lcl, 1)
+
+        def _es(tc):
+            return 6.112 * math.exp(17.67 * tc / (tc + 243.5))
+
+        def _mixr(tc, pr):
+            e = _es(tc)
+            return 0.622 * e / max(1e-6, pr - e)
+
+        def _tv(tc, w):
+            return (tc + 273.15) * (1.0 + 0.61 * w)
+
+        def _moist_lapse(tc, pr):
+            tkl = tc + 273.15
+            w = _mixr(tc, pr)
+            num = 1.0 + (2.501e6 * w) / (287.0 * tkl)
+            den = 1.0 + (2.501e6 ** 2 * w * 0.622) / (1004.0 * 287.0 * tkl * tkl)
+            return (287.0 * tkl / (1004.0 * pr)) * (num / den)
+
+        w0 = _mixr(td0, p0)          # conserved below the LCL
+        cape = cin = 0.0
+        lfc_p = el_p = None
+        prev = None
+        t_par = t0
+        for L in layers:
+            pr = L["pres"]
+            if pr > p0:
+                continue
+            if prev is not None:
+                dp = prev[0] - pr
+                if dp <= 0:
+                    continue
+                if pr >= p_lcl:
+                    t_par = (t_par + 273.15) * (pr / prev[0]) ** 0.2854 - 273.15
+                else:
+                    steps = max(1, int(dp / 5))
+                    sub = dp / steps
+                    pp = prev[0]
+                    for _ in range(steps):
+                        t_par += _moist_lapse(t_par, pp) * (-sub)
+                        pp -= sub
+            w_par = w0 if pr >= p_lcl else _mixr(t_par, pr)
+            w_env = _mixr(min(L["dwpt"], L["tmpc"]), pr)
+            tv_env = _tv(L["tmpc"], w_env)
+            buoy = (_tv(t_par, w_par) - tv_env) / tv_env
+            if prev is not None:
+                dz = 29.27 * (L["tmpc"] + 273.15) * math.log(prev[0] / pr)
+                contrib = 9.81 * buoy * dz
+                if buoy > 0:
+                    if lfc_p is None:
+                        lfc_p = pr
+                    cape += contrib
+                elif lfc_p is None:
+                    if pr >= CIN_SEARCH_TOP_HPA:
+                        cin += contrib
+                elif el_p is None:
+                    el_p = pr
+            prev = (pr, L["tmpc"])
+
+        if lfc_p is None:
+            # No level of free convection within the search layer: fully capped.
+            out["sbcape"] = 0.0
+            out["sbcin"] = round(min(0.0, cin), 0)
+            return out
+        out["sbcape"] = round(max(0.0, cape), 0)
+        out["sbcin"] = round(min(0.0, cin), 0)
+        out["lfc_p"] = round(lfc_p, 1)
+        if el_p:
+            out["el_p"] = round(el_p, 1)
+    except Exception:
+        pass
+    return out
+
+
+def build_soundings_export(combined_data, site="kxmr", max_hours=SKEWT_MAX_HOURS):
+    """Compact per-model, per-hour soundings at one site, for the frontend skew-T.
+
+    Must run BEFORE generate_aviation_dashboard strips `_layers`, since it reuses exactly the
+    profiles the matrix was built from — no refetching, and no risk of the skew-T disagreeing
+    with the table beside it.
+    """
+    if not SKEWT_ENABLED:
+        return None
+    site = site.lower()
+    models = (combined_data.get(site) or {})
+    if not models:
+        logging.warning(f"Skew-T export: no data for {site.upper()}.")
+        return None
+
+    t0 = time.time()
+    out = {"site": site.upper(), "models": {}, "n_profiles": 0}
+    for mdl, rows in models.items():
+        if not isinstance(rows, dict):
+            continue
+        keys = sorted(rows.keys(), key=lambda k: _row_sort_key(k))[:max_hours]
+        prof_out = {}
+        for rk in keys:
+            prof = rows.get(rk)
+            if not isinstance(prof, dict):
+                continue
+            layers = prof.get("_layers") or []
+            if len(layers) < 5:
+                continue
+            lv = []
+            for L in layers:
+                if L.get("pres") is None or L.get("tmpc") is None:
+                    continue
+                if L["pres"] < SKEWT_TOP_HPA:
+                    continue
+                lv.append([
+                    round(L["pres"], 1),
+                    round(L["hght"]) if L.get("hght") is not None else None,
+                    round(L["tmpc"], 1),
+                    round(L["dwpt"], 1) if L.get("dwpt") is not None else None,
+                    round(L["drct"]) if L.get("drct") is not None else None,
+                    round(L["sknt"], 1) if L.get("sknt") is not None else None,
+                ])
+            if len(lv) < 5:
+                continue
+            entry = {"lv": lv}
+            params = _convective_params(layers)
+            if params:
+                entry["p"] = params
+            # Carry the provenance flags so the skew-T panel can repeat the same warnings
+            # the matrix cell shows rather than presenting a coarse column as authoritative.
+            if prof.get("coarse"):
+                entry["coarse"] = prof["coarse"]
+            if prof.get("stale"):
+                entry["stale"] = prof["stale"]
+            prof_out[rk] = entry
+            out["n_profiles"] += 1
+        if prof_out:
+            out["models"][mdl] = prof_out
+
+    out["elapsed_s"] = round(time.time() - t0, 1)
+    logging.info(f"Skew-T export: {out['n_profiles']} profiles across "
+                 f"{len(out['models'])} models at {site.upper()} in {out['elapsed_s']}s.")
+    return out
+
+
+def _row_sort_key(rk):
+    """Sort 'DD/HH' row keys across a month boundary."""
+    try:
+        d, h = map(int, rk.split("/"))
+        return (d if d > 15 else d + 32, h)
+    except Exception:
+        return (999, 999)
 
 def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_rows=None,
                         gefs_member_rows=None, ecens_member_rows=None):
@@ -4798,6 +5164,17 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         logging.error(f"Launch thermo build failed: {e}")
         launch_thermo = {"site": "KXMR", "hour": 10, "models": [], "by_model": {}}
 
+    # Skew-T export MUST happen here: it reuses the very `_layers` the next block deletes.
+    try:
+        skewt = build_soundings_export(combined_data, site=SKEWT_SITE)
+        if skewt:
+            with open(SKEWT_FILE, "w") as f:
+                json.dump(skewt, f, separators=(",", ":"))
+            logging.info(f"Skew-T soundings written to {SKEWT_FILE} "
+                         f"({os.path.getsize(SKEWT_FILE) / 1e6:.1f} MB).")
+    except Exception as e:
+        logging.error(f"Skew-T export failed (dashboard continues): {e}")
+
     # Strip the raw sounding layers stashed for on-demand thermo — they must NOT bloat history.json.
     for _sid, _models in combined_data.items():
         if not isinstance(_models, dict):
@@ -4818,8 +5195,22 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     thermo_runs.insert(0, {"timestamp": current_timestamp, "thermo": launch_thermo})
     thermo_runs = thermo_runs[:LAUNCH_THERMO_HISTORY_RUNS]
 
+    # Which model run produced each column, so the frontend can label "HRRR (12Z)".
+    # Panel-only ensembles report their own cycle separately — they are not matrix columns.
+    panel_cycles = {}
+    if gefs_cycle_key:
+        panel_cycles["gefs"] = gefs_cycle_key
+    elif isinstance(prior_gefs_cache, dict) and prior_gefs_cache.get("cycle"):
+        panel_cycles["gefs"] = prior_gefs_cache["cycle"]
+    if ecens_cycle_key:
+        panel_cycles["ecens"] = ecens_cycle_key
+    elif isinstance(prior_ecens_cache, dict) and prior_ecens_cache.get("cycle"):
+        panel_cycles["ecens"] = prior_ecens_cache["cycle"]
+
     payload = {
         "runs": history_runs,
+        "model_cycles": _cycles_payload(),
+        "panel_cycles": panel_cycles,
         "href_maps_latest": href_maps_latest,
         "launch_thermo": launch_thermo,
         "launch_thermo_runs": thermo_runs,
@@ -4931,9 +5322,21 @@ def run_pipeline():
                 for kind, rows in kinds.items():
                     if not rows:
                         continue
-                    # AWS HRRR only fills pad columns; airports retain BUFKIT HRRR.
+                    # AWS HRRR normally fills pad columns only, because the airports have
+                    # richer ~40-level BUFKIT HRRR soundings. When BUFKIT is unavailable
+                    # (PSU closed public access to the archive in Aug 2026), an airport HRRR
+                    # column would otherwise sit empty once carry-forward ages out — so fall
+                    # back to the AWS column rather than showing nothing. Mandatory isobaric
+                    # levels give only 2-3 points below 2,000 ft, so LLWS on a fallback column
+                    # is the same bulk estimate the pads use; it is tagged so the frontend can
+                    # say so rather than letting it pass as a BUFKIT-quality number.
                     if kind == "hrrr" and not is_pad:
-                        continue
+                        if target[sid].get("hrrr"):
+                            continue  # a real BUFKIT column arrived this run; don't clobber it
+                        rows = {rk: dict(p, coarse="AWS HRRR (isobaric levels)")
+                                for rk, p in rows.items() if isinstance(p, dict)}
+                        logging.info(f"HRRR {sid}: no BUFKIT column, using AWS isobaric fallback "
+                                     f"({len(rows)} hours).")
                     target[sid][kind] = rows
             r_hours = sum(len(k.get("rrfs", {})) for k in aws_matrix.values())
             e_hours = sum(len(k.get("refs", {})) for k in aws_matrix.values())
