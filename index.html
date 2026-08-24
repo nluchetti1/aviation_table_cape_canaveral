@@ -2142,7 +2142,12 @@
                 if (!p || p < SK_P_TOP || p > SK_P_BOT) return;
                 const y = skY(p);
                 s += `<line x1="${SK_L}" y1="${y}" x2="${SK_L + SK_W + SK_SKEW}" y2="${y}" stroke="${col}" stroke-width="1" stroke-dasharray="6 4" opacity="0.85"/>`;
-                s += `<text x="${SK_L + 4}" y="${y - 3}" font-size="9" font-weight="700" fill="${col}">${lab} ${Math.round(p)}</text>`;
+                // Height first, pressure second: the y-axis is already pressure, so repeating it
+                // adds nothing, whereas the height is the number that gets read out loud.
+                const aglft = skAglFt(lv, p);
+                const shown = aglft == null ? `${Math.round(p)} hPa`
+                            : `${(aglft / 1000).toFixed(1)} kft`;
+                s += `<text x="${SK_L + 4}" y="${y - 3}" font-size="9" font-weight="700" fill="${col}">${lab} ${shown}</text>`;
             });
 
             // wind barbs, thinned so they don't overlap
@@ -2162,6 +2167,24 @@
             return s;
         }
 
+
+        // Pressure -> height above ground, in feet. The level list carries height MSL, so the
+        // surface level is subtracted. A cloud base means nothing to a forecaster in hPa; it
+        // means something in feet AGL, which is also the unit the ceiling column and any TAF
+        // would use. Returns null when the profile carries no heights, in which case the
+        // caller falls back to showing pressure.
+        function skAglFt(lv, p) {
+            if (!lv || !lv.length || p == null) return null;
+            const sfc = lv[0][1];
+            if (sfc == null) return null;
+            const h = skHeightAt(lv, p);
+            return h == null ? null : Math.max(0, h - sfc);
+        }
+        function skFtStr(ft) {
+            if (ft == null) return null;
+            return Math.round(ft).toLocaleString('en-US') + ' ft';
+        }
+
         function skParamsPanel(entry) {
             const p = entry.p || {};
             const row = (lab, val, unit, hint) => {
@@ -2171,16 +2194,28 @@
                         <td style="padding:3px 0 3px 8px; color:#94a3b8; font-size:0.72rem;">${hint || ''}</td></tr>`;
             };
             const capeCol = (c) => c == null ? '' : (c >= 2500 ? 'color:#991b1b;' : c >= 1000 ? 'color:#b45309;' : '');
+            // Levels read in feet AGL, with the pressure kept alongside in the hint column —
+            // the model speaks hPa, the console and the TAF speak feet, and losing the
+            // pressure entirely would make it harder to cross-check against the plot.
+            const lvlRow = (lab, hpa, hint) => {
+                if (hpa == null) return row(lab, null, '', hint);
+                const ft = skAglFt(entry.lv, hpa);
+                const shown = ft == null ? `${hpa} hPa` : skFtStr(ft);
+                const note = ft == null ? hint : `${hint} \u00b7 ${Math.round(hpa)} hPa`;
+                return `<tr><td style="padding:3px 8px 3px 0; color:#475569;">${lab}</td>
+                        <td style="padding:3px 0; font-weight:700; text-align:right;">${shown}</td>
+                        <td style="padding:3px 0 3px 8px; color:#94a3b8; font-size:0.72rem;">${note}</td></tr>`;
+            };
             return `<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">
                 <tr><td colspan="3" style="padding-top:2px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0;">Parcel</td></tr>
                 ${row('SBCAPE', p.sbcape, ' J/kg', 'surface parcel')}
                 ${row('SBCIN', p.sbcin, ' J/kg', 'inhibition')}
                 ${row('MLCAPE', p.mlcape, ' J/kg', 'mixed layer')}
                 ${row('MLCIN', p.mlcin, ' J/kg', '')}
-                <tr><td colspan="3" style="padding-top:8px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0;">Levels</td></tr>
-                ${row('LCL', p.lcl_p, ' hPa', 'cloud base')}
-                ${row('LFC', p.lfc_p, ' hPa', 'free convection')}
-                ${row('EL', p.el_p, ' hPa', 'equilibrium')}
+                <tr><td colspan="3" style="padding-top:8px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0;">Levels <span style="font-weight:400; color:#94a3b8; font-size:0.72rem;">(ft AGL)</span></td></tr>
+                ${lvlRow('LCL', p.lcl_p, 'cloud base')}
+                ${lvlRow('LFC', p.lfc_p, 'free convection')}
+                ${lvlRow('EL', p.el_p, 'equilibrium')}
                 <tr><td colspan="3" style="padding-top:8px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0;">Indices</td></tr>
                 ${row('K-Index', p.k_index, '', '')}
                 ${row('Lifted Index', p.lifted_index, '', 'mixed-layer')}
@@ -2426,9 +2461,12 @@
             { k: 'sbcape', lab: 'SBCAPE', unit: '', dp: 0, watch: 500, split: 1200, grp: 'Parcel' },
             { k: 'sbcin', lab: 'SBCIN', unit: '', dp: 0, watch: 50, split: 125 },
             { k: 'mlcape', lab: 'MLCAPE', unit: '', dp: 0, watch: 500, split: 1200 },
-            { k: 'lcl_p', lab: 'LCL', unit: ' hPa', dp: 0, watch: 25, split: 50, grp: 'Levels' },
-            { k: 'lfc_p', lab: 'LFC', unit: ' hPa', dp: 0, watch: 50, split: 100 },
-            { k: 'el_p', lab: 'EL', unit: ' hPa', dp: 0, watch: 50, split: 100 },
+            // Levels in feet AGL rather than hPa. Thresholds are rebased accordingly: 25 hPa
+            // near the surface is roughly 700 ft, while 50 hPa at the EL is several thousand,
+            // so the same pressure difference means very different things at the two ends.
+            { k: '_lcl_ft', lab: 'LCL', unit: ' ft', dp: 0, watch: 500, split: 1200, grp: 'Levels (ft AGL)' },
+            { k: '_lfc_ft', lab: 'LFC', unit: ' ft', dp: 0, watch: 1500, split: 3000 },
+            { k: '_el_ft', lab: 'EL', unit: ' ft', dp: 0, watch: 3000, split: 6000 },
             { k: '_t0', lab: '0\u00b0C hgt', unit: ' kft', dp: 1, watch: 1.0, split: 2.0, grp: 'Charging layer' },
             { k: '_t20', lab: '\u221220\u00b0C hgt', unit: ' kft', dp: 1, watch: 1.0, split: 2.0 },
             { k: '_depth', lab: 'depth', unit: ' kft', dp: 1, watch: 1.0, split: 2.0 },
@@ -2444,14 +2482,31 @@
             picked.forEach(pk => {
                 const p = pk.entry.p || {};
                 const cs = skChargeStats(pk.entry);
-                vals[pk.model] = Object.assign({}, p, { _t0: cs.t0, _t20: cs.t20, _depth: cs.depth });
+                vals[pk.model] = Object.assign({}, p, {
+                    _t0: cs.t0, _t20: cs.t20, _depth: cs.depth,
+                    _lcl_ft: skAglFt(pk.entry.lv, p.lcl_p),
+                    _lfc_ft: skAglFt(pk.entry.lv, p.lfc_p),
+                    _el_ft: skAglFt(pk.entry.lv, p.el_p),
+                });
             });
             // The page-wide `th` rule is a solid blue with white text, which made the GFS
             // header (blue) invisible against it. Every header cell in this table overrides
             // the background explicitly so the model colour is what's read.
             const thBase = 'background:#f8fafc; border-bottom:2px solid #e2e8f0; position:static;';
-            const head = picked.map(pk =>
-                `<th style="${thBase} padding:4px 5px; text-align:right; color:${skCmpColor(pk.model)}; font-size:0.74rem; font-weight:700;">${ltLabel(pk.model)}</th>`).join('');
+            // Each column carries the model RUN beneath its name. Comparing a 2-hour-old HRRR
+            // against a 9-hour-old GFS is a different exercise from comparing two fresh runs,
+            // and the difference is invisible without this.
+            const head = picked.map(pk => {
+                const ck = cycleFor('kxmr', pk.model);
+                const lab = cycleLabel(ck);
+                const stale = lab && cycleIsStale(pk.model, ck);
+                const age = ck ? cycleAgeH(ck) : null;
+                const sub = lab
+                    ? `<div title="Run ${ck}${age != null ? ' \u2014 ' + age.toFixed(1) + ' h old' : ''}"
+                         style="font-weight:600; font-size:0.68rem; color:${stale ? '#b45309' : '#94a3b8'};">${lab}${stale ? ' \u26a0' : ''}</div>`
+                    : '';
+                return `<th style="${thBase} padding:4px 5px; text-align:right; color:${skCmpColor(pk.model)}; font-size:0.74rem; font-weight:700;">${ltLabel(pk.model)}${sub}</th>`;
+            }).join('');
             let rows = '';
             SK_CMP_ROWS.forEach(r => {
                 if (r.grp) {
@@ -2463,14 +2518,19 @@
                 });
                 const real = got.filter(v => v != null);
                 const spread = real.length >= 2 ? Math.max(...real) - Math.min(...real) : null;
+                // Four- and five-figure heights need separators to stay scannable in a column.
+                const fmt = (v) => (r.unit === ' ft')
+                    ? Math.round(v).toLocaleString('en-US') + ' ft'
+                    : v.toFixed(r.dp) + r.unit;
                 const cells = got.map(v =>
-                    `<td style="padding:3px 5px; text-align:right; font-weight:600;">${v == null ? '\u2014' : v.toFixed(r.dp) + r.unit}</td>`).join('');
+                    `<td style="padding:3px 5px; text-align:right; font-weight:600;">${v == null ? '\u2014' : fmt(v)}</td>`).join('');
                 let sp = '<span style="color:#cbd5e1;">\u2014</span>';
                 if (spread != null) {
                     const sty = spread >= r.split ? 'background:#fee2e2; color:#991b1b;'
                               : spread >= r.watch ? 'background:#fef3c7; color:#78350f;'
                               : 'color:#94a3b8;';
-                    sp = `<span style="${sty} padding:1px 6px; border-radius:9px; font-weight:600;">${spread.toFixed(r.dp)}</span>`;
+                    const spTxt = (r.unit === ' ft') ? Math.round(spread).toLocaleString('en-US') : spread.toFixed(r.dp);
+                    sp = `<span style="${sty} padding:1px 6px; border-radius:9px; font-weight:600;">${spTxt}</span>`;
                 }
                 rows += `<tr><td style="padding:3px 6px 3px 0; color:#475569; white-space:nowrap;">${r.lab}</td>${cells}<td style="padding:3px 0 3px 6px; text-align:right; font-size:0.76rem;">${sp}</td></tr>`;
             });
