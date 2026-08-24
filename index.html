@@ -226,11 +226,37 @@
         }
         // Rapidly-updating models going stale matters more than slow ones: a 9-hour-old HRRR
         // is a problem, a 9-hour-old GFS is normal.
-        const CYCLE_STALE_H = { hrrr: 4, rap: 4, rrfs: 5, refs: 9, gfs: 9, ecmwf: 15, gefs: 9, ecens: 15 };
+        // A run being OLD is not the same as a run being LATE, and only the second is worth
+        // a warning. The first version used flat age limits, which flagged a 9.4 h old 00Z GFS
+        // at 09:22Z — even though the 06Z GFS had not finished running yet, so 00Z was
+        // correctly the newest run in existence. That trains people to ignore the marker.
+        //
+        // The honest test is "should a newer run have landed by now?", which is
+        //     cycle interval + how long that source takes to publish + a margin.
+        // `every` is the spacing between cycles this pipeline can actually use; `lag` is
+        // roughly when the file appears, measured from cycle time. BUFKIT lags further than
+        // GRIB because PSU cannot build a .buf until the whole model run has finished, while
+        // NOMADS and AWS publish forecast-hour by forecast-hour.
+        const CYCLE_TIMING = {
+            hrrr:  { every: 1, lag: 2 },    // hourly; AWS fetch already waits HRRR_LATENCY_H
+            rap:   { every: 1, lag: 2.5 },  // hourly, via BUFKIT
+            rrfs:  { every: 6, lag: 4 },    // RRFS_CYCLE_HOURS = 00/06/12/18
+            refs:  { every: 6, lag: 5 },
+            gfs:   { every: 6, lag: 6 },    // 06Z GFS BUFKIT lands ~11-12Z
+            gefs:  { every: 6, lag: 6 },
+            ecmwf: { every: 6, lag: 9 },    // IFS open data posts ~8 h after cycle time
+            ecens: { every: 6, lag: 9 },
+        };
+        const CYCLE_STALE_MARGIN_H = 1.5;   // slack for a slow but not broken publish
+        function cycleStaleLimit(model) {
+            const t = CYCLE_TIMING[(model || '').toLowerCase()];
+            if (!t) return 14;
+            return t.every + t.lag + CYCLE_STALE_MARGIN_H;
+        }
         function cycleIsStale(model, key) {
             const age = cycleAgeH(key);
             if (age == null) return false;
-            return age > (CYCLE_STALE_H[(model || '').toLowerCase()] || 12);
+            return age > cycleStaleLimit(model);
         }
         function cycleTag(site, model) {
             const key = cycleFor(site, model);
@@ -241,7 +267,7 @@
             const col = stale ? '#fca5a5' : 'rgba(255,255,255,0.82)';
             const title = `Run ${key.slice(0,4)}-${key.slice(4,6)}-${key.slice(6,8)} ${lab}` +
                           (age != null ? ` — ${age.toFixed(1)} h old` : '') +
-                          (stale ? ' (older than expected for this model)' : '');
+                          (stale ? ` — a newer run should have landed by now (expected within ${cycleStaleLimit(model).toFixed(1)} h)` : '');
             return `<br><span title="${title}" style="font-weight:normal; font-size:0.7em; color:${col};">${lab}${stale ? ' \u26a0' : ''}</span>`;
         }
         const launchMetrics = ['hght_p5c', 'hght_0c', 'hght_5c', 'hght_10c', 'hght_15c', 'hght_20c', 'cloud_top', 'cloud_thick', 'thick_layer', 'cuP_neg10_5nm', 'cuP_neg20_10nm', 'ct_thunder'];
@@ -2364,17 +2390,32 @@
             // Per-model freezing / -20 C tick marks at the left edge, in the model's colour.
             // A shaded band is meaningless with several models, but the LEVELS still matter,
             // so each model gets a short tick instead of a full-width line.
+            // Per-model charging-layer boundaries. A shaded band is meaningless with several
+            // models (whose 0 C?), so each model contributes a tick at its own 0 C and -20 C
+            // level instead. The horizontal spread across a tick group IS the disagreement
+            // shown in the table's charging-layer rows.
+            //
+            // LABELLED, because an unannotated cluster of coloured dashes at the edge of a
+            // skew-T is indistinguishable from a rendering artifact.
+            const tickMeta = { 0: null, '-20': null };
             picked.forEach((pk, idx) => {
                 const T = [];
                 (pk.entry.lv || []).forEach(r => { if (r[0] != null && r[2] != null) T.push([r[2], r[0]]); });
                 if (T.length < 3) return;
-                [[0, 5], [-20, 5]].forEach(([tt, len]) => {
+                [0, -20].forEach(tt => {
                     const p = skCrossP(T, tt);
                     if (!p || p < SK_P_TOP || p > SK_P_BOT) return;
                     const y = skY(p);
-                    const x = SK_L + 2 + idx * 7;
-                    s += `<line x1="${x}" y1="${(y - len).toFixed(1)}" x2="${x}" y2="${(y + len).toFixed(1)}" stroke="${skCmpColor(pk.model)}" stroke-width="2.4" opacity="0.85"/>`;
+                    const x = SK_L + 6 + idx * 7;
+                    s += `<line x1="${x}" y1="${(y - 5).toFixed(1)}" x2="${x}" y2="${(y + 5).toFixed(1)}" stroke="${skCmpColor(pk.model)}" stroke-width="2.4" opacity="0.9"><title>${ltLabel(pk.model)} ${tt}\u00b0C level</title></line>`;
+                    const key = String(tt);
+                    if (tickMeta[key] == null || y < tickMeta[key]) tickMeta[key] = y;
                 });
+            });
+            Object.entries(tickMeta).forEach(([tt, y]) => {
+                if (y == null) return;
+                const lab = (tt === '0') ? '0\u00b0C' : '\u221220\u00b0C';
+                s += `<text x="${SK_L + 6 + picked.length * 7 + 3}" y="${(y + 3.5).toFixed(1)}" font-size="8" fill="#64748b" font-weight="600">${lab}</text>`;
             });
 
             // Traces: temperature solid, dewpoint dashed, one colour per model.
@@ -2393,7 +2434,7 @@
             });
 
             // Legend, top-left inside the frame where the traces are always cold and far right.
-            const lw = 104, lh = 16 + picked.length * 14;
+            const lw = 112, lh = 26 + picked.length * 14;
             s += `<rect x="${SK_L + 8}" y="${SK_T0 + 8}" width="${lw}" height="${lh}" fill="#ffffff" stroke="#cbd5e1" stroke-width="0.8" rx="4" opacity="0.94"/>`;
             picked.forEach((pk, i) => {
                 const yy = SK_T0 + 22 + i * 14;
@@ -2401,6 +2442,7 @@
                 s += `<text x="${SK_L + 36}" y="${yy}" font-size="9" fill="${skCmpColor(pk.model)}" font-weight="700">${ltLabel(pk.model)}</text>`;
             });
             s += `<text x="${SK_L + 15}" y="${SK_T0 + 22 + picked.length * 14 + 1}" font-size="7.5" fill="#94a3b8">solid T \u00b7 dashed Td</text>`;
+            s += `<text x="${SK_L + 15}" y="${SK_T0 + 22 + picked.length * 14 + 10}" font-size="7.5" fill="#94a3b8">ticks: 0 / \u221220\u00b0C levels</text>`;
 
             // Wind barbs, one column per model.
             picked.forEach((pk, idx) => {
