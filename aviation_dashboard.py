@@ -213,7 +213,33 @@ REFS_MEMBER_WINDOW_FH = 60
 # XMR for the 10Z hours, compute the indices per member, and average the RESULTS — the valid way to
 # get an ensemble TI/PWAT (never from the ensemble-MEAN sounding). Costs a handful of member GRIB
 # range-reads per run (only the ~2-3 forecast hours that land on 10Z), so it's gated here.
-REFS_MEMBER_THERMO_ENABLED = True
+# Individual REFS members are NOT published on the NOMADS parallel feed — only derived
+# ensemble products (mean, sprd, pmmn, lpmm, avrg, prob, eas). The per-member sweep this flag
+# controls has nothing to read, so it stays off.
+#
+# WHAT THAT COSTS, plainly: the 10Z panel's REFS row is now computed FROM the ensemble mean
+# sounding rather than being the mean of indices computed per member. Those are different
+# quantities. Averaging soundings smooths the moisture profile, so the mean sounding is drier
+# wherever members disagreed, and its Thompson / PWAT / K-Index read systematically less
+# unstable than the ensemble actually is. Still a useful airmass signal; not an ensemble index,
+# and it carries no spread. Restore this the moment members reappear.
+REFS_MEMBER_THERMO_ENABLED = False
+
+# Show the REFS ensemble MEAN in the 10Z panel now that per-member soundings are gone.
+#
+# This is a compromise, not a free win. Airmass indices from a MEAN SOUNDING are biased:
+# averaging relative humidity across members smooths away the moisture structure, so PWAT
+# and K-Index read drier and Lifted Index reads more stable than the ensemble's own average
+# of those quantities would. The bias grows with member spread — it is smallest on a
+# well-agreed airmass and worst exactly when the members disagree, which is when you would
+# most want the number.
+#
+# The WIND fields do not suffer this: averaging u/v across members is linear, so the
+# 1000-700 mb mean flow, the regime and the anvil flow are as valid from the mean as from
+# the members. That is most of why the row is worth having at all.
+#
+# Set False to go back to omitting REFS from the panel entirely.
+REFS_MEAN_IN_PANEL = True
 
 # ---- GEFS ensemble column for the 10Z panel (global 0.5 deg, AWS mirror) ---------------------
 # Panel-only: GEFS is far coarser than the mesoscale columns and would add nothing to the hourly
@@ -279,14 +305,41 @@ MSG_INDEX_THRESHOLDS = {1: "p25", 2: "p50", 3: "p100", 4: "p200"}
 #   rrfs_public/refs.YYYYMMDD/CC/ensprod/ ...                              (ensemble products)
 RRFS_ENABLED = True          # master switch for the RRFS deterministic pad column
 REFS_ENABLED = True          # master switch for the REFS ensemble-average pad column
-RRFS_AWS_ROOT = "https://noaa-rrfs-pds.s3.amazonaws.com"
-RRFS_CYCLE_HOURS = [0, 6, 12, 18]   # cycles that run to full length
-RRFS_MAX_FH = 60             # RRFS/REFS run to 60 h on the extended (00/06/12/18z) cycles; go the
-                             # full depth so the REFS column carries the outlook past where the
-                             # shorter models drop off. HRRR is capped at 48 separately below.
-RRFS_LATENCY_H = 4           # approx hours before a cycle's files are complete on AWS
-# REFS averages ('avrg') post ~6-hourly. Since the app runs hourly, each run just picks up
-# the latest available cycle; the 6-hourly cadence is fine (rows repeat until the next cycle).
+# NOMADS parallel feed. RRFS/REFS moved off the AWS prototype bucket (SCN 26-48); the
+# rrfs_a/ tree that carried individual ensemble members is gone, so REFS is now the published
+# ENSEMBLE MEAN only — see REFS_MEMBER_THERMO_ENABLED for what that costs.
+RRFS_NOMADS_ROOT = "https://nomads.ncep.noaa.gov/pub/data/nccf/com"
+RRFS_AWS_ROOT = "https://noaa-rrfs-pds.s3.amazonaws.com"   # legacy, retained for reference
+
+# RRFS runs EVERY hour. Only the synoptic cycles run to full length; the off-hour runs are
+# short, so the fetch depth follows the cycle actually chosen instead of always asking for 60
+# and firing 40 pointless probes an hour.
+RRFS_CYCLE_HOURS = list(range(24))
+RRFS_SYNOPTIC_CYCLES = [0, 6, 12, 18]
+RRFS_MAX_FH = 60             # synoptic cycles
+RRFS_SHORT_FH = 18           # off-hour cycles
+RRFS_LATENCY_H = 2           # cycle directories are still filling ~1.5-2 h after cycle time
+
+# REFS is 6-hourly and sits one directory deeper, under ensprod/.
+REFS_CYCLE_HOURS = [0, 6, 12, 18]
+REFS_MAX_FH = 60
+REFS_LATENCY_H = 4
+
+# NOMADS is not S3. It asks for restraint and will treat a burst as an attack, the same way
+# PSU did. This concurrency is deliberately low and is NOT a knob to turn up casually.
+NOMADS_MAX_CONCURRENCY = 3
+
+# The TRUE member-based cumulus NMEP read individual RRFS ensemble members from the AWS
+# prototype tree (rrfs_a/rrfsens.DATE/CC/mNNN/). That tree went away with SCN 26-48 and NOMADS
+# publishes no members, so the member path can only fail and fall back. Left OFF so the run
+# does not spend a probe sweep every hour proving that.
+#
+# The cumulus columns still populate, via the enspost/ensprod 'prob' exceedance-curve method
+# (fetch_refs_echotop_probs). That is a ~40 km neighbourhood product rather than a true 5/10 nm
+# member count, so the probabilities are SMOOTHER and less peaked than the member version was —
+# the column is labelled with its provenance so the two are not confused. Flip back to True the
+# day members are published again.
+RRFS_MEMBER_NMEP_ENABLED = False
 
 # HRRR pressure-level GRIB2 on AWS (byte-range friendly via .idx, no bot-blocking). HRRR
 # only reaches f48 on the 00/06/12/18z "extended" cycles; other cycles stop at f18. We pull
@@ -313,14 +366,8 @@ HRRR_LATENCY_H = 2
 # The exact REFS ensemble-mean filename ordering has drifted across the pre-op feed. We probe
 # these candidate patterns (formatted with cycle `c` and forecast-hour ints) once per run and
 # cache whichever resolves, so every subsequent hour reuses the confirmed pattern.
-REFS_FILENAME_CANDIDATES = [
-    "refs.t{c}z.mean.f{f2}.conus.grib2",
-    "refs.t{c}z.conus.mean.f{f2}.grib2",
-    "refs.t{c}z.mean.f{f3}.conus.grib2",
-    "refs.t{c}z.conus.prslev.mean.f{f2}.grib2",
-    "rrfsce.t{c}z.conus.mean.f{f2}.grib2",
-]
-_REFS_RESOLVED_PATTERN = None   # set once we confirm a working pattern this run
+# (REFS_FILENAME_CANDIDATES removed: the NOMADS layout is documented and stable, so the
+#  old filename search is no longer needed.)
 
 
 
@@ -2477,18 +2524,23 @@ def _range_download_grib(session, grib_url, idx_entries, wanted_levels_hpa, debu
 
 
 def _rrfs_determine_cycle(session, model_kind):
-    """Find the most recent RRFS/REFS cycle available on AWS by probing .idx existence.
-    model_kind: 'rrfs' (deterministic) or 'refs' (ensemble). Returns (date_str, cycle).
-    For REFS, also resolves and caches which filename pattern actually carries isobaric
-    temperature data (guards against picking a precip-only product like 'avrg')."""
-    global _REFS_RESOLVED_PATTERN
+    """Newest usable cycle on the NOMADS parallel feed, confirmed by probing .idx existence.
+
+    model_kind: 'rrfs' (deterministic, hourly), 'refs' (ensemble mean, 6-hourly) or 'hrrr'.
+    Returns (date_str, cycle).
+
+    The old AWS version had to guess which of several REFS filenames actually carried
+    isobaric temperature, because the prototype bucket kept renaming them. The NOMADS layout
+    is documented and stable — refs.tHHz.mean.fFF.conus.grib2 under ensprod/ — so the probe
+    is now a single existence check rather than a search.
+    """
     now = datetime.datetime.now(datetime.timezone.utc)
 
-    # HRRR only reaches f48 on the 00/06/12/18z extended cycles; restrict to those so we
-    # never pick an odd-hour cycle that stops at f18.
     if model_kind == "hrrr":
         cycle_hours = list(range(24)) if HRRR_ALL_CYCLES else HRRR_EXTENDED_CYCLES
         latency_h = HRRR_LATENCY_H
+    elif model_kind == "refs":
+        cycle_hours, latency_h = REFS_CYCLE_HOURS, REFS_LATENCY_H
     else:
         cycle_hours, latency_h = RRFS_CYCLE_HOURS, RRFS_LATENCY_H
 
@@ -2501,37 +2553,22 @@ def _rrfs_determine_cycle(session, model_kind):
         date_str = cand.strftime("%Y%m%d")
         cycle = f"{cand.hour:02d}"
 
-        if model_kind == "refs":
-            # Try each candidate filename; accept the first whose idx contains isobaric TMP.
-            # Probe several forecast hours (some ensemble products don't emit f01), so we
-            # don't reject a valid pattern just because its earliest hour is missing.
-            base = f"{RRFS_AWS_ROOT}/rrfs_a/refs.{date_str}/{cycle}/enspost"
-            resolved = False
-            for pat in REFS_FILENAME_CANDIDATES:
-                for probe_fh in (1, 6, 8, 12):
-                    fn = pat.format(c=cycle, f2=f"{probe_fh:02d}", f3=f"{probe_fh:03d}")
-                    probe = f"{base}/{fn}.idx"
-                    try:
-                        r = session.get(probe, timeout=10)
-                        if r.status_code == 200 and "TMP" in r.text and "mb" in r.text:
-                            _REFS_RESOLVED_PATTERN = pat
-                            logging.info(f"[RRFS DEBUG] REFS resolved filename pattern: {pat} "
-                                         f"(confirmed at f{probe_fh:02d})")
-                            resolved = True
-                            break
-                    except Exception:
-                        continue
-                if resolved:
-                    return date_str, cycle
-            continue  # this cycle had no working REFS mean file; try older cycle
-        else:
-            probe = _rrfs_grib_url(model_kind, date_str, cycle, 1) + ".idx"
-            try:
-                r = session.get(probe, timeout=10)
-                if r.status_code == 200 and len(r.text) > 50:
-                    return date_str, cycle
-            except Exception:
-                continue
+        # Probe a forecast hour that every run length reaches. f001 for RRFS/HRRR; REFS
+        # ensemble products sometimes start at f01 but the mean is reliably there by f06.
+        probe_fh = 6 if model_kind == "refs" else 1
+        probe = _rrfs_grib_url(model_kind, date_str, cycle, probe_fh) + ".idx"
+        try:
+            r = session.get(probe, timeout=15)
+            if r.status_code == 200 and len(r.text) > 50:
+                if model_kind == "refs" and "TMP" not in r.text:
+                    # A product without isobaric temperature is no use for a sounding; skip
+                    # rather than silently building empty columns from it.
+                    logging.warning(f"[RRFS] REFS {date_str} {cycle}z idx has no TMP; trying older cycle.")
+                    continue
+                return date_str, cycle
+        except Exception:
+            continue
+    logging.warning(f"[RRFS] no usable {model_kind.upper()} cycle found on NOMADS after 36 h of probing.")
     return None, None
 
 
@@ -2539,15 +2576,17 @@ def _rrfs_grib_url(model_kind, date_str, cycle, f_hour_int):
     """Build the AWS S3 URL for an RRFS deterministic, REFS ensemble-mean, or HRRR
     pressure-level file. For REFS, uses the module-cached resolved filename pattern."""
     if model_kind == "refs":
-        pat = _REFS_RESOLVED_PATTERN or REFS_FILENAME_CANDIDATES[0]
-        f_name = pat.format(c=cycle, f2=f"{f_hour_int:02d}", f3=f"{f_hour_int:03d}")
-        return f"{RRFS_AWS_ROOT}/rrfs_a/refs.{date_str}/{cycle}/enspost/{f_name}"
+        # refs/para/refs.YYYYMMDD/HH/ensprod/refs.tHHz.mean.fFF.conus.grib2
+        # Note the extra ensprod/ level and the TWO-digit forecast hour; RRFS uses three.
+        f_name = f"refs.t{cycle}z.mean.f{f_hour_int:02d}.conus.grib2"
+        return f"{RRFS_NOMADS_ROOT}/refs/para/refs.{date_str}/{cycle}/ensprod/{f_name}"
     elif model_kind == "hrrr":
         f_name = f"hrrr.t{cycle}z.wrfprsf{f_hour_int:02d}.grib2"
         return f"{HRRR_AWS_ROOT}/hrrr.{date_str}/conus/{f_name}"
     else:
+        # rrfs/para/rrfs.YYYYMMDD/HH/rrfs.tHHz.prslev.3km.fFFF.conus.grib2
         f_name = f"rrfs.t{cycle}z.prslev.3km.f{f_hour_int:03d}.conus.grib2"
-        return f"{RRFS_AWS_ROOT}/rrfs_public/rrfs.{date_str}/{cycle}/{f_name}"
+        return f"{RRFS_NOMADS_ROOT}/rrfs/para/rrfs.{date_str}/{cycle}/{f_name}"
 
 
 def fetch_rrfs_pad_hour(session, model_kind, date_str, cycle, f_hour_int, row_key, all_coords, debug=False):
@@ -2634,14 +2673,18 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
             # pointless .idx probes an hour. The depth follows the cycle actually chosen.
             if kind == "hrrr":
                 kind_max_fh = 48 if int(cycle) in HRRR_EXTENDED_CYCLES else 18
+            elif kind == "refs":
+                kind_max_fh = REFS_MAX_FH
             else:
-                kind_max_fh = RRFS_MAX_FH
+                # RRFS is hourly but only the synoptic runs go the full 60 h. Asking a 13Z run
+                # for f060 would fire 40 doomed probes at NOMADS every hour.
+                kind_max_fh = RRFS_MAX_FH if int(cycle) in RRFS_SYNOPTIC_CYCLES else RRFS_SHORT_FH
             f_hours = list(range(1, kind_max_fh + 1))
 
-            logging.info(f"Fetching {kind.upper()} columns from AWS ({len(all_coords)} sites): {date_str} {cycle}z, {len(f_hours)} hours")
+            logging.info(f"Fetching {kind.upper()} columns ({len(all_coords)} sites): {date_str} {cycle}z, {len(f_hours)} hours")
             for _sid in all_coords:
                 _record_cycle(_sid, kind, f"{date_str}{cycle}")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=NOMADS_MAX_CONCURRENCY) as executor:
                 futures = []
                 for idx, fh in enumerate(f_hours):
                     valid_dt = cycle_init + datetime.timedelta(hours=fh)
@@ -3615,7 +3658,7 @@ def fetch_refs_echotop_probs():
     WINDOW_FH = 24  # end of the launch-planning window; also the tasks-loop depth below
 
     def _probe(d, cc, fh):
-        purl = (f"{RRFS_AWS_ROOT}/rrfs_a/refs.{d}/{cc}/enspost/"
+        purl = (f"{RRFS_NOMADS_ROOT}/refs/para/refs.{d}/{cc}/ensprod/"
                 f"refs.t{cc}z.prob.f{fh:02d}.conus.grib2.idx")
         try:
             r = session.get(purl, timeout=12)
@@ -3666,7 +3709,8 @@ def fetch_refs_echotop_probs():
                  f"(neighborhood reducer = '{REFS_CUMULUS_NBR_REDUCER}')")
 
     if REFS_MEMBER_PROBE:
-        probe_rrfsens_member_retop(session)
+        if RRFS_MEMBER_NMEP_ENABLED:
+            probe_rrfsens_member_retop(session)
 
     r5_nm = REFS_CUMULUS_RADII_NM['neg10']    # 5 nm standoff ring for the -10C column
     r10_nm = REFS_CUMULUS_RADII_NM['neg20']   # 10 nm standoff ring for the -20C column
@@ -3683,7 +3727,7 @@ def fetch_refs_echotop_probs():
     nbr_lock = threading.Lock()
 
     def _prob_url(fh):
-        return (f"{RRFS_AWS_ROOT}/rrfs_a/refs.{date_str}/{cycle}/enspost/"
+        return (f"{RRFS_NOMADS_ROOT}/refs/para/refs.{date_str}/{cycle}/ensprod/"
                 f"refs.t{cycle}z.prob.f{fh:02d}.conus.grib2")
 
     def _worker(fh, row_key):
@@ -4846,10 +4890,11 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
     for model, rows in site_models.items():
         if not isinstance(rows, dict):
             continue
-        # Skip the REFS ensemble-MEAN sounding: airmass indices (moisture-driven PWAT, and KI/LI/
-        # TI) are not meaningful from a mean sounding — averaging RH across members destroys the
-        # moisture structure (PWAT collapses, KI goes dry). RRFS deterministic is the hi-res stand-in.
-        if model == "refs":
+        # The REFS ensemble-MEAN sounding. Its thermodynamic indices are biased (see
+        # REFS_MEAN_IN_PANEL) because averaging RH across members destroys moisture structure.
+        # Included anyway when the flag is on — the flow fields are unaffected and a REFS row
+        # is better than no REFS row — but every row is tagged so the panel can say so.
+        if model == "refs" and not REFS_MEAN_IN_PANEL:
             continue
         day_rows = []
         # Gather candidate profiles per forecast day within ASSESS_HOUR_TOL of the assessment hour,
@@ -4898,7 +4943,9 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                     "ti_pct": _climo_percentile(ti, THOMPSON_CLIMO_XMR.get(month), THOMPSON_PCTL_POINTS),
                     "pwat": pwat,
                     "pwat_pct": _climo_percentile(pwat, PWAT_CLIMO_XMR.get(month), PWAT_PCTL_POINTS),
-                    "engine": th.get("engine"),
+                    # Tag REFS rows so the frontend can flag the mean-sounding caveat. The
+                    # ensemble columns use "...N-mem" here; this is deliberately distinct.
+                    "engine": ("mean-sounding" if model == "refs" else th.get("engine")),
                 })
                 break
         if day_rows:
@@ -5091,7 +5138,8 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
             filled = 0
             member_matrix, member_maps5, member_maps10 = ({}, {}, {})
             if REFS_MEMBER_NMEP_ENABLED:
-                member_matrix, member_maps5, member_maps10 = fetch_rrfsens_member_nmep()
+                member_matrix, member_maps5, member_maps10 = (
+                    fetch_rrfsens_member_nmep() if RRFS_MEMBER_NMEP_ENABLED else ({}, {}, {}))
 
             if member_matrix:
                 # TRUE member time-lagged NMEP at the real 5/10 nm radius. For each site-hour count
