@@ -100,7 +100,11 @@ SKEWT_SITE = "kxmr"
 # very different horizon). At 96 an hourly model reaches f96 and ECMWF exports its full
 # 3-hourly range. Cost is roughly 0.7 KB and one MetPy parcel calculation per profile, so
 # raising this grows soundings.json and the run time in a straight line.
-SKEWT_MAX_PROFILES = 96
+#
+# Set to 200 so it is a RUNAWAY GUARD rather than a limit anyone meets: at 96 it was silently
+# truncating GFS, whose BUFKIT column carries more steps than that. Every model now exports
+# its full range and the number only exists to stop a malformed feed producing a huge file.
+SKEWT_MAX_PROFILES = 200
 SKEWT_MAX_HOURS = SKEWT_MAX_PROFILES   # back-compat alias
 SKEWT_TOP_HPA = 100        # drop levels above this; nothing in the panel needs the stratosphere
 SKEWT_FILE = "soundings.json"
