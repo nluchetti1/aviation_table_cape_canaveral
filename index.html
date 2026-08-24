@@ -1868,7 +1868,11 @@
         // --- thermodynamic helpers (kept minimal; the heavy lifting is backend MetPy) -----
         const SK_P_BOT = 1050, SK_P_TOP = 100;
         const SK_T_MIN = -50, SK_T_MAX = 45;   // deg C along the bottom axis
-        const SK_W = 560, SK_H = 520, SK_L = 46, SK_T0 = 14;
+        // SK_L was 46 (just enough for the pressure labels). It is now 74; the 26 px opened
+        // up between the labels and the plot holds the saturation strip.
+        const SK_W = 560, SK_H = 520, SK_L = 74, SK_T0 = 14;
+        const SK_LABEL_X = 42;              // right edge of the pressure / height labels
+        const SK_CLOUD_X = 46, SK_CLOUD_W = 24;
         const SK_SKEW = 300;                    // px of rightward tilt from bottom to top
 
         function skY(p) {
@@ -1921,7 +1925,7 @@
             [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100].forEach(p => {
                 const y = skY(p);
                 g += `<line x1="${SK_L}" y1="${y}" x2="${SK_L + SK_W + SK_SKEW}" y2="${y}" stroke="#cbd5e1" stroke-width="0.8"/>`;
-                g += `<text x="${SK_L - 5}" y="${y + 3}" text-anchor="end" font-size="9" fill="#64748b">${p}</text>`;
+                g += `<text x="${SK_LABEL_X}" y="${y + 3}" text-anchor="end" font-size="9" fill="#64748b">${p}</text>`;
             });
             // skewed isotherms
             for (let t = -110; t <= 50; t += 10) {
@@ -2065,6 +2069,94 @@
             return g;
         }
 
+
+
+        // ---- synoptic flow -----------------------------------------------------------------
+        // Same octant -> onshore/offshore classification the 10Z Synoptic table uses. At the
+        // Cape the class matters more than the octant: SE and E are different compass points
+        // but the same story for sea-breeze timing and for where an anvil goes.
+        const SK_REGIME_CLASS = { NE:'onshore', E:'onshore', SE:'onshore',
+                                  NW:'offshore', W:'offshore', SW:'offshore',
+                                  N:'alongshore', S:'alongshore' };
+        function skRegimeChip(reg) {
+            if (!reg) return '\u2014';
+            const k = SK_REGIME_CLASS[reg] || 'alongshore';
+            const sty = k === 'onshore'  ? 'background:#dbeafe; color:#0c4a6e;'
+                      : k === 'offshore' ? 'background:#fed7aa; color:#7c2d12;'
+                      :                    'background:#dcfce7; color:#14532d;';
+            return `<span title="${k}" style="${sty} padding:0 6px; border-radius:9px; font-weight:700; font-size:0.72rem;">${reg}</span>`;
+        }
+        function skFlowStr(dir, spd) {
+            if (dir == null) return '\u2014';
+            return `${Math.round(dir)}\u00b0 / ${spd == null ? '\u2014' : Number(spd).toFixed(1)} kt`;
+        }
+        // Smallest signed angle from b to a, so 350 and 010 read as 20 apart, not 340.
+        function skAngDiff(a, b) {
+            if (a == null || b == null) return null;
+            return ((a - b + 540) % 360) - 180;
+        }
+        // Widest angular separation across a set of directions. A plain max-minus-min would
+        // report 340 for a cluster straddling north.
+        function skAngSpread(dirs) {
+            const d = dirs.filter(v => v != null);
+            if (d.length < 2) return null;
+            let worst = 0;
+            for (let i = 0; i < d.length - 1; i++)
+                for (let j = i + 1; j < d.length; j++)
+                    worst = Math.max(worst, Math.abs(skAngDiff(d[i], d[j])));
+            return worst;
+        }
+
+        // ---- saturation / cloud strip ----------------------------------------------------
+        // A BUFKIT-style cloud column down the left edge. soundings.json carries T and Td but
+        // not RH, so RH is recovered with the same Magnus formula the backend uses for the
+        // ceiling column — which means this strip and the Ceilings row in the matrix agree by
+        // construction rather than by coincidence.
+        function skRH(t, td) {
+            if (t == null || td == null) return null;
+            const a = 17.625, b = 243.04;
+            const tdc = Math.min(td, t);
+            const gt = (a * t) / (b + t), gd = (a * tdc) / (b + tdc);
+            return Math.max(0, Math.min(100, 100 * Math.exp(gd - gt)));
+        }
+        // Opacity bands. 95% is the one that matters: it is the threshold the ceiling
+        // calculation uses to call a deck, so a solid block here is the same air that
+        // produces a ceiling in the table. Lighter bands are context — moist but not decked.
+        function skCloudShade(rh) {
+            if (rh == null) return null;
+            if (rh >= 95) return 0.82;
+            if (rh >= 90) return 0.52;
+            if (rh >= 82) return 0.30;
+            if (rh >= 74) return 0.15;
+            return null;
+        }
+        function skCloudStrip(lv, x, w, opts) {
+            opts = opts || {};
+            const fill = opts.fill || '#475569';
+            let g = `<rect x="${x}" y="${SK_T0}" width="${w}" height="${SK_H}" fill="#ffffff" stroke="#e2e8f0" stroke-width="0.8"/>`;
+            for (let i = 0; i < lv.length - 1; i++) {
+                const p1 = lv[i][0], p2 = lv[i + 1][0];
+                if (p1 == null || p2 == null || p2 < SK_P_TOP) continue;
+                const r1 = skRH(lv[i][2], lv[i][3]), r2 = skRH(lv[i + 1][2], lv[i + 1][3]);
+                if (r1 == null || r2 == null) continue;
+                const rh = (r1 + r2) / 2;
+                const op = skCloudShade(rh);
+                if (op == null) continue;
+                const y1 = skY(p1), y2 = skY(p2);
+                const top = Math.min(y1, y2), h = Math.abs(y1 - y2);
+                if (h <= 0) continue;
+                g += `<rect x="${(x + 0.6).toFixed(1)}" y="${top.toFixed(1)}" width="${(w - 1.2).toFixed(1)}" height="${h.toFixed(1)}" fill="${fill}" opacity="${op}"><title>${Math.round(rh)}% RH near ${Math.round((p1 + p2) / 2)} hPa</title></rect>`;
+                // A saturated deck gets an edge marker so it reads as a deck, not just dark.
+                if (rh >= 95) {
+                    g += `<rect x="${(x + 0.6).toFixed(1)}" y="${top.toFixed(1)}" width="2" height="${h.toFixed(1)}" fill="#0ea5e9"/>`;
+                }
+            }
+            if (opts.label) {
+                g += `<text x="${x + w / 2}" y="${SK_T0 - 3.5}" text-anchor="middle" font-size="7.5" fill="#94a3b8" font-weight="600">${opts.label}</text>`;
+            }
+            return g;
+        }
+
         // --- the plot --------------------------------------------------------------------
         function skewSVG(entry) {
             const lv = entry.lv || [];
@@ -2095,6 +2187,7 @@
                 <defs><clipPath id="skclip"><rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}"/></clipPath></defs>
                 <rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}" fill="#fff" stroke="#94a3b8" stroke-width="1"/>`;
             s += skBackground();
+            s += skCloudStrip(lv, SK_CLOUD_X, SK_CLOUD_W, { label: 'RH' });
             s += skChargingLayer(T, lv);
             s += skChargeIsotherms(T, lv);
 
@@ -2112,7 +2205,7 @@
                     }
                 }
                 if (hh == null) return;
-                s += `<text x="${SK_L - 5}" y="${(skY(pp) + 12).toFixed(1)}" text-anchor="end" font-size="8" fill="#a3a3a3">${(hh / 1000).toFixed(0)}kft</text>`;
+                s += `<text x="${SK_LABEL_X}" y="${(skY(pp) + 12).toFixed(1)}" text-anchor="end" font-size="8" fill="#a3a3a3">${(hh / 1000).toFixed(0)}kft</text>`;
             });
 
             // shade CAPE / CIN between the parcel and the environment
@@ -2233,7 +2326,14 @@
                         <td style="padding:3px 0 3px 8px; color:#94a3b8; font-size:0.72rem;">${note}</td></tr>`;
             };
             return `<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">
-                <tr><td colspan="3" style="padding-top:2px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0;">Parcel</td></tr>
+                <tr><td colspan="3" style="padding-top:2px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0;">Synoptic flow</td></tr>
+                <tr><td style="padding:3px 8px 3px 0; color:#475569;">1000\u2013700 mb</td>
+                    <td style="padding:3px 0; font-weight:700; text-align:right;">${skFlowStr(p.mf_dir, p.mf_spd)}</td>
+                    <td style="padding:3px 0 3px 8px;">${skRegimeChip(p.mf_regime)}</td></tr>
+                <tr><td style="padding:3px 8px 3px 0; color:#475569;">Anvil 300\u2013150</td>
+                    <td style="padding:3px 0; font-weight:700; text-align:right;">${skFlowStr(p.av_dir, p.av_spd)}</td>
+                    <td style="padding:3px 0 3px 8px; color:#94a3b8; font-size:0.72rem;">transport</td></tr>
+                <tr><td colspan="3" style="padding-top:8px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0;">Parcel</td></tr>
                 ${row('SBCAPE', p.sbcape, ' J/kg', 'surface parcel')}
                 ${row('SBCIN', p.sbcin, ' J/kg', 'inhibition')}
                 ${row('MLCAPE', p.mlcape, ' J/kg', 'mixed layer')}
@@ -2387,6 +2487,17 @@
                 <rect x="${SK_L}" y="${SK_T0}" width="${SK_W + SK_SKEW}" height="${SK_H}" fill="#fff" stroke="#94a3b8" stroke-width="1"/>`;
             s += skBackground();
 
+            // One narrow saturation sub-strip per model, in model colour. Where the models
+            // agree it reads as a solid block; where they disagree it stripes, which is the
+            // quickest way to see that one model has a deck the others do not.
+            {
+                const subW = SK_CLOUD_W / Math.max(1, picked.length);
+                picked.forEach((pk, i) => {
+                    s += skCloudStrip(pk.entry.lv || [], SK_CLOUD_X + i * subW, subW,
+                                      { fill: skCmpColor(pk.model), label: i === 0 ? 'RH' : null });
+                });
+            }
+
             // Per-model freezing / -20 C tick marks at the left edge, in the model's colour.
             // A shaded band is meaningless with several models, but the LEVELS still matter,
             // so each model gets a short tick instead of a full-width line.
@@ -2499,6 +2610,15 @@
         // Comparison table: parameters down, models across, with a spread column. Spread is
         // the plain max-minus-min across the models that actually reported a value, and it is
         // shaded once it passes a threshold that means something for that field.
+        // Flow rows are handled outside SK_CMP_ROWS: a direction/speed pair with a regime chip
+        // is not a single number, and its spread has to be angular rather than max-minus-min.
+        const SK_CMP_FLOW = [
+            { dirK: 'mf_dir', spdK: 'mf_spd', regK: 'mf_regime', lab: '1000\u2013700 mb',
+              watch: 40, split: 80, sWatch: 8, sSplit: 15 },
+            { dirK: 'av_dir', spdK: 'av_spd', regK: null, lab: 'Anvil 300\u2013150',
+              watch: 40, split: 80, sWatch: 10, sSplit: 20 },
+        ];
+
         const SK_CMP_ROWS = [
             { k: 'sbcape', lab: 'SBCAPE', unit: '', dp: 0, watch: 500, split: 1200, grp: 'Parcel' },
             { k: 'sbcin', lab: 'SBCIN', unit: '', dp: 0, watch: 50, split: 125 },
@@ -2550,6 +2670,42 @@
                 return `<th style="${thBase} padding:4px 5px; text-align:right; color:${skCmpColor(pk.model)}; font-size:0.74rem; font-weight:700;">${ltLabel(pk.model)}${sub}</th>`;
             }).join('');
             let rows = '';
+
+            // Synoptic flow first: it frames everything below it. Direction spread is the
+            // widest angular separation between any two models, not max minus min.
+            rows += `<tr><td colspan="${picked.length + 2}" style="padding:7px 0 2px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0; font-size:0.76rem;">Synoptic flow</td></tr>`;
+            SK_CMP_FLOW.forEach(fr => {
+                const dirs = picked.map(pk => (vals[pk.model][fr.dirK] == null ? null : Number(vals[pk.model][fr.dirK])));
+                const spds = picked.map(pk => (vals[pk.model][fr.spdK] == null ? null : Number(vals[pk.model][fr.spdK])));
+                const cells = picked.map((pk, i) => {
+                    const reg = fr.regK ? vals[pk.model][fr.regK] : null;
+                    return `<td style="padding:3px 5px; text-align:right; font-weight:600; white-space:nowrap;">
+                        ${skFlowStr(dirs[i], spds[i])}${reg ? '<br>' + skRegimeChip(reg) : ''}</td>`;
+                }).join('');
+                const aSp = skAngSpread(dirs);
+                const real = spds.filter(v => v != null);
+                const sSp = real.length >= 2 ? Math.max(...real) - Math.min(...real) : null;
+                const chip = (v, watch, split, unit) => {
+                    if (v == null) return '';
+                    const sty = v >= split ? 'background:#fee2e2; color:#991b1b;'
+                              : v >= watch ? 'background:#fef3c7; color:#78350f;'
+                              : 'color:#94a3b8;';
+                    return `<span style="${sty} padding:1px 5px; border-radius:9px; font-weight:600;">${Math.round(v)}${unit}</span>`;
+                };
+                // Regime DISAGREEMENT is flagged on onshore/offshore class, matching the 10Z panel:
+                // a different octant in the same class is not a different forecast.
+                let regNote = '';
+                if (fr.regK) {
+                    const cls = picked.map(pk => SK_REGIME_CLASS[vals[pk.model][fr.regK]] || null).filter(Boolean);
+                    if (cls.length >= 2 && new Set(cls).size > 1) {
+                        regNote = ` <span title="models disagree on onshore vs offshore" style="background:#fee2e2; color:#991b1b; padding:1px 5px; border-radius:9px; font-weight:700; font-size:0.7rem;">SPLIT</span>`;
+                    }
+                }
+                rows += `<tr><td style="padding:3px 6px 3px 0; color:#475569; white-space:nowrap;">${fr.lab}</td>${cells}
+                    <td style="padding:3px 0 3px 6px; text-align:right; font-size:0.74rem; white-space:nowrap;">
+                    ${chip(aSp, fr.watch, fr.split, '\u00b0')} ${chip(sSp, fr.sWatch, fr.sSplit, 'kt')}${regNote}</td></tr>`;
+            });
+
             SK_CMP_ROWS.forEach(r => {
                 if (r.grp) {
                     rows += `<tr><td colspan="${picked.length + 2}" style="padding:7px 0 2px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0; font-size:0.76rem;">${r.grp}</td></tr>`;
