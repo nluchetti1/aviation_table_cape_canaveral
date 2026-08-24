@@ -1764,6 +1764,18 @@
             const model = document.getElementById('ltModel').value;
             const rows = (thermo.by_model && thermo.by_model[model]) || [];
             const ens = (rows[0] && /(\d+)-mem/.exec(rows[0].engine || '')) ;
+            // REFS now comes from the published ensemble MEAN sounding, not per-member means.
+            // Its wind fields are fine (averaging u/v is linear); its thermodynamic indices are
+            // biased toward the middle, and the bias is worst exactly when the members disagree.
+            // Saying so beside the numbers is the difference between a caveat and a trap.
+            const meanNote = (rows[0] && rows[0].engine === 'mean-sounding')
+                ? `<div style="font-size:0.78rem; color:#78350f; background:#fef3c7; padding:5px 8px; border-radius:4px; margin:2px 0 8px;">
+                     <strong>REFS = ensemble MEAN sounding.</strong> NOMADS publishes no REFS members, so these
+                     indices come from the mean profile rather than being averaged across members.
+                     Mean flow, regime and anvil flow are unaffected. Thompson, PWAT, RH and the lightning
+                     probability read toward the middle &mdash; drier and more stable than the ensemble's true
+                     average &mdash; and the error grows with member spread.</div>`
+                : '';
             const ensNote = ens ? `<div style="font-size:0.78rem; color:#475569; margin:2px 0 8px;">${
                 ltLabel(model)} = ${ens[1]}-member ensemble (mean of per-member indices, not the mean sounding).${
                 model === 'ecens' ? ' Perturbed members only — the ECMWF open-data tier publishes no control member at pressure levels. Anvil flow is blank: the 300\u2013150 mb levels are deliberately not fetched, which keeps this column affordable.' : ''}</div>` : '';
@@ -1821,7 +1833,7 @@
                 }
                 return s;
             };
-            let html = ensNote + `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
+            let html = meanNote + ensNote + `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
               <thead><tr style="text-align:left; color:#475569; border-bottom:2px solid #e2e8f0;">
                 <th style="padding:8px 6px; width:150px; white-space:nowrap;">Day</th>
                 <th style="padding:8px 6px;">1000–700 mb Mean Flow</th>
