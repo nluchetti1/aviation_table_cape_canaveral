@@ -4645,7 +4645,13 @@ def _convective_params(layers):
         # Reuse the existing index calculation so the skew-T panel and the 10Z panel can
         # never disagree about Thompson or PWAT for the same profile.
         base = compute_launch_thermo(layers) or {}
-        for k in ("k_index", "lifted_index", "thompson", "pwat_in", "rh_700_500"):
+        # Includes the 1000-700 mb mean flow and the 300-150 mb anvil flow. These are carried
+        # through from compute_launch_thermo rather than recomputed for the skew-T, so the
+        # sounding panel and the 10Z Synoptic table are reading literally the same numbers —
+        # two independent layer-mean implementations would eventually disagree by a degree or
+        # a knot and there would be no way to tell which was right.
+        for k in ("k_index", "lifted_index", "thompson", "pwat_in", "rh_700_500",
+                  "mf_dir", "mf_spd", "mf_regime", "av_dir", "av_spd", "av_regime"):
             if base.get(k) is not None:
                 out[k] = base[k]
         return out
