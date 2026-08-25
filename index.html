@@ -1995,7 +1995,18 @@
             if (spd < 2.5) return `<circle cx="${x}" cy="${y}" r="3.5" fill="none" stroke="#334155" stroke-width="1"/>`;
             const BC = skBarbColor(spd);
             const L = 26;
-            const rad = (dir + 180) * Math.PI / 180;   // barb points INTO the wind
+            // Staff points TOWARD the direction the wind comes FROM. `dir` is already a
+            // meteorological FROM-direction everywhere upstream (BUFKIT DRCT verbatim; GRIB
+            // columns via atan2(-u,-v)), so it needs NO rotation — the old `dir + 180` pointed
+            // the staff where the wind was GOING and drew every barb exactly reversed. A
+            // 119\u00b0 SE mean flow rendered as a staff toward 299\u00b0, which reads as westerly and
+            // disagreed with the flow row in the table beside it.
+            //
+            // Removing the rotation also lands the feathers on the correct side: they are
+            // derived from the perpendicular (px,py) below, so they flipped with the staff.
+            // Feathers now fall 90\u00b0 left of the wind vector = toward low pressure in the NH,
+            // which is the standard station-model convention.
+            const rad = dir * Math.PI / 180;
             const dx = Math.sin(rad), dy = -Math.cos(rad);
             const ex = x + dx * L, ey = y + dy * L;
             let s = `<line x1="${x}" y1="${y}" x2="${ex.toFixed(1)}" y2="${ey.toFixed(1)}" stroke="${BC}" stroke-width="1.2"/>`;
@@ -2668,7 +2679,7 @@
             if (dir == null || spd == null) return '';
             if (spd < 2.5) return `<circle cx="${x}" cy="${y}" r="2.6" fill="none" stroke="${col}" stroke-width="1"/>`;
             const L = 17, st = 3.2, fl = 7;
-            const rad = (dir + 180) * Math.PI / 180;
+            const rad = dir * Math.PI / 180;   // FROM-direction; see skBarb for why there is no +180
             const dx = Math.sin(rad), dy = -Math.cos(rad);
             const ex = x + dx * L, ey = y + dy * L;
             let s = `<line x1="${x}" y1="${y}" x2="${ex.toFixed(1)}" y2="${ey.toFixed(1)}" stroke="${col}" stroke-width="1"/>`;
