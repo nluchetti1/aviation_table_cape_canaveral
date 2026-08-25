@@ -62,6 +62,21 @@ ECMWF_MAX_FH = 144        # forecast hours to ingest. IFS open-data is 3-hourly 
                           # traded for ECMWF reaching day 6 in the matrix and the 10Z panel.
 ECMWF_LEVELS_HPA = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100]
 
+# The whole 49-step retrieve used to be ONE client.retrieve() call wrapped in the shared
+# 300 s SOURCE_DEADLINE_S. That is an all-or-nothing bet: if the portal is slow, or 429s
+# and ecmwf-opendata starts its own retry sleep, the deadline fires, the thread is
+# abandoned, and the column comes back COMPLETELY EMPTY — which is exactly the "ECMWF is
+# no longer an option" symptom, because an empty dict never reaches the skew-T export or
+# the 10Z panel. So the retrieve is now chunked and given its own internal wall-clock
+# budget: each chunk that lands is parsed and kept, and running out of time costs forecast
+# HOURS instead of the whole model.
+ECMWF_STEP_CHUNK = 8       # steps per retrieve call. Smaller = more requests, finer salvage.
+ECMWF_BUDGET_S = 480       # internal budget; returns whatever has been parsed when spent.
+ECMWF_DEADLINE_S = 660     # outer backstop (must exceed ECMWF_BUDGET_S, else it pre-empts it)
+# Tried in order until one yields a chunk. The portal is normally fastest, but it is also
+# the one that 429s under load, and a mirror that works beats a fast source that refuses.
+ECMWF_SOURCE_FALLBACKS = ["ecmwf", "azure", "aws"]
+
 # ---- ECMWF ENS ensemble column for the 10Z panel (IFS ENS 0.25 deg, open data) --------------
 # Panel-only, exactly like GEFS: a second global ensemble to read against GEFS at day 3+.
 #
@@ -86,6 +101,13 @@ ECMWF_ENS_PARAMS = ["t", "r", "u", "v"]   # gh omitted; heights fall back to bar
 # ENS advances every 6 h while this pipeline runs hourly, so rows are cached against the
 # cycle and only refetched when a new one posts (~0.9 GB / 6 min when it does).
 ECMWF_ENS_CACHE_ENABLED = True
+# The measured cold-cycle fetch is ~940 MB in ~285 s. Against the shared 300 s
+# SOURCE_DEADLINE_S that is a coin flip, and losing it does more damage than losing one
+# run: _run_with_deadline returns ({}, None), the None cycle key makes the payload write
+# ecens_cache=None, the cache is DESTROYED, and the next hourly run re-downloads the same
+# 940 MB into the same 300 s deadline. That is the failure loop behind "ECMWF ENS vanished
+# from the 10Z table". Own deadline here, plus cache carry-forward at the call site.
+ECMWF_ENS_DEADLINE_S = 600
 
 # ---- Skew-T sounding export -----------------------------------------------------------
 # Ships the KXMR profiles the matrix was already built from into a SEPARATE soundings.json,
@@ -108,6 +130,23 @@ SKEWT_MAX_PROFILES = 200
 SKEWT_MAX_HOURS = SKEWT_MAX_PROFILES   # back-compat alias
 SKEWT_TOP_HPA = 100        # drop levels above this; nothing in the panel needs the stratosphere
 SKEWT_FILE = "soundings.json"
+
+# Columns that must never reach the skew-T, whatever else they are good for.
+#
+# REFS is here because the NOMADS ensemble-MEAN product publishes only FIVE pressure levels
+# (925/850/700/500/250). That is enough for a layer-mean wind and nothing else: a skew-T
+# drawn through five points is four straight segments, the parcel curve is meaningless, and
+# the derived indices are nonsense in a way that LOOKS authoritative (a measured KXMR 25/10
+# REFS profile gave Thompson -13.8 and 0 J/kg CAPE on a day the CAMs had 1800-2200 J/kg).
+# RRFS is unaffected: it comes off the full 21-level isobaric set and stays in the panel.
+SKEWT_EXCLUDE_MODELS = {"refs"}
+# Belt and braces for the same problem: any profile thinner than this is not a sounding.
+# 8 clears every real column (RRFS 21, ECMWF 12, GEFS 11, BUFKIT ~40) and stops a future
+# thin product sneaking in the way REFS did.
+SKEWT_MIN_LEVELS = 8
+# Run the Cizek RF on every exported profile, not just the 10Z panel rows. See the caveat
+# in build_soundings_export: the forest was trained on 10Z soundings only.
+SKEWT_LIGHTNING = True
 
 # ---- Convective (cumulus) mask for the Thick Cloud Layer / Max Layer Thickness LLCC ----
 # The Thick Cloud Layer rule targets STRATIFORM decks; cumulus is governed by its own LLCC rule.
@@ -251,7 +290,19 @@ REFS_MEAN_IN_PANEL = True
 #
 # So the gate is on the DATA, not on the model name: any column thin on humidity gets a
 # flow-only row. If REFS later publishes a fuller mean, it starts working with no code change.
-PANEL_MIN_RH_LEVELS = 5
+#
+# RAISED 5 -> 6 on 2026-08-25. The pre-install REFS path now returns FIVE humidity levels
+# rather than one, which cleared the old gate by exactly one level and let the indices
+# through. They should not have gone through: 925/850/700/500/250 mb gives a 250 mb gap
+# straddling the whole mid-troposphere, and the 25/10Z KXMR mean produced Thompson -13.8,
+# 700-500 RH 28%, 0 J/kg CAPE and a Cizek probability of 19.7% on a morning the CAMs had
+# Thompson +26 to +34 and 50-76%. Those numbers are not a low-end forecast, they are an
+# artefact of the vertical gap, and they were being plotted on the same axis as real ones.
+#
+# 6 is chosen against the columns that must survive: ECMWF ENS publishes 6 humidity levels
+# (1000/925/850/700/600/500) and is unaffected, as are GEFS (11), ECMWF HRES (12), RRFS (21)
+# and BUFKIT (~40). Set back to 5 to restore the old behaviour in one edit.
+PANEL_MIN_RH_LEVELS = 6
 
 # ---- GEFS ensemble column for the 10Z panel (global 0.5 deg, AWS mirror) ---------------------
 # Panel-only: GEFS is far coarser than the mesoscale columns and would add nothing to the hourly
@@ -330,6 +381,17 @@ RRFS_CYCLE_HOURS = list(range(24))
 RRFS_SYNOPTIC_CYCLES = [0, 6, 12, 18]
 RRFS_MAX_FH = 60             # synoptic cycles
 RRFS_SHORT_FH = 18           # off-hour cycles
+# THIS is why an off-hour RRFS column ends cleanly ~18-24 h out with nothing beyond, even on
+# a run where every hour it did fetch came back complete. A cycle outside RRFS_SYNOPTIC_CYCLES
+# is capped at RRFS_SHORT_FH and the sweep never PROBES past it — so the tail is not missing
+# data, it is data that was never asked for. Distinguishing that from the budget cutoff
+# matters: one is fixed by raising a number, the other by spending more wall clock.
+#
+# Rather than hardcode a new guess, probe. After the short cap is exhausted, ask the server
+# whether the cycle actually goes further; if the .idx exists, extend to RRFS_MAX_FH. Costs
+# one request on off-hour cycles and adapts on its own if NCEP lengthens the parallel runs.
+RRFS_PROBE_BEYOND_SHORT = True
+RRFS_PROBE_FH = 24           # the hour probed to decide whether an off-hour cycle runs long
 RRFS_LATENCY_H = 2           # cycle directories are still filling ~1.5-2 h after cycle time
 
 # REFS is 6-hourly and sits one directory deeper, under ensprod/.
@@ -364,6 +426,27 @@ NOMADS_RANGE_PAUSE_S = 0.15
 # to end: the last run sat for 36 minutes and was cancelled with nothing committed. Better a
 # short column and a finished run than a hung job.
 NOMADS_KIND_BUDGET_S = 420
+# Per-kind override of the budget above.
+#
+# One number for all three kinds was the direct cause of the ragged RRFS column. RRFS is
+# HOURLY out to f060 and REFS is hourly to f060 as well, but a REFS hour is a small file
+# while an RRFS hour is a full CONUS isobaric set; measured 2026-08-25 11:10Z, RRFS managed
+# 26 of 60 hours in the 420 s it was given (~16 s/hour) and stopped mid-column. The hours it
+# HAD reached were f001-f016 plus the reserved 10Z islands on days 2 and 3, which is why the
+# matrix showed values, then a block of blanks, then values again. Nothing was random and
+# nothing failed — the sweep simply ran out of clock, and the panel reservation made the
+# leftover look scattered.
+#
+# 900 s covers all 60 RRFS hours at the measured rate with margin. Raise/lower against the
+# "RRFS: N hours in Ms (X.Xs/hour)" line the sweep now logs — that number is the one to
+# budget against, and it moves with NOMADS load.
+NOMADS_KIND_BUDGET_OVERRIDE = {"rrfs": 900, "refs": 480, "hrrr": 300}
+
+
+def _nomads_kind_budget(kind):
+    return NOMADS_KIND_BUDGET_OVERRIDE.get(kind, NOMADS_KIND_BUDGET_S)
+
+
 # Wall-clock ceiling for any single upstream fetch that manages its own retries.
 SOURCE_DEADLINE_S = 300
 # Give up on a model entirely after this many throttled requests in a row.
@@ -2909,6 +2992,26 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
                 # RRFS is hourly but only the synoptic runs go the full 60 h. Asking a 13Z run
                 # for f060 would fire 40 doomed probes at NOMADS every hour.
                 kind_max_fh = RRFS_MAX_FH if int(cycle) in RRFS_SYNOPTIC_CYCLES else RRFS_SHORT_FH
+                if (RRFS_PROBE_BEYOND_SHORT and kind_max_fh < RRFS_MAX_FH
+                        and RRFS_PROBE_FH > kind_max_fh):
+                    # One .idx probe decides whether this off-hour cycle is genuinely short or
+                    # whether the cap is just an assumption we inherited.
+                    try:
+                        _pu = _rrfs_grib_url(kind, date_str, cycle, RRFS_PROBE_FH) + ".idx"
+                        _pr = _nomads_get(session, _pu, timeout=15,
+                                          tag=f"{kind.upper()} f{RRFS_PROBE_FH:03d} depth probe")
+                        if _pr.status_code == 200:
+                            logging.info(f"{kind.upper()}: {cycle}z is an off-hour cycle (cap "
+                                         f"f{kind_max_fh:03d}) but f{RRFS_PROBE_FH:03d} exists on "
+                                         f"the server — extending to f{RRFS_MAX_FH:03d}.")
+                            kind_max_fh = RRFS_MAX_FH
+                        else:
+                            logging.info(f"{kind.upper()}: {cycle}z stops at f{kind_max_fh:03d} "
+                                         f"(f{RRFS_PROBE_FH:03d} probe returned HTTP "
+                                         f"{_pr.status_code}). The short tail is the RUN LENGTH, "
+                                         f"not a fetch failure.")
+                    except Exception as _e:
+                        logging.debug(f"{kind.upper()} depth probe failed, keeping cap: {_e}")
             f_hours = list(range(1, kind_max_fh + 1))
             if RRFS_PRIORITISE_PANEL_HOURS and kind in ("rrfs", "refs"):
                 # Hours valid within ASSESS_HOUR_TOL of the assessment hour, on any forecast
@@ -2932,14 +3035,24 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
             # and was cancelled with nothing written. Because the panel-critical hours are at
             # the FRONT of f_hours, running out of budget costs matrix depth, not a model.
             _nomads_reset_throttle()
+            _budget = _nomads_kind_budget(kind)
             _t_start = time.time()
             _done = 0
+            _reached = []          # forecast hours that actually produced data, for the horizon log
             for idx, fh in enumerate(f_hours):
-                if time.time() - _t_start > NOMADS_KIND_BUDGET_S:
+                if time.time() - _t_start > _budget:
+                    # Say WHICH hours are missing and why, because "budget spent" and "the run
+                    # is only that long" produce identical-looking holes in the matrix and need
+                    # completely different fixes.
+                    _missed = sorted(set(f_hours[idx:]))
                     logging.warning(
-                        f"{kind.upper()}: {NOMADS_KIND_BUDGET_S}s budget spent after {_done} "
-                        f"of {len(f_hours)} hours — stopping here so the run can finish. "
-                        f"Panel-critical hours were fetched first, so those are already in.")
+                        f"{kind.upper()}: {_budget}s budget spent after {_done} of "
+                        f"{len(f_hours)} hours ({(time.time()-_t_start)/max(1,_done):.1f}s/hour) "
+                        f"— stopping here so the run can finish. Not fetched: "
+                        f"f{_missed[0]:03d}-f{_missed[-1]:03d} ({len(_missed)} hours). These "
+                        f"appear as BLANKS in the matrix and are a clock limit, not missing "
+                        f"data upstream — raise NOMADS_KIND_BUDGET_OVERRIDE['{kind}'] "
+                        f"(currently {_budget}) to close them.")
                     break
                 valid_dt = cycle_init + datetime.timedelta(hours=fh)
                 row_key = f"{valid_dt.day:02d}/{valid_dt.hour:02d}"
@@ -2951,6 +3064,12 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
                         matrix[sid][mk][row_key] = vd
                     if site_vals:
                         _done += 1
+                        _reached.append(fh)
+                        if _done % 10 == 0:
+                            _el = time.time() - _t_start
+                            logging.info(f"{kind.upper()}: {_done} hours in {_el:.0f}s "
+                                         f"({_el/_done:.1f}s/hour), {_budget - _el:.0f}s of "
+                                         f"budget left.")
                 except NomadsThrottled as e:
                     # NOMADS has stopped serving us. Continuing just burns the budget and
                     # risks the job being cancelled before anything is committed, so stop
@@ -2963,6 +3082,30 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
                     break
                 except Exception as e:
                     _rrfs_note_fail(kind, fh, f"{type(e).__name__}: {str(e)[:60]}")
+
+            # Contiguous horizon vs interior holes. A column that stops at f018 and a column
+            # that has f001-f016 then islands at f026-f030 look the same in a summary count
+            # and mean entirely different things at the matrix.
+            if _reached:
+                _r = sorted(set(_reached))
+                _contig = _r[0]
+                for _h in _r[1:]:
+                    if _h == _contig + 1:
+                        _contig = _h
+                    else:
+                        break
+                _holes = [h for h in range(_r[0], _r[-1] + 1) if h not in set(_r)]
+                _el = time.time() - _t_start
+                logging.info(f"{kind.upper()}: unbroken through f{_contig:03d}, last hour "
+                             f"f{_r[-1]:03d}, {len(_r)} hours in {_el:.0f}s "
+                             f"({_el/len(_r):.1f}s/hour).")
+                if _holes:
+                    logging.warning(
+                        f"{kind.upper()}: {len(_holes)} INTERIOR gap(s) between f{_contig+1:03d} "
+                        f"and f{_r[-1]:03d} — these are hours the panel reservation jumped over "
+                        f"before the budget ran out, so the matrix column will show blanks with "
+                        f"values on both sides. Raise the budget or set "
+                        f"RRFS_PRIORITISE_PANEL_HOURS=False to trade panel depth for a solid column.")
 
             _rrfs_fail_summary(kind, len(f_hours))
             sample = next(iter(all_coords))
@@ -3001,102 +3144,157 @@ def fetch_all_ecmwf_soundings():
         all_coords[sid] = {"lat": c["lat"], "lon": c["lon"]}
 
     steps = list(range(0, ECMWF_MAX_FH + 1, 3))  # IFS open-data cadence is 3-hourly
-    target = os.path.join(CACHE_DIR, "ecmwf_ifs_pl.grib2")
-    if os.path.exists(target):
-        try: os.remove(target)
-        except Exception: pass
 
-    try:
-        client = Client(source=ECMWF_SOURCE)
-        result = client.retrieve(
-            type="fc",
-            step=steps,
-            levtype="pl",
-            levelist=ECMWF_LEVELS_HPA,
-            param=["t", "gh", "r", "u", "v"],
-            target=target,
-        )
-        init_dt = getattr(result, "datetime", None)
-        if init_dt is not None:
-            _ec_cycle = init_dt.strftime("%Y%m%d%H")
-            for _sid in list(LAUNCH_PADS) + list(STATIONS):
-                _record_cycle(_sid, "ecmwf", _ec_cycle)
-        size_kib = os.path.getsize(target) // 1024 if os.path.exists(target) else 0
-        logging.info(f"ECMWF IFS: retrieved {size_kib} KiB, init {init_dt}, {len(steps)} steps.")
-    except Exception as e:
-        logging.error(f"ECMWF Open Data retrieve failed, skipping column: {e}")
-        if os.path.exists(target):
-            try: os.remove(target)
-            except Exception: pass
-        return {}
-
-    # Parse the multi-step file: group messages by VALID time -> row_key, per site per level.
+    # Accumulators live OUTSIDE the fetch loop so a chunk that lands is kept even if a later
+    # one never does. This is the whole point of the rewrite: the previous version made one
+    # retrieve for all 49 steps inside a 300 s external deadline, so a slow portal or a 429
+    # (ecmwf-opendata answers those with its own 120 s retry sleep, up to 500 times) produced
+    # an EMPTY dict, and an empty dict is indistinguishable downstream from "no ECMWF".
     per = {}                                   # row_key -> sid -> {level: {field: val}}
     seen = {}                                  # (shortName, typeOfLevel) -> count  [debug]
     matched = {"t": 0, "rh": 0, "hgt": 0, "u": 0, "v": 0}
     decode_errors = 0
-    try:
-        grbs = pygrib.open(target)
-        grid_lats = grid_lons = None
-        site_ij = {}
-        for grb in grbs:
-            try:
-                type_lvl = getattr(grb, "typeOfLevel", "")
-                short = getattr(grb, "shortName", "")
-            except Exception:
-                continue
-            seen[(short, type_lvl)] = seen.get((short, type_lvl), 0) + 1
-            if type_lvl != "isobaricInhPa":
-                continue
-            level = grb.level
-            if level not in ECMWF_LEVELS_HPA:
-                continue
-            field = None
-            if short in ("t", "TMP"): field = "t"
-            elif short in ("r", "RH"): field = "rh"
-            elif short in ("gh", "HGT"): field = "hgt"
-            elif short in ("u", "UGRD"): field = "u"
-            elif short in ("v", "VGRD"): field = "v"
-            if field is None:
-                continue
-            try:
-                vd = grb.validDate  # datetime of the valid time
-            except Exception:
-                continue
-            row_key = f"{vd.day:02d}/{vd.hour:02d}"
-            if grid_lats is None:
-                grid_lats, grid_lons = grb.latlons()
-                glons = np.where(grid_lons > 180, grid_lons - 360.0, grid_lons)
-                for sid, c in all_coords.items():
-                    dist = (grid_lats - c["lat"]) ** 2 + (glons - c["lon"]) ** 2
-                    site_ij[sid] = np.unravel_index(np.argmin(dist), dist.shape)
-            try:
-                vals = grb.values
-            except Exception as e:
-                # CCSDS decode failure surfaces here if eccodes lacks aec/libaec support.
-                decode_errors += 1
-                if decode_errors <= 3:
-                    logging.error(f"ECMWF GRIB value decode failed ({short}@{level}): {e}")
-                continue
-            matched[field] += 1
-            for sid, (iy, ix) in site_ij.items():
-                per.setdefault(row_key, {}).setdefault(sid, {}).setdefault(level, {})[field] = float(vals[iy, ix])
-        grbs.close()
-    except Exception as e:
-        logging.error(f"ECMWF GRIB parse failed: {e}")
-        return {}
-    finally:
+    grid_lats = grid_lons = None
+    site_ij = {}
+    init_dt = None
+    chunks_ok = 0
+    steps_ok = 0
+    t_budget = time.time()
+
+    def _parse_chunk(path):
+        """Parse one chunk file into `per`. Returns messages matched."""
+        nonlocal grid_lats, grid_lons, site_ij, decode_errors
+        n_before = sum(matched.values())
+        grbs = pygrib.open(path)
+        try:
+            for grb in grbs:
+                try:
+                    type_lvl = getattr(grb, "typeOfLevel", "")
+                    short = getattr(grb, "shortName", "")
+                except Exception:
+                    continue
+                seen[(short, type_lvl)] = seen.get((short, type_lvl), 0) + 1
+                if type_lvl != "isobaricInhPa":
+                    continue
+                level = grb.level
+                if level not in ECMWF_LEVELS_HPA:
+                    continue
+                field = None
+                if short in ("t", "TMP"): field = "t"
+                elif short in ("r", "RH"): field = "rh"
+                elif short in ("gh", "HGT"): field = "hgt"
+                elif short in ("u", "UGRD"): field = "u"
+                elif short in ("v", "VGRD"): field = "v"
+                if field is None:
+                    continue
+                try:
+                    vd = grb.validDate  # datetime of the valid time
+                except Exception:
+                    continue
+                row_key = f"{vd.day:02d}/{vd.hour:02d}"
+                if grid_lats is None:
+                    grid_lats, grid_lons = grb.latlons()
+                    glons = np.where(grid_lons > 180, grid_lons - 360.0, grid_lons)
+                    for sid, c in all_coords.items():
+                        dist = (grid_lats - c["lat"]) ** 2 + (glons - c["lon"]) ** 2
+                        site_ij[sid] = np.unravel_index(np.argmin(dist), dist.shape)
+                try:
+                    vals = grb.values
+                except Exception as e:
+                    # CCSDS decode failure surfaces here if eccodes lacks aec/libaec support.
+                    decode_errors += 1
+                    if decode_errors <= 3:
+                        logging.error(f"ECMWF GRIB value decode failed ({short}@{level}): {e}")
+                    continue
+                matched[field] += 1
+                for sid, (iy, ix) in site_ij.items():
+                    per.setdefault(row_key, {}).setdefault(sid, {}).setdefault(level, {})[field] = float(vals[iy, ix])
+        finally:
+            grbs.close()
+        return sum(matched.values()) - n_before
+
+    # Chunked retrieve with source failover and a wall-clock budget.
+    #
+    # Sources are tried in order per chunk and the winner is remembered, so a portal that is
+    # refusing today costs one failed chunk rather than the column. Every chunk is parsed and
+    # deleted immediately: peak disk is one chunk, not the whole 49-step file.
+    src_order = list(ECMWF_SOURCE_FALLBACKS)
+    if ECMWF_SOURCE in src_order:
+        src_order.remove(ECMWF_SOURCE)
+    src_order.insert(0, ECMWF_SOURCE)
+    good_src = None
+
+    chunk_list = [steps[i:i + ECMWF_STEP_CHUNK] for i in range(0, len(steps), ECMWF_STEP_CHUNK)]
+    logging.info(f"ECMWF IFS: {len(steps)} steps in {len(chunk_list)} chunk(s) of "
+                 f"{ECMWF_STEP_CHUNK}, budget {ECMWF_BUDGET_S}s, sources {src_order}.")
+
+    for ci, chunk in enumerate(chunk_list):
+        elapsed = time.time() - t_budget
+        if elapsed > ECMWF_BUDGET_S:
+            logging.warning(
+                f"ECMWF IFS: {ECMWF_BUDGET_S}s budget spent after {steps_ok} of {len(steps)} "
+                f"steps — keeping what parsed and moving on. The column will be SHORTER, not "
+                f"absent. Raise ECMWF_BUDGET_S (and ECMWF_DEADLINE_S with it) to go deeper.")
+            break
+        target = os.path.join(CACHE_DIR, f"ecmwf_ifs_pl_{ci:02d}.grib2")
         if os.path.exists(target):
             try: os.remove(target)
             except Exception: pass
+
+        got = False
+        for src in ([good_src] if good_src else src_order):
+            t_chunk = time.time()
+            try:
+                client = Client(source=src)
+                result = client.retrieve(
+                    type="fc",
+                    step=chunk,
+                    levtype="pl",
+                    levelist=ECMWF_LEVELS_HPA,
+                    param=["t", "gh", "r", "u", "v"],
+                    target=target,
+                )
+                if init_dt is None:
+                    init_dt = getattr(result, "datetime", None)
+                    if init_dt is not None:
+                        _ec_cycle = init_dt.strftime("%Y%m%d%H")
+                        for _sid in list(LAUNCH_PADS) + list(STATIONS):
+                            _record_cycle(_sid, "ecmwf", _ec_cycle)
+                n_msgs = _parse_chunk(target)
+                size_kib = os.path.getsize(target) // 1024 if os.path.exists(target) else 0
+                logging.info(f"ECMWF IFS chunk {ci + 1}/{len(chunk_list)} "
+                             f"(f{chunk[0]:03d}-f{chunk[-1]:03d}) via {src}: {size_kib} KiB, "
+                             f"{n_msgs} messages, {time.time() - t_chunk:.0f}s.")
+                good_src = src
+                chunks_ok += 1
+                steps_ok += len(chunk)
+                got = True
+                break
+            except Exception as e:
+                logging.warning(f"ECMWF IFS chunk {ci + 1} (f{chunk[0]:03d}-f{chunk[-1]:03d}) "
+                                f"via {src} failed after {time.time() - t_chunk:.0f}s: "
+                                f"{type(e).__name__}: {e}")
+                if good_src == src:
+                    good_src = None   # stop pinning a source that just broke
+            finally:
+                if os.path.exists(target):
+                    try: os.remove(target)
+                    except Exception: pass
+        if not got:
+            logging.error(f"ECMWF IFS chunk {ci + 1}: every source refused. Continuing to the "
+                          f"next chunk rather than abandoning the column.")
 
     logging.info("[ECMWF DEBUG] shortName/typeOfLevel seen: "
                  + ", ".join(f"{k[0]}/{k[1]}={v}" for k, v in sorted(seen.items())))
     logging.info(f"[ECMWF DEBUG] fields matched to parser: {matched}"
                  + (f" | {decode_errors} value-decode errors" if decode_errors else ""))
+    logging.info(f"ECMWF IFS: {chunks_ok}/{len(chunk_list)} chunks, {steps_ok}/{len(steps)} "
+                 f"steps, init {init_dt}, {time.time() - t_budget:.0f}s total.")
     if sum(matched.values()) == 0:
         logging.warning("[ECMWF DEBUG] ZERO isobaric fields matched. If shortNames above look right "
-                        "but decode errors are nonzero, eccodes likely lacks CCSDS/aec (libaec) support.")
+                        "but decode errors are nonzero, eccodes likely lacks CCSDS/aec (libaec) support. "
+                        "If NO chunk succeeded at all, the failure is the retrieve, not the parse — "
+                        "read the per-chunk warnings above for the reason each source gave.")
         return {}
 
     # Build profiles + run the shared variable computation (same engine as pads/BUFKIT).
@@ -4962,6 +5160,27 @@ def _convective_params(layers):
                   "mf_dir", "mf_spd", "mf_regime", "av_dir", "av_spd", "av_regime"):
             if base.get(k) is not None:
                 out[k] = base[k]
+
+        # Cizek lightning probability for THIS profile.
+        #
+        # All three RF features are already sitting in `base` — Thompson, the 1000-700 mb mean
+        # flow (from which the westerly-positive u component is rebuilt with the upstream
+        # formula) and the 700-500 mb mean RH — so this costs one forest walk per profile and
+        # is guaranteed to agree with the 10Z panel wherever they overlap, because it is
+        # literally the same three numbers through the same function.
+        #
+        # OFF-LABEL WARNING, and the frontend repeats it: the forest was trained on the 10Z
+        # KSC/CCSFS sounding only. Applied at 19Z it is being handed a daytime-heated Thompson
+        # from a feature distribution it never saw with that label, so treat anything outside
+        # roughly 08-12Z as a relative trend between models and hours, not a calibrated
+        # probability. `ltg_hour_ok` carries that judgement to the UI rather than leaving the
+        # panel to re-derive it.
+        if SKEWT_LIGHTNING:
+            u_ltg = rf_lightning_u_wind(out.get("mf_dir"), out.get("mf_spd"))
+            ltg = rf_lightning_prob(out.get("thompson"), u_ltg, out.get("rh_700_500"))
+            if ltg is not None:
+                out["ltg"] = ltg
+                out["ltg_u"] = round(u_ltg, 2)
         return out
     except Exception:
         return {}
@@ -5083,8 +5302,17 @@ def build_soundings_export(combined_data, site="kxmr", max_hours=SKEWT_MAX_PROFI
 
     t0 = time.time()
     out = {"site": site.upper(), "models": {}, "n_profiles": 0}
+    skipped_thin = {}     # model -> count of profiles rejected for too few levels
     for mdl, rows in models.items():
         if not isinstance(rows, dict):
+            continue
+        # Hard exclusion by name, for columns that are useful in the matrix but are not
+        # soundings. See SKEWT_EXCLUDE_MODELS — REFS publishes five pressure levels, which
+        # draws as four straight segments and produces parcel numbers that are wrong in a
+        # way that looks plausible.
+        if mdl in SKEWT_EXCLUDE_MODELS:
+            logging.info(f"Skew-T export: skipping '{mdl}' (SKEWT_EXCLUDE_MODELS) — "
+                         f"{len(rows)} hour(s) not exported.")
             continue
         # Cap on profile COUNT, so an hourly model and a 3-hourly one reach different
         # horizons from the same number. That is intentional: the point is to export what
@@ -5096,7 +5324,8 @@ def build_soundings_export(combined_data, site="kxmr", max_hours=SKEWT_MAX_PROFI
             if not isinstance(prof, dict):
                 continue
             layers = prof.get("_layers") or []
-            if len(layers) < 5:
+            if len(layers) < SKEWT_MIN_LEVELS:
+                skipped_thin[mdl] = skipped_thin.get(mdl, 0) + 1
                 continue
             lv = []
             for L in layers:
@@ -5112,7 +5341,8 @@ def build_soundings_export(combined_data, site="kxmr", max_hours=SKEWT_MAX_PROFI
                     round(L["drct"]) if L.get("drct") is not None else None,
                     round(L["sknt"], 1) if L.get("sknt") is not None else None,
                 ])
-            if len(lv) < 5:
+            if len(lv) < SKEWT_MIN_LEVELS:
+                skipped_thin[mdl] = skipped_thin.get(mdl, 0) + 1
                 continue
             entry = {"lv": lv}
             params = _convective_params(layers)
@@ -5130,8 +5360,15 @@ def build_soundings_export(combined_data, site="kxmr", max_hours=SKEWT_MAX_PROFI
             out["models"][mdl] = prof_out
 
     out["elapsed_s"] = round(time.time() - t0, 1)
+    if skipped_thin:
+        # Say so rather than letting a column quietly vanish. A model dropped for thin
+        # profiles and a model that failed to fetch look identical in the output file.
+        logging.info("Skew-T export: dropped thin profiles (< "
+                     f"{SKEWT_MIN_LEVELS} usable levels): "
+                     + ", ".join(f"{m}={n}" for m, n in sorted(skipped_thin.items())))
     logging.info(f"Skew-T export: {out['n_profiles']} profiles across "
-                 f"{len(out['models'])} models at {site.upper()} in {out['elapsed_s']}s.")
+                 f"{len(out['models'])} models at {site.upper()} in {out['elapsed_s']}s "
+                 f"[{', '.join(sorted(out['models'])) or 'none'}].")
     return out
 
 
@@ -5519,14 +5756,31 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     except Exception as e:
         logging.error(f"GEFS member thermo fetch failed: {e}")
         gefs_member_rows, gefs_cycle_key = {}, None
+    # Same cache-preservation rule as ECMWF ENS below.
+    if not gefs_member_rows and isinstance(prior_gefs_cache, dict) and prior_gefs_cache.get("rows"):
+        gefs_member_rows = prior_gefs_cache["rows"]
+        gefs_cycle_key = prior_gefs_cache.get("cycle")
+        logging.warning(f"GEFS: fetch produced nothing; reusing cached cycle "
+                        f"{gefs_cycle_key} ({len(gefs_member_rows)} rows).")
     try:
         ecens_member_rows, ecens_cycle_key = _run_with_deadline(
             lambda: fetch_ecmwf_ens_member_thermo(
                 site="kxmr", assess_hour=10, cache=prior_ecens_cache),
-            SOURCE_DEADLINE_S, "ECMWF ENS", default=({}, None))
+            ECMWF_ENS_DEADLINE_S, "ECMWF ENS", default=({}, None))
     except Exception as e:
         logging.error(f"ECMWF ENS member thermo fetch failed: {e}")
         ecens_member_rows, ecens_cycle_key = {}, None
+    # A failed ENS fetch must not also DESTROY the cache. Without this, one timeout wrote
+    # ecens_cache=None, which forced a full ~940 MB refetch on the next hourly run, which
+    # timed out the same way — the column stayed missing until a cycle happened to land
+    # inside the deadline. Falling back to the previous cycle's rows keeps the panel
+    # populated with a real (older) forecast and keeps the cache alive.
+    if not ecens_member_rows and isinstance(prior_ecens_cache, dict) and prior_ecens_cache.get("rows"):
+        ecens_member_rows = prior_ecens_cache["rows"]
+        ecens_cycle_key = prior_ecens_cache.get("cycle")
+        logging.warning(f"ECMWF ENS: fetch produced nothing; reusing cached cycle "
+                        f"{ecens_cycle_key} ({len(ecens_member_rows)} rows) rather than "
+                        f"dropping the column and discarding the cache.")
     try:
         launch_thermo = build_launch_thermo(combined_data, site="kxmr", assess_hour=10,
                                             refs_member_rows=refs_member_rows,
@@ -5724,8 +5978,11 @@ def run_pipeline():
     # try/except so any ECMWF outage or missing dependency leaves the rest of the run intact.
     if ECMWF_ENABLED:
         try:
+            # ECMWF gets its OWN deadline, sized above its internal budget. The shared 300 s
+            # was below the time a 49-step retrieve needs on a normal day, so the backstop
+            # was firing as routine behaviour and taking the whole column with it.
             ecmwf_matrix = _run_with_deadline(
-                fetch_all_ecmwf_soundings, SOURCE_DEADLINE_S, "ECMWF", default={})
+                fetch_all_ecmwf_soundings, ECMWF_DEADLINE_S, "ECMWF", default={})
             if ecmwf_matrix:
                 if pad_matrix is None:
                     pad_matrix = {pid: {} for pid in LAUNCH_PADS}
