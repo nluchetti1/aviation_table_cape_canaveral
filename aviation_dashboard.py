@@ -354,6 +354,16 @@ NOMADS_MAX_CONCURRENCY = 1
 # ~20 s to transfer, so the pause below is on top of a naturally slow request and the
 # effective spacing is well past their floor. REFS files are small and genuinely need it.
 NOMADS_REQUEST_PAUSE_S = 4.0
+# Pause between the byte-range GETs WITHIN one file. This must be tiny and separate from the
+# between-files pause: a single RRFS hour needs ~100 range requests, so charging the 4 s
+# file-pause for each of them cost 6.7 minutes of pure sleeping per forecast hour and turned
+# a 20-second download into a 7-minute one. The ranges are one logical transfer of one file,
+# not 100 requests for new data.
+NOMADS_RANGE_PAUSE_S = 0.15
+# Hard wall-clock budget per model kind. Without this a slow or throttled source has no way
+# to end: the last run sat for 36 minutes and was cancelled with nothing committed. Better a
+# short column and a finished run than a hung job.
+NOMADS_KIND_BUDGET_S = 420
 # Retry a redirected (throttled) request this many times, backing off each time.
 NOMADS_THROTTLE_RETRIES = 3
 
@@ -2554,7 +2564,7 @@ def _range_download_grib(session, grib_url, idx_entries, wanted_levels_hpa, debu
                 # the thing NOMADS actually objects to.
                 if "nomads.ncep.noaa.gov" in grib_url:
                     r = _nomads_get(session, grib_url, timeout=25, headers=hdr,
-                                    tag="range GET")
+                                    tag="range GET", pause=NOMADS_RANGE_PAUSE_S)
                 else:
                     r = session.get(grib_url, headers=hdr, timeout=25)
                 if r.status_code in (200, 206):
@@ -2632,13 +2642,19 @@ _NOMADS_LAST = [0.0]
 _NOMADS_REDIRECT_LOGGED = [False]
 
 
-def _nomads_get(session, url, timeout=20, tag="", stream=False, headers=None):
-    """One paced request. Retries a 302 with backoff before giving up."""
+def _nomads_get(session, url, timeout=20, tag="", stream=False, headers=None, pause=None):
+    """One paced request. Retries a 302 with backoff before giving up.
+
+    `pause` is the minimum spacing before this request. Callers fetching a NEW FILE pass the
+    default (NOMADS_REQUEST_PAUSE_S); callers pulling successive byte-ranges out of a file
+    they are already downloading pass NOMADS_RANGE_PAUSE_S.
+    """
+    pause = NOMADS_REQUEST_PAUSE_S if pause is None else pause
     for attempt in range(NOMADS_THROTTLE_RETRIES + 1):
         with _NOMADS_LOCK:
             gap = time.time() - _NOMADS_LAST[0]
-            if gap < NOMADS_REQUEST_PAUSE_S:
-                time.sleep(NOMADS_REQUEST_PAUSE_S - gap)
+            if gap < pause:
+                time.sleep(pause - gap)
             _NOMADS_LAST[0] = time.time()
         r = session.get(url, timeout=timeout, allow_redirects=False,
                         stream=stream, headers=headers or {})
@@ -2825,22 +2841,32 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
             logging.info(f"Fetching {kind.upper()} columns ({len(all_coords)} sites): {date_str} {cycle}z, {len(f_hours)} hours")
             for _sid in all_coords:
                 _record_cycle(_sid, kind, f"{date_str}{cycle}")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=NOMADS_MAX_CONCURRENCY) as executor:
-                futures = []
-                for idx, fh in enumerate(f_hours):
-                    valid_dt = cycle_init + datetime.timedelta(hours=fh)
-                    row_key = f"{valid_dt.day:02d}/{valid_dt.hour:02d}"
-                    dbg = (idx == 0)  # verbose only on first hour
-                    futures.append(executor.submit(
-                        fetch_rrfs_pad_hour, session, kind, date_str, cycle, fh, row_key, all_coords, dbg
-                    ))
-                for fut in concurrent.futures.as_completed(futures):
-                    try:
-                        row_key, mk, site_vals = fut.result()
-                        for sid, vd in site_vals.items():
-                            matrix[sid][mk][row_key] = vd
-                    except Exception:
-                        pass
+            # Sequential, with a wall-clock budget. Concurrency is 1 anyway (NOMADS throttles
+            # bursts), so the executor bought nothing but hid the running total — and without
+            # a budget a slow source has no way to stop: the 2026-08-25 run sat for 36 minutes
+            # and was cancelled with nothing written. Because the panel-critical hours are at
+            # the FRONT of f_hours, running out of budget costs matrix depth, not a model.
+            _t_start = time.time()
+            _done = 0
+            for idx, fh in enumerate(f_hours):
+                if time.time() - _t_start > NOMADS_KIND_BUDGET_S:
+                    logging.warning(
+                        f"{kind.upper()}: {NOMADS_KIND_BUDGET_S}s budget spent after {_done} "
+                        f"of {len(f_hours)} hours — stopping here so the run can finish. "
+                        f"Panel-critical hours were fetched first, so those are already in.")
+                    break
+                valid_dt = cycle_init + datetime.timedelta(hours=fh)
+                row_key = f"{valid_dt.day:02d}/{valid_dt.hour:02d}"
+                dbg = (idx == 0)  # verbose only on the first hour
+                try:
+                    row_key, mk, site_vals = fetch_rrfs_pad_hour(
+                        session, kind, date_str, cycle, fh, row_key, all_coords, dbg)
+                    for sid, vd in site_vals.items():
+                        matrix[sid][mk][row_key] = vd
+                    if site_vals:
+                        _done += 1
+                except Exception as e:
+                    _rrfs_note_fail(kind, fh, f"{type(e).__name__}: {str(e)[:60]}")
 
             _rrfs_fail_summary(kind, len(f_hours))
             sample = next(iter(all_coords))
