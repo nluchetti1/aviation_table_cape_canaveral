@@ -315,8 +315,8 @@ MSG_INDEX_THRESHOLDS = {1: "p25", 2: "p50", 3: "p100", 4: "p200"}
 # The rrfs_public/ tree is the "operationally-representative" set per the AWS registry:
 #   rrfs_public/rrfs.YYYYMMDD/CC/rrfs.tCCz.prslev.3km.fFFF.conus.grib2      (deterministic)
 #   rrfs_public/refs.YYYYMMDD/CC/ensprod/ ...                              (ensemble products)
-RRFS_ENABLED = True          # master switch for the RRFS deterministic pad column
-REFS_ENABLED = True          # master switch for the REFS ensemble-average pad column
+RRFS_ENABLED = False       # master switch for the RRFS deterministic pad column
+REFS_ENABLED = False         # master switch for the REFS ensemble-average pad column
 # NOMADS parallel feed. RRFS/REFS moved off the AWS prototype bucket (SCN 26-48); the
 # rrfs_a/ tree that carried individual ensemble members is gone, so REFS is now the published
 # ENSEMBLE MEAN only — see REFS_MEMBER_THERMO_ENABLED for what that costs.
