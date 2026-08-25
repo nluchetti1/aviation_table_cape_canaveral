@@ -2114,6 +2114,14 @@
             if (dir == null) return '\u2014';
             return `${Math.round(dir)}\u00b0 / ${spd == null ? '\u2014' : Number(spd).toFixed(1)} kt`;
         }
+        // Same numbers, split so a narrow column can stack them. The single-model panel keeps
+        // using skFlowStr above: it has one column and plenty of room.
+        function skFlowDirStr(dir) {
+            return dir == null ? '\u2014' : `${Math.round(dir)}\u00b0`;
+        }
+        function skFlowSpdStr(spd) {
+            return spd == null ? '\u2014' : `${Number(spd).toFixed(1)} kt`;
+        }
         // Smallest signed angle from b to a, so 350 and 010 read as 20 apart, not 340.
         function skAngDiff(a, b) {
             if (a == null || b == null) return null;
@@ -2748,20 +2756,29 @@
                     ? `<div title="Run ${ck}${age != null ? ' \u2014 ' + age.toFixed(1) + ' h old' : ''}"
                          style="font-weight:600; font-size:0.68rem; color:${stale ? '#b45309' : '#94a3b8'};">${lab}${stale ? ' \u26a0' : ''}</div>`
                     : '';
-                return `<th style="${thBase} padding:4px 5px; text-align:right; color:${skCmpColor(pk.model)}; font-size:0.74rem; font-weight:700;">${ltLabel(pk.model)}${sub}</th>`;
+                return `<th style="${thBase} padding:4px 6px; text-align:right; color:${skCmpColor(pk.model)}; font-size:0.74rem; font-weight:700; white-space:nowrap; min-width:78px;">${ltLabel(pk.model)}${sub}</th>`;
             }).join('');
             let rows = '';
 
             // Synoptic flow first: it frames everything below it. Direction spread is the
             // widest angular separation between any two models, not max minus min.
-            rows += `<tr><td colspan="${picked.length + 2}" style="padding:7px 0 2px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0; font-size:0.76rem;">Synoptic flow</td></tr>`;
+            rows += `<tr><td colspan="${picked.length + 2}" style="padding:7px 0 2px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0; font-size:0.76rem; background:#fff;">Synoptic flow</td></tr>`;
             SK_CMP_FLOW.forEach(fr => {
                 const dirs = picked.map(pk => (vals[pk.model][fr.dirK] == null ? null : Number(vals[pk.model][fr.dirK])));
                 const spds = picked.map(pk => (vals[pk.model][fr.spdK] == null ? null : Number(vals[pk.model][fr.spdK])));
                 const cells = picked.map((pk, i) => {
                     const reg = fr.regK ? vals[pk.model][fr.regK] : null;
-                    return `<td style="padding:3px 5px; text-align:right; font-weight:600; white-space:nowrap;">
-                        ${skFlowStr(dirs[i], spds[i])}${reg ? '<br>' + skRegimeChip(reg) : ''}</td>`;
+                    // Direction ON TOP OF speed, not beside it.
+                    //
+                    // "218\u00b0 / 5.2 kt" is ~13 nowrap characters. With five models that is
+                    // wider than the panel can give each column, and because the cell cannot
+                    // wrap it spills sideways and prints over its neighbour — which is what
+                    // made this row unreadable while every other row was fine. Stacking halves
+                    // the width demand and the numbers still read top-to-bottom as a pair.
+                    return `<td style="padding:3px 6px; text-align:right; font-weight:600; white-space:nowrap; line-height:1.25;">
+                        ${skFlowDirStr(dirs[i])}<br>
+                        <span style="font-weight:600; color:#334155;">${skFlowSpdStr(spds[i])}</span>${
+                        reg ? '<br>' + skRegimeChip(reg) : ''}</td>`;
                 }).join('');
                 const aSp = skAngSpread(dirs);
                 const real = spds.filter(v => v != null);
@@ -2782,14 +2799,14 @@
                         regNote = ` <span title="models disagree on onshore vs offshore" style="background:#fee2e2; color:#991b1b; padding:1px 5px; border-radius:9px; font-weight:700; font-size:0.7rem;">SPLIT</span>`;
                     }
                 }
-                rows += `<tr><td style="padding:3px 6px 3px 0; color:#475569; white-space:nowrap;">${fr.lab}</td>${cells}
+                rows += `<tr><td style="padding:3px 10px 3px 0; color:#475569; white-space:nowrap; position:sticky; left:0; background:#fff; z-index:1;">${fr.lab}</td>${cells}
                     <td style="padding:3px 0 3px 6px; text-align:right; font-size:0.74rem; white-space:nowrap;">
                     ${chip(aSp, fr.watch, fr.split, '\u00b0')} ${chip(sSp, fr.sWatch, fr.sSplit, 'kt')}${regNote}</td></tr>`;
             });
 
             SK_CMP_ROWS.forEach(r => {
                 if (r.grp) {
-                    rows += `<tr><td colspan="${picked.length + 2}" style="padding:7px 0 2px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0; font-size:0.76rem;">${r.grp}</td></tr>`;
+                    rows += `<tr><td colspan="${picked.length + 2}" style="padding:7px 0 2px; font-weight:700; color:#1e293b; border-bottom:1px solid #e2e8f0; font-size:0.76rem; background:#fff;">${r.grp}</td></tr>`;
                 }
                 const got = picked.map(pk => {
                     const v = vals[pk.model][r.k];
@@ -2811,11 +2828,16 @@
                     const spTxt = (r.unit === ' ft') ? Math.round(spread).toLocaleString('en-US') : spread.toFixed(r.dp);
                     sp = `<span style="${sty} padding:1px 6px; border-radius:9px; font-weight:600;">${spTxt}</span>`;
                 }
-                rows += `<tr><td style="padding:3px 6px 3px 0; color:#475569; white-space:nowrap;">${r.lab}</td>${cells}<td style="padding:3px 0 3px 6px; text-align:right; font-size:0.76rem;">${sp}</td></tr>`;
+                rows += `<tr><td style="padding:3px 10px 3px 0; color:#475569; white-space:nowrap; position:sticky; left:0; background:#fff; z-index:1;">${r.lab}</td>${cells}<td style="padding:3px 0 3px 6px; text-align:right; font-size:0.76rem;">${sp}</td></tr>`;
             });
+            // Give every model column room instead of a fixed 340px floor that five columns
+            // cannot honour. The wrapper already scrolls horizontally, so a wider table is
+            // scrollable rather than crushed — and the label column is pinned left so a row
+            // name is never the thing that scrolls out from under its own numbers.
+            const tblMin = 150 + picked.length * 86 + 64;
             return `<div style="overflow-x:auto; -webkit-overflow-scrolling:touch;">
-                <table style="width:100%; border-collapse:collapse; font-size:0.8rem; min-width:340px;">
-                <thead><tr><th style="${thBase}"></th>${head}<th style="${thBase} padding:4px 6px; text-align:right; color:#64748b; font-size:0.72rem;">spread</th></tr></thead>
+                <table style="width:100%; border-collapse:collapse; font-size:0.8rem; min-width:${tblMin}px; table-layout:auto;">
+                <thead><tr><th style="${thBase} position:sticky; left:0; background:#f8fafc; z-index:2; min-width:130px;"></th>${head}<th style="${thBase} padding:4px 6px; text-align:right; color:#64748b; font-size:0.72rem;">spread</th></tr></thead>
                 <tbody>${rows}</tbody></table></div>
                 <div style="font-size:0.7rem; color:#94a3b8; margin-top:8px;">
                     Spread is max minus min across the models reporting a value. Amber and red mark
