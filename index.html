@@ -1768,6 +1768,18 @@
             // Its wind fields are fine (averaging u/v is linear); its thermodynamic indices are
             // biased toward the middle, and the bias is worst exactly when the members disagree.
             // Saying so beside the numbers is the difference between a caveat and a trap.
+            // A column whose source publishes almost no humidity levels keeps its wind fields
+            // and drops the moisture-driven indices. Saying which is which matters: the flow
+            // numbers in that row are as good as any other model's, and the blanks are honest
+            // absence rather than a fetch failure.
+            const thinNote = (rows[0] && rows[0].engine === 'thin-moisture')
+                ? `<div style="font-size:0.78rem; color:#78350f; background:#fef3c7; padding:5px 8px; border-radius:4px; margin:2px 0 8px;">
+                     <strong>Flow only.</strong> This source publishes ${rows[0].rh_levels == null ? 'too few' : 'only ' + rows[0].rh_levels}
+                     level${rows[0].rh_levels === 1 ? '' : 's'} carrying humidity &mdash; not enough vertical moisture
+                     structure for Thompson, PWAT, RH or the lightning probability, so those are left blank rather
+                     than computed from a single level. Mean flow, regime and anvil flow only need u/v and are
+                     unaffected.</div>`
+                : '';
             const meanNote = (rows[0] && rows[0].engine === 'mean-sounding')
                 ? `<div style="font-size:0.78rem; color:#78350f; background:#fef3c7; padding:5px 8px; border-radius:4px; margin:2px 0 8px;">
                      <strong>REFS = ensemble MEAN sounding.</strong> NOMADS publishes no REFS members, so these
@@ -1833,7 +1845,7 @@
                 }
                 return s;
             };
-            let html = meanNote + ensNote + `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
+            let html = thinNote + meanNote + ensNote + `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
               <thead><tr style="text-align:left; color:#475569; border-bottom:2px solid #e2e8f0;">
                 <th style="padding:8px 6px; width:150px; white-space:nowrap;">Day</th>
                 <th style="padding:8px 6px;">1000–700 mb Mean Flow</th>
