@@ -241,6 +241,18 @@ REFS_MEMBER_THERMO_ENABLED = False
 # Set False to go back to omitting REFS from the panel entirely.
 REFS_MEAN_IN_PANEL = True
 
+# Minimum number of levels carrying humidity before the moisture-driven indices are trusted.
+#
+# Measured on 2026-08-24: refs.tHHz.mean carries 6 isobaric levels and exactly ONE with RH.
+# Thompson, K-Index, Lifted Index, PWAT and the 700-500 RH all need vertical moisture
+# structure, and computing them from a single humidity level produces numbers that look
+# ordinary and mean nothing. The WIND fields are unaffected — mean flow, regime and anvil
+# flow only need u/v, which REFS does publish on several levels.
+#
+# So the gate is on the DATA, not on the model name: any column thin on humidity gets a
+# flow-only row. If REFS later publishes a fuller mean, it starts working with no code change.
+PANEL_MIN_RH_LEVELS = 5
+
 # ---- GEFS ensemble column for the 10Z panel (global 0.5 deg, AWS mirror) ---------------------
 # Panel-only: GEFS is far coarser than the mesoscale columns and would add nothing to the hourly
 # matrix, but it gives a genuine global-ensemble read on the daily airmass out to a week.
@@ -328,6 +340,20 @@ REFS_LATENCY_H = 4
 # NOMADS is not S3. It asks for restraint and will treat a burst as an attack, the same way
 # PSU did. This concurrency is deliberately low and is NOT a knob to turn up casually.
 NOMADS_MAX_CONCURRENCY = 3
+
+# Forecast hours whose VALID time lands near the 10Z assessment hour are fetched FIRST,
+# ahead of the sequential f001, f002, ... sweep.
+#
+# Reason: a 3 km CONUS message is ~1.3 MB and byte-range cannot subset spatially, so one
+# forecast hour costs ~133 MB and a 60-hour sweep is ~8 GB. When that runs out of time the
+# sweep truncates at whatever hour it reached — and on 2026-08-24 that was f010, six hours
+# short of the f016 the 10Z panel needed. The panel then showed no RRFS row at all, which
+# looked like a panel bug and was actually a download budget running out.
+#
+# Fetching the handful of panel-critical hours first makes the panel robust to truncation:
+# worst case the MATRIX is short, which is visible and expected, rather than the panel
+# silently losing a model.
+RRFS_PRIORITISE_PANEL_HOURS = True
 
 # The TRUE member-based cumulus NMEP read individual RRFS ensemble members from the AWS
 # prototype tree (rrfs_a/rrfsens.DATE/CC/mNNN/). That tree went away with SCN 26-48 and NOMADS
@@ -2572,6 +2598,42 @@ def _rrfs_determine_cycle(session, model_kind):
     return None, None
 
 
+# Per-hour failure ledger for the RRFS/REFS sweep.
+#
+# The futures loop used to swallow every exception with a bare `except: pass`, so a run that
+# produced 10 of 60 forecast hours gave no clue whether the other 50 were missing files, a
+# throttle, or a parse error. Those need completely different fixes, and guessing between
+# them wasted a cycle. Reasons are tallied here and summarised at the end of each sweep.
+_RRFS_FAILS = {}
+
+
+def _rrfs_note_fail(kind, fh, reason):
+    _RRFS_FAILS.setdefault(kind, []).append((fh, reason))
+
+
+def _rrfs_fail_summary(kind, attempted):
+    """Log why the hours that produced nothing produced nothing."""
+    fails = _RRFS_FAILS.get(kind) or []
+    if not fails:
+        return
+    by_reason = {}
+    for fh, reason in fails:
+        # Collapse "idx HTTP 404" for f011..f060 into one line rather than fifty.
+        key = reason.split("(")[0].strip()
+        by_reason.setdefault(key, []).append(fh)
+    logging.warning(f"{kind.upper()}: {len(fails)}/{attempted} forecast hours produced nothing. Reasons:")
+    for reason, hrs in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+        hrs = sorted(hrs)
+        span = f"f{hrs[0]:03d}" if len(hrs) == 1 else f"f{hrs[0]:03d}-f{hrs[-1]:03d}"
+        logging.warning(f"    {len(hrs):>3} hour(s)  {span:<14} {reason}")
+    # An unbroken tail of missing files means the run simply is not that long yet.
+    idx404 = sorted(fh for fh, r in fails if r.startswith("idx HTTP 404"))
+    if len(idx404) > 3 and idx404 == list(range(idx404[0], idx404[-1] + 1)):
+        logging.warning(f"    -> f{idx404[0]:03d} onward are all missing on the server: this cycle "
+                        f"has not been written that far yet, or does not run that long. "
+                        f"Not a fetch problem.")
+
+
 def _rrfs_grib_url(model_kind, date_str, cycle, f_hour_int):
     """Build the AWS S3 URL for an RRFS deterministic, REFS ensemble-mean, or HRRR
     pressure-level file. For REFS, uses the module-cached resolved filename pattern."""
@@ -2605,7 +2667,8 @@ def fetch_rrfs_pad_hour(session, model_kind, date_str, cycle, f_hour_int, row_ke
         if idx_resp.status_code != 200:
             if debug:
                 logging.warning(f"[RRFS DEBUG]   >>> idx not found. Check {model_kind.upper()} "
-                                f"AWS path/filename. GRIB URL was: {grib_url}")
+                                f"path/filename. GRIB URL was: {grib_url}")
+            _rrfs_note_fail(model_kind, f_hour_int, f"idx HTTP {idx_resp.status_code}")
             return row_key, model_kind, out
 
         idx_entries = _parse_grib_idx(idx_resp.text)
@@ -2615,6 +2678,7 @@ def fetch_rrfs_pad_hour(session, model_kind, date_str, cycle, f_hour_int, row_ke
 
         local_path = _range_download_grib(session, grib_url, idx_entries, PAD_LEVELS_HPA, debug=debug)
         if not local_path:
+            _rrfs_note_fail(model_kind, f_hour_int, "range download returned nothing")
             return row_key, model_kind, out
 
         if debug:
@@ -2626,8 +2690,13 @@ def fetch_rrfs_pad_hour(session, model_kind, date_str, cycle, f_hour_int, row_ke
             result = compute_profile_variables(layers)
             if result is not None:
                 out[sid] = result
+        if not out:
+            _rrfs_note_fail(model_kind, f_hour_int,
+                            f"grib parsed but produced no usable profile "
+                            f"({len(site_profiles)} site profiles)")
     except Exception as e:
         logging.debug(f"RRFS fetch break {model_kind} f{f_hour_int:03d}: {e}")
+        _rrfs_note_fail(model_kind, f_hour_int, f"{type(e).__name__}: {str(e)[:80]}")
         if debug:
             logging.warning(f"[RRFS DEBUG]   >>> exception: {e}")
     finally:
@@ -2680,6 +2749,18 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
                 # for f060 would fire 40 doomed probes at NOMADS every hour.
                 kind_max_fh = RRFS_MAX_FH if int(cycle) in RRFS_SYNOPTIC_CYCLES else RRFS_SHORT_FH
             f_hours = list(range(1, kind_max_fh + 1))
+            if RRFS_PRIORITISE_PANEL_HOURS and kind in ("rrfs", "refs"):
+                # Hours valid within ASSESS_HOUR_TOL of the assessment hour, on any forecast
+                # day, moved to the front. Order only — nothing is added or dropped.
+                def _is_panel_hour(fh):
+                    v = cycle_init + datetime.timedelta(hours=fh)
+                    return abs(v.hour - 10) <= ASSESS_HOUR_TOL
+                prio = [h for h in f_hours if _is_panel_hour(h)]
+                rest = [h for h in f_hours if not _is_panel_hour(h)]
+                f_hours = prio + rest
+                if prio:
+                    logging.info(f"{kind.upper()}: fetching {len(prio)} panel-critical hour(s) "
+                                 f"first (f{prio[0]:03d}..f{prio[-1]:03d}), then the rest.")
 
             logging.info(f"Fetching {kind.upper()} columns ({len(all_coords)} sites): {date_str} {cycle}z, {len(f_hours)} hours")
             for _sid in all_coords:
@@ -2701,6 +2782,7 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
                     except Exception:
                         pass
 
+            _rrfs_fail_summary(kind, len(f_hours))
             sample = next(iter(all_coords))
             hours_ok = len(matrix[sample].get(kind, {}))
             if hours_ok == 0:
@@ -4916,6 +4998,16 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
             cands.sort(key=lambda c: (c[0], c[1]))
             for diff, hh, prof in cands:
                 th = compute_launch_thermo(prof["_layers"])  # MetPy (mixed-layer LI), on demand
+                # Count levels that actually carry humidity. A column too thin here keeps its
+                # wind fields and drops the moisture-driven indices rather than publishing
+                # numbers derived from one RH level.
+                _rh_n = sum(1 for _L in (prof.get("_layers") or [])
+                            if _L.get("rh") is not None or _L.get("dwpt") is not None)
+                if th and _rh_n < PANEL_MIN_RH_LEVELS:
+                    for _k in ("k_index", "lifted_index", "thompson", "pwat_in", "pwat_mm",
+                               "rh_700_500"):
+                        th[_k] = None
+                    th["thin_moisture"] = _rh_n
                 if not th:
                     continue
                 day_label, date_str, sort_key, month, _yr = _valid_day_fields(dd, now)
@@ -4945,7 +5037,11 @@ def build_launch_thermo(combined_data, site="kxmr", assess_hour=10, refs_member_
                     "pwat_pct": _climo_percentile(pwat, PWAT_CLIMO_XMR.get(month), PWAT_PCTL_POINTS),
                     # Tag REFS rows so the frontend can flag the mean-sounding caveat. The
                     # ensemble columns use "...N-mem" here; this is deliberately distinct.
-                    "engine": ("mean-sounding" if model == "refs" else th.get("engine")),
+                    # Tag the row so the panel can say which fields to trust. "thin-moisture"
+                    # means the moisture indices were suppressed for lack of humidity levels.
+                    "engine": ("thin-moisture" if th.get("thin_moisture") is not None
+                               else ("mean-sounding" if model == "refs" else th.get("engine"))),
+                    "rh_levels": th.get("thin_moisture"),
                 })
                 break
         if day_rows:
