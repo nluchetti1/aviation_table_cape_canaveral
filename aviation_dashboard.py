@@ -315,8 +315,8 @@ MSG_INDEX_THRESHOLDS = {1: "p25", 2: "p50", 3: "p100", 4: "p200"}
 # The rrfs_public/ tree is the "operationally-representative" set per the AWS registry:
 #   rrfs_public/rrfs.YYYYMMDD/CC/rrfs.tCCz.prslev.3km.fFFF.conus.grib2      (deterministic)
 #   rrfs_public/refs.YYYYMMDD/CC/ensprod/ ...                              (ensemble products)
-RRFS_ENABLED = False       # master switch for the RRFS deterministic pad column
-REFS_ENABLED = False         # master switch for the REFS ensemble-average pad column
+RRFS_ENABLED = True          # master switch for the RRFS deterministic pad column
+REFS_ENABLED = True          # master switch for the REFS ensemble-average pad column
 # NOMADS parallel feed. RRFS/REFS moved off the AWS prototype bucket (SCN 26-48); the
 # rrfs_a/ tree that carried individual ensemble members is gone, so REFS is now the published
 # ENSEMBLE MEAN only — see REFS_MEMBER_THERMO_ENABLED for what that costs.
@@ -364,6 +364,8 @@ NOMADS_RANGE_PAUSE_S = 0.15
 # to end: the last run sat for 36 minutes and was cancelled with nothing committed. Better a
 # short column and a finished run than a hung job.
 NOMADS_KIND_BUDGET_S = 420
+# Wall-clock ceiling for any single upstream fetch that manages its own retries.
+SOURCE_DEADLINE_S = 300
 # Give up on a model entirely after this many throttled requests in a row.
 #
 # Measured 2026-08-25: NOMADS served the first forecast hour (~105 range requests) and then
@@ -2731,6 +2733,38 @@ def _nomads_get(session, url, timeout=20, tag="", stream=False, headers=None, pa
 # throttle, or a parse error. Those need completely different fixes, and guessing between
 # them wasted a cycle. Reasons are tallied here and summarised at the end of each sweep.
 _RRFS_FAILS = {}
+
+
+def _run_with_deadline(fn, seconds, label, default=None):
+    """Run fn() but give up waiting after `seconds`.
+
+    Some third-party clients retry forever on their own schedule — ecmwf-opendata defaults to
+    500 attempts at 120 s apart, which is 16 hours, and a 429 from ECMWF's portal is enough to
+    trigger it. There is no way to pass a deadline into those libraries, so the call runs on a
+    daemon thread and the pipeline stops WAITING for it. The thread may still be sleeping when
+    the process exits; that is fine, it is a daemon and holds nothing the run needs.
+
+    The point is that no single upstream can decide how long the whole dashboard takes.
+    """
+    box = {}
+
+    def _target():
+        try:
+            box["v"] = fn()
+        except Exception as e:
+            box["e"] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        logging.error(f"{label}: still running after {seconds}s — abandoning it and continuing "
+                      f"so the rest of the run can finish and publish.")
+        return default
+    if "e" in box:
+        logging.error(f"{label}: {type(box['e']).__name__}: {box['e']}")
+        return default
+    return box.get("v", default)
 
 
 def _rrfs_note_fail(kind, fh, reason):
@@ -5478,14 +5512,18 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
         logging.error(f"REFS member thermo fetch failed: {e}")
         refs_member_rows = {}
     try:
-        gefs_member_rows, gefs_cycle_key = fetch_gefs_member_thermo(
-            site="kxmr", assess_hour=10, cache=prior_gefs_cache)
+        gefs_member_rows, gefs_cycle_key = _run_with_deadline(
+            lambda: fetch_gefs_member_thermo(
+                site="kxmr", assess_hour=10, cache=prior_gefs_cache),
+            SOURCE_DEADLINE_S, "GEFS", default=({}, None))
     except Exception as e:
         logging.error(f"GEFS member thermo fetch failed: {e}")
         gefs_member_rows, gefs_cycle_key = {}, None
     try:
-        ecens_member_rows, ecens_cycle_key = fetch_ecmwf_ens_member_thermo(
-            site="kxmr", assess_hour=10, cache=prior_ecens_cache)
+        ecens_member_rows, ecens_cycle_key = _run_with_deadline(
+            lambda: fetch_ecmwf_ens_member_thermo(
+                site="kxmr", assess_hour=10, cache=prior_ecens_cache),
+            SOURCE_DEADLINE_S, "ECMWF ENS", default=({}, None))
     except Exception as e:
         logging.error(f"ECMWF ENS member thermo fetch failed: {e}")
         ecens_member_rows, ecens_cycle_key = {}, None
@@ -5686,7 +5724,8 @@ def run_pipeline():
     # try/except so any ECMWF outage or missing dependency leaves the rest of the run intact.
     if ECMWF_ENABLED:
         try:
-            ecmwf_matrix = fetch_all_ecmwf_soundings()
+            ecmwf_matrix = _run_with_deadline(
+                fetch_all_ecmwf_soundings, SOURCE_DEADLINE_S, "ECMWF", default={})
             if ecmwf_matrix:
                 if pad_matrix is None:
                     pad_matrix = {pid: {} for pid in LAUNCH_PADS}
