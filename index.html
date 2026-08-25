@@ -2328,6 +2328,57 @@
             return Math.round(ft).toLocaleString('en-US') + ' ft';
         }
 
+        // ---- Cizek lightning probability on an arbitrary forecast hour -------------------
+        //
+        // The RF ships three features (Thompson, 1000-700 mb westerly-positive u in kt,
+        // 700-500 mb mean RH) and the backend now evaluates it for EVERY exported profile,
+        // not just the 10Z panel rows. That is useful and it is also off-label, so the
+        // presentation carries the caveat instead of burying it:
+        //
+        //   inside 08-12Z  -> full colour, this is the environment the forest was trained on
+        //   outside        -> greyed with a dagger, read it as a trend between models/hours
+        //
+        // Training was on the 10Z KSC/CCSFS sounding. At 19Z the Thompson value has been
+        // through a day of heating and sits in a range the forest only ever saw attached to
+        // a different base rate, so the NUMBER is not calibrated even though the ORDERING
+        // across models at the same hour usually still is.
+        const SK_LTG_HOUR = 10, SK_LTG_TOL = 2;
+        function skLtgHourOk(hk) {
+            if (!hk) return false;
+            const hh = Number(String(hk).split('/')[1]);
+            return isFinite(hh) && Math.abs(hh - SK_LTG_HOUR) <= SK_LTG_TOL;
+        }
+        function skLtgChip(v, ok) {
+            if (v == null) return '<span style="color:#94a3b8;">\u2014</span>';
+            if (!ok) {
+                return `<span title="Outside 08\u201312Z \u2014 off-label for a 10Z-trained model"
+                          style="color:#94a3b8; font-weight:600;">${v}%\u2020</span>`;
+            }
+            const sty = v >= 70 ? 'background:#fee2e2; color:#991b1b;'
+                      : v >= 40 ? 'background:#fef3c7; color:#78350f;'
+                      : 'background:#e0f2fe; color:#0c4a6e;';
+            return `<span style="${sty} padding:1px 7px; border-radius:10px; font-weight:700;">${v}%</span>`;
+        }
+        function skLtgRow(p, entry) {
+            const hk = (entry && entry.__hk) || null;
+            const ok = skLtgHourOk(hk);
+            const val = (p.ltg == null) ? '<span style="color:#94a3b8;">\u2014</span>' : skLtgChip(p.ltg, ok);
+            return `<tr><td style="padding:3px 8px 3px 0; color:#475569;">Cizek P(ltg)</td>
+                    <td style="padding:3px 0; font-weight:700; text-align:right;">${val}</td>
+                    <td style="padding:3px 0 3px 8px; color:#94a3b8; font-size:0.72rem;">${
+                      ok ? '10Z model \u00b7 in window' : '10Z model \u00b7 off-label'}</td></tr>`;
+        }
+        function skLtgCaveat(entry) {
+            const hk = (entry && entry.__hk) || null;
+            if (skLtgHourOk(hk)) return '';
+            return `<div style="font-size:0.7rem; color:#78350f; background:#fef3c7; padding:5px 8px;
+                        border-radius:4px; margin-top:6px;">
+                    \u2020 The Cizek forest was trained on the <strong>10Z</strong> KSC/CCSFS sounding.
+                    At this hour its inputs sit outside that distribution, so read the value as a
+                    relative trend between models and hours rather than a calibrated probability.
+                    The 10Z Synoptic panel is the calibrated read.</div>`;
+        }
+
         function skParamsPanel(entry) {
             const p = entry.p || {};
             const row = (lab, val, unit, hint) => {
@@ -2372,12 +2423,14 @@
                 ${row('Thompson', p.thompson, '', 'KI \u2212 LI')}
                 ${row('PWAT', p.pwat_in, ' in', '')}
                 ${row('700\u2013500 RH', p.rh_700_500 == null ? null : Math.round(p.rh_700_500), '%', '')}
+                ${skLtgRow(p, entry)}
             </table>
             <div style="font-size:0.7rem; color:#94a3b8; margin-top:8px;">
                 Parcel theory computed server-side${p.cape_engine ? ' via ' + p.cape_engine : ''}.
                 Shaded red is positive area (CAPE), blue is negative (CIN); the dashed black line is
                 the surface parcel.
-            </div>`;
+            </div>
+            ${skLtgCaveat(entry)}`;
         }
 
         // --- data + UI -------------------------------------------------------------------
@@ -2661,6 +2714,10 @@
             { k: 'thompson', lab: 'Thompson', unit: '', dp: 1, watch: 5, split: 10 },
             { k: 'pwat_in', lab: 'PWAT', unit: ' in', dp: 2, watch: 0.25, split: 0.5 },
             { k: 'rh_700_500', lab: '700\u2013500 RH', unit: '%', dp: 0, watch: 10, split: 20 },
+            // Spread thresholds are wider than they look: the forest is a step function, so
+            // two models 3 Thompson apart can land 20 percentage points apart with no real
+            // disagreement about the airmass. 25/40 flags genuine splits, not quantisation.
+            { k: 'ltg', lab: 'Cizek P(ltg)', unit: '%', dp: 1, watch: 25, split: 40 },
         ];
 
         function skCompareTable(picked) {
@@ -2765,7 +2822,8 @@
                     differences large enough to change the read; thresholds are per-field, not a
                     single percentage. Parcel theory is computed server-side per model, so a spread
                     here is genuine model disagreement rather than a difference in method.
-                </div>`;
+                </div>
+                ${skLtgCaveat(picked[0] && picked[0].entry)}`;
         }
 
         function skRenderCompare() {
@@ -2818,7 +2876,7 @@
             const missing = [];
             skewCmpModels.forEach(m => {
                 const e = (soundings.models[m] || {})[hk];
-                if (e && e.lv && e.lv.length >= 3) picked.push({ model: m, entry: e });
+                if (e && e.lv && e.lv.length >= 3) { e.__hk = hk; picked.push({ model: m, entry: e }); }
                 else missing.push(m);
             });
 
@@ -2923,6 +2981,10 @@
             skewHourIdx = Math.max(0, Math.min(skewHourIdx, hours.length - 1));
             const hk = hours[skewHourIdx];
             const entry = soundings.models[skewModel][hk];
+            // The lightning row needs to know WHICH hour it is looking at, and `entry` is the
+            // only thing handed to skParamsPanel. Stamped rather than threaded through every
+            // signature, so nothing else in the render path has to change.
+            if (entry) entry.__hk = hk;
 
             const modelOpts = models.map(m =>
                 `<option value="${m}"${m === skewModel ? ' selected' : ''}>${ltLabel(m)}</option>`).join('')
