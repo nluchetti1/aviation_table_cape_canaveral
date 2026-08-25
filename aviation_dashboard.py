@@ -364,6 +364,22 @@ NOMADS_RANGE_PAUSE_S = 0.15
 # to end: the last run sat for 36 minutes and was cancelled with nothing committed. Better a
 # short column and a finished run than a hung job.
 NOMADS_KIND_BUDGET_S = 420
+# Give up on a model entirely after this many throttled requests in a row.
+#
+# Measured 2026-08-25: NOMADS served the first forecast hour (~105 range requests) and then
+# began answering 302 with NO Location header — a brush-off, not a redirect. Once that starts
+# it does not stop, so retrying burns the whole budget and the JOB GETS CANCELLED WITH
+# NOTHING COMMITTED. That is the worst outcome: a missing RRFS column is survivable, an
+# empty dashboard is not. Bail out fast, let the rest of the pipeline finish, publish.
+NOMADS_THROTTLE_GIVEUP = 6
+# Merge byte ranges separated by less than this many bytes into one request.
+#
+# The download issued ONE REQUEST PER GRIB MESSAGE — ~105 per forecast hour, ~1900 per run.
+# No pause makes that acceptable to NOMADS; the count has to come down, not the rate. GRIB
+# orders messages by variable, so wanted levels sit in runs with unwanted ones between them;
+# merging across those gaps trades a little wasted download for an order of magnitude fewer
+# requests. Each 3 km message is ~1.3 MB, so this spans roughly six skipped messages.
+NOMADS_RANGE_MERGE_GAP = 8_000_000
 # Retry a redirected (throttled) request this many times, backing off each time.
 NOMADS_THROTTLE_RETRIES = 3
 
@@ -2553,6 +2569,25 @@ def _range_download_grib(session, grib_url, idx_entries, wanted_levels_hpa, debu
                             "messages at wanted levels — check idx var/level naming.")
         return None
 
+    # Collapse adjacent/near-adjacent ranges into single requests. One request per message
+    # was ~105 per forecast hour, which NOMADS refuses outright after the first file.
+    _n_before = len(ranges)
+    _wanted_bytes = sum((e - s0) for s0, e in ranges if e not in (None, ""))
+    _closed = sorted(((s0, e) for s0, e in ranges if e not in (None, "")), key=lambda x: x[0])
+    _open = [(s0, e) for s0, e in ranges if e in (None, "")]
+    _merged = []
+    for s0, e in _closed:
+        if _merged and (s0 - _merged[-1][1]) <= NOMADS_RANGE_MERGE_GAP:
+            _merged[-1] = (_merged[-1][0], max(_merged[-1][1], e))
+        else:
+            _merged.append((s0, e))
+    ranges = _merged + _open
+    _span_bytes = sum((e - s0) for s0, e in _merged)
+    if debug:
+        logging.info(f"[RRFS DEBUG]   ranges merged {_n_before} -> {len(ranges)} requests; "
+                     f"{_span_bytes/1e6:.0f} MB spanned vs {_wanted_bytes/1e6:.0f} MB wanted "
+                     f"({_span_bytes/max(1,_wanted_bytes):.2f}x)")
+
     local_path = os.path.join(CACHE_DIR, f"rrfs_col_{abs(hash(grib_url)) % 10_000_000}.grib2")
     try:
         with open(local_path, "wb") as fh:
@@ -2640,6 +2675,16 @@ def _rrfs_determine_cycle(session, model_kind):
 _NOMADS_LOCK = threading.Lock()
 _NOMADS_LAST = [0.0]
 _NOMADS_REDIRECT_LOGGED = [False]
+_NOMADS_THROTTLE_STREAK = [0]
+
+
+class NomadsThrottled(Exception):
+    """Raised once NOMADS has refused enough requests in a row that continuing is pointless."""
+
+
+def _nomads_reset_throttle():
+    _NOMADS_THROTTLE_STREAK[0] = 0
+    _NOMADS_REDIRECT_LOGGED[0] = False
 
 
 def _nomads_get(session, url, timeout=20, tag="", stream=False, headers=None, pause=None):
@@ -2659,7 +2704,13 @@ def _nomads_get(session, url, timeout=20, tag="", stream=False, headers=None, pa
         r = session.get(url, timeout=timeout, allow_redirects=False,
                         stream=stream, headers=headers or {})
         if r.status_code not in (301, 302, 303, 307, 308, 429, 503):
+            _NOMADS_THROTTLE_STREAK[0] = 0
             return r
+        _NOMADS_THROTTLE_STREAK[0] += 1
+        if _NOMADS_THROTTLE_STREAK[0] >= NOMADS_THROTTLE_GIVEUP:
+            raise NomadsThrottled(
+                f"{_NOMADS_THROTTLE_STREAK[0]} consecutive refusals from NOMADS "
+                f"(last: HTTP {r.status_code} on {tag or url})")
         if not _NOMADS_REDIRECT_LOGGED[0]:
             _NOMADS_REDIRECT_LOGGED[0] = True
             logging.warning(f"[NOMADS] {tag or url} -> HTTP {r.status_code}; "
@@ -2846,6 +2897,7 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
             # a budget a slow source has no way to stop: the 2026-08-25 run sat for 36 minutes
             # and was cancelled with nothing written. Because the panel-critical hours are at
             # the FRONT of f_hours, running out of budget costs matrix depth, not a model.
+            _nomads_reset_throttle()
             _t_start = time.time()
             _done = 0
             for idx, fh in enumerate(f_hours):
@@ -2865,6 +2917,16 @@ def fetch_all_rrfs_refs_soundings(include_hrrr=True):
                         matrix[sid][mk][row_key] = vd
                     if site_vals:
                         _done += 1
+                except NomadsThrottled as e:
+                    # NOMADS has stopped serving us. Continuing just burns the budget and
+                    # risks the job being cancelled before anything is committed, so stop
+                    # this model and let the rest of the pipeline finish and publish.
+                    logging.warning(
+                        f"{kind.upper()}: abandoning after {_done} of {len(f_hours)} hours — {e}. "
+                        f"The dashboard will publish without the missing {kind.upper()} hours; "
+                        f"an incomplete column beats an uncommitted run.")
+                    _rrfs_note_fail(kind, fh, "NOMADS throttled; model abandoned")
+                    break
                 except Exception as e:
                     _rrfs_note_fail(kind, fh, f"{type(e).__name__}: {str(e)[:60]}")
 
