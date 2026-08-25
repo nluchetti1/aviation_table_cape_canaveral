@@ -339,7 +339,23 @@ REFS_LATENCY_H = 4
 
 # NOMADS is not S3. It asks for restraint and will treat a burst as an attack, the same way
 # PSU did. This concurrency is deliberately low and is NOT a knob to turn up casually.
-NOMADS_MAX_CONCURRENCY = 3
+# NOMADS throttles by REDIRECT, not by 403.
+#
+# Measured 2026-08-25: the first .idx request per model returned 200 and every subsequent one
+# returned 302 — RRFS f011 fine, f001-f018 all bounced; REFS f014 fine, f001-f060 all bounced.
+# f011 cannot exist while f001 does not, so this was never file availability. NOMADS says so
+# in its own docs: "include a 10 second wait between fetches ... the server may mistake
+# excessive requests as denial-of-service attack and block the user."
+#
+# So: one connection, and a pause between requests. This is the PSU lesson again — the fetch
+# is deliberately slow because the alternative is being served nothing at all.
+NOMADS_MAX_CONCURRENCY = 1
+# Seconds between NOMADS requests. Their guidance is 10 s; each RRFS byte-range already takes
+# ~20 s to transfer, so the pause below is on top of a naturally slow request and the
+# effective spacing is well past their floor. REFS files are small and genuinely need it.
+NOMADS_REQUEST_PAUSE_S = 4.0
+# Retry a redirected (throttled) request this many times, backing off each time.
+NOMADS_THROTTLE_RETRIES = 3
 
 # Forecast hours whose VALID time lands near the 10Z assessment hour are fetched FIRST,
 # ahead of the sequential f001, f002, ... sweep.
@@ -2533,7 +2549,14 @@ def _range_download_grib(session, grib_url, idx_entries, wanted_levels_hpa, debu
             # Group into a single multi-range request where possible; fall back to per-range.
             for start, end in ranges:
                 hdr = {"Range": f"bytes={start}-{end}"}
-                r = session.get(grib_url, headers=hdr, timeout=25)
+                # Paced too: the range requests are the bulk of the traffic, so throttling
+                # only the .idx probe while firing dozens of unpaced range GETs would miss
+                # the thing NOMADS actually objects to.
+                if "nomads.ncep.noaa.gov" in grib_url:
+                    r = _nomads_get(session, grib_url, timeout=25, headers=hdr,
+                                    tag="range GET")
+                else:
+                    r = session.get(grib_url, headers=hdr, timeout=25)
                 if r.status_code in (200, 206):
                     fh.write(r.content)
         if os.path.getsize(local_path) == 0:
@@ -2598,6 +2621,42 @@ def _rrfs_determine_cycle(session, model_kind):
     return None, None
 
 
+# Serialised, paced GET for NOMADS, with redirect-aware throttle handling.
+#
+# `allow_redirects=False` is deliberate: a 302 here is the throttle telling us to go away, and
+# following it just fetches an HTML error page that would then fail to parse as an .idx —
+# turning a clear signal into a confusing one. The Location is logged once so the assumption
+# stays checkable rather than becoming folklore.
+_NOMADS_LOCK = threading.Lock()
+_NOMADS_LAST = [0.0]
+_NOMADS_REDIRECT_LOGGED = [False]
+
+
+def _nomads_get(session, url, timeout=20, tag="", stream=False, headers=None):
+    """One paced request. Retries a 302 with backoff before giving up."""
+    for attempt in range(NOMADS_THROTTLE_RETRIES + 1):
+        with _NOMADS_LOCK:
+            gap = time.time() - _NOMADS_LAST[0]
+            if gap < NOMADS_REQUEST_PAUSE_S:
+                time.sleep(NOMADS_REQUEST_PAUSE_S - gap)
+            _NOMADS_LAST[0] = time.time()
+        r = session.get(url, timeout=timeout, allow_redirects=False,
+                        stream=stream, headers=headers or {})
+        if r.status_code not in (301, 302, 303, 307, 308, 429, 503):
+            return r
+        if not _NOMADS_REDIRECT_LOGGED[0]:
+            _NOMADS_REDIRECT_LOGGED[0] = True
+            logging.warning(f"[NOMADS] {tag or url} -> HTTP {r.status_code}; "
+                            f"Location={r.headers.get('Location', '(none)')!r}. "
+                            f"Treating as a throttle and backing off. If that Location looks "
+                            f"like a real file move rather than an error page, the URL builder "
+                            f"needs updating instead.")
+        if attempt < NOMADS_THROTTLE_RETRIES:
+            wait = NOMADS_REQUEST_PAUSE_S * (2 ** attempt) * random.uniform(0.8, 1.3)
+            time.sleep(wait)
+    return r
+
+
 # Per-hour failure ledger for the RRFS/REFS sweep.
 #
 # The futures loop used to swallow every exception with a bare `except: pass`, so a run that
@@ -2660,7 +2719,8 @@ def fetch_rrfs_pad_hour(session, model_kind, date_str, cycle, f_hour_int, row_ke
     out = {}
     local_path = None
     try:
-        idx_resp = session.get(idx_url, timeout=15)
+        idx_resp = _nomads_get(session, idx_url, timeout=15,
+                               tag=f"{model_kind.upper()} f{f_hour_int:03d} idx")
         if debug:
             logging.info(f"[RRFS DEBUG] {model_kind.upper()} f{f_hour_int:03d} idx HTTP {idx_resp.status_code}")
             logging.info(f"[RRFS DEBUG]   idx URL: {idx_url}")
