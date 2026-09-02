@@ -305,7 +305,11 @@
                 modelCycles = payload.model_cycles || null;   // {site: {model: 'YYYYMMDDHH'}}
                 panelCycles = payload.panel_cycles || null;   // {model: 'YYYYMMDDHH'} panel-only ensembles
                 refcMaps = payload.refc_maps || null;
-                ivtMaps = payload.ivt_maps || null;
+                // Fallback only. The live source is ivt_maps.json, written by run_ivt.yml on
+                // its own schedule; this key is still honoured for runs made with
+                // IVT_IN_PIPELINE=1.
+                ivtMaps = (payload.ivt_maps && Object.keys(payload.ivt_maps).length)
+                          ? payload.ivt_maps : null;
 
                 // Diagnostic: how many hours carry a real calibrated-thunder map per window.
                 const countReal = (o) => !o ? 0 : Object.values(o).filter(Boolean).length;
@@ -316,6 +320,7 @@
                             '| blankBasemap:', hrefBlankMap || '(none)');
                 buildTimelineNav();
                 loadRunIndex(0); // index 0 is always the most recent run
+                loadIvtIndex();
             } catch(e) {
                 document.getElementById("view-title").innerText = "Error loading history.json pipeline";
                 console.error(e);
@@ -3071,6 +3076,23 @@
         // Reads the ivt_maps block written by ivt_maps.fetch_ivt_maps(). Each model keeps
         // its OWN init cycle: RAP runs hourly while GFS and NAM are 6-hourly, so a single
         // shared cycle label would be wrong for at least one of them.
+
+        // ivt_maps.json is written by a SEPARATE workflow on its own cadence, so it is
+        // fetched independently and may be newer or older than history.json. Failure is
+        // silent and non-fatal: the nav entry simply reports no maps.
+        async function loadIvtIndex() {
+            try {
+                const r = await fetch('ivt_maps.json?t=' + Date.now());
+                if (!r.ok) return;
+                const j = await r.json();
+                if (j && j.models && Object.keys(j.models).length) {
+                    ivtMaps = j.models;
+                    console.log('[IVT] index loaded, generated ' + (j.generated || '?'));
+                }
+            } catch (e) {
+                console.warn('ivt_maps.json unavailable:', e);
+            }
+        }
 
         function ivtModels() {
             if (!ivtMaps) return [];
