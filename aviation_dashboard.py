@@ -5621,12 +5621,17 @@ def generate_aviation_dashboard(stations, models, current_sounding_matrix, time_
     # maps and nothing else, which is why it gets its own try and returns {} rather than
     # raising. GFS is the only enabled model by default -- see ivt_maps.py for why RAP/NAM
     # are optional and HRRR/GEFS are excluded outright.
+    # IVT maps moved to their own workflow (run_ivt.yml). They added ~11 minutes to a run
+    # that was already at 43, which pushed scheduled runs past timeout-minutes: 60 and got
+    # them cancelled with no error text. Set IVT_IN_PIPELINE=1 to fold them back in.
     ivt_map_set = {}
-    if ivt_maps.IVT_MAPS_ENABLED:
+    if os.environ.get("IVT_IN_PIPELINE") == "1" and ivt_maps.IVT_MAPS_ENABLED:
         try:
             ivt_map_set = ivt_maps.fetch_ivt_maps()
         except Exception as e:
             logging.error(f"[IVT] map set failed, continuing without it: {e}")
+    else:
+        logging.info("[IVT] maps skipped here; run_ivt.yml owns them (IVT_IN_PIPELINE=1 to re-enable)")
 
     refc_maps = {}   # {row_key: "maps/refc/....png"} — backs the ANVIL hover popup
     if CONVECTIVE_MASK_ENABLED:
