@@ -677,12 +677,68 @@ def fetch_ivt_maps(models=None, session=None):
     return out
 
 
-if __name__ == "__main__":
+def prune_ivt_maps(result):
+    """Delete IVT PNGs that are not part of the current map set.
+
+    Nothing else prunes maps/ivt: prune_stale_maps() only unlinks top-level files in maps/,
+    and unlink on a subdirectory fails silently. Filenames carry the init cycle, so RAP --
+    an hourly model -- writes 22 new PNGs every hour and the previous 22 stay forever, all
+    of it committed to git. Left alone this is hundreds of MB of history a week.
+    """
+    keep = set()
+    for entry in (result or {}).values():
+        for rel in (entry.get("maps") or {}).values():
+            keep.add(os.path.basename(rel))
+    removed = 0
+    for model in (result or {}):
+        d = os.path.join(IVT_MAPS_DIR, model)
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            if f.endswith(".png") and f not in keep:
+                try:
+                    os.unlink(os.path.join(d, f))
+                    removed += 1
+                except Exception:
+                    pass
+    if removed:
+        logging.info(f"[IVT] pruned {removed} stale PNG(s) from {IVT_MAPS_DIR}")
+    return removed
+
+
+def write_ivt_json(result, path="ivt_maps.json"):
+    """Write the map index as a standalone sidecar.
+
+    Deliberately NOT merged into history.json: this runs in its own workflow now, and two
+    workflows rewriting the same file is a merge conflict on every overlapping run. The page
+    reads this file directly and falls back to history.json's ivt_maps key.
+    """
     import json
+    payload = {"generated": datetime.datetime.now(datetime.timezone.utc)
+                                 .strftime("%Y-%m-%d %H:%M UTC"),
+               "models": result or {}}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, separators=(",", ":"))
+    n = sum(len(v.get("maps", {})) for v in (result or {}).values())
+    logging.info(f"[IVT] wrote {path}: {n} maps across {len(result or {})} model(s)")
+
+
+if __name__ == "__main__":
+    import argparse
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s - %(levelname)s - %(message)s")
-    # Smoke test: one model, three steps, so a first live run is cheap to inspect.
-    IVT_MODELS["rap"]["enabled"] = False
-    IVT_MODELS["nam"]["enabled"] = False
-    IVT_MODELS["gfs"]["steps"] = [0, 24, 48]
-    print(json.dumps(fetch_ivt_maps(), indent=2))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--smoke", action="store_true",
+                    help="one model, three steps -- cheap check that the path still works")
+    ap.add_argument("--models", default=None, help="comma-separated subset")
+    args, _ = ap.parse_known_args()
+
+    if args.smoke:
+        for m in ("rap", "nam", "ecmwf"):
+            IVT_MODELS[m]["enabled"] = False
+        IVT_MODELS["gfs"]["steps"] = [0, 24, 48]
+
+    sel = args.models.split(",") if args.models else None
+    res = fetch_ivt_maps(models=sel)
+    prune_ivt_maps(res)
+    write_ivt_json(res)
