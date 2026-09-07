@@ -1,7 +1,7 @@
 name: Update TAF Dashboard
 on:
   schedule:
-    - cron: '15 * * * *'
+    - cron: '13 * * * *'
   workflow_dispatch:
 
 # CRITICAL: Gives the action permission to push the index.html back to the repo
