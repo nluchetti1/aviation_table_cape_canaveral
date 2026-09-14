@@ -1165,6 +1165,12 @@
         // Which models the panel can compare. Everything build_launch_thermo emitted for this
         // site is fair game — including the ensembles and the short-range models.
         function ltCmpModels() {
+            // Season-aware: in cool season the A/B pickers must offer only models with cool
+            // rows, otherwise they would list GEFS/ECENS and compare two empty payloads.
+            if (typeof ltSeason !== 'undefined' && ltSeason === 'cool') {
+                const t = ltActiveThermo();
+                return (t && t.cool && t.cool.models) || [];
+            }
             const t = ltActiveThermo();
             return (t && t.models) || (launchThermo && launchThermo.models) || [];
         }
@@ -1355,11 +1361,126 @@
             if (v >= 20) return ctChip(v + ' kt', '#fed7aa', '#7c2d12');
             return v + ' kt';
         }
+        // ltJoinByDay reads thermo.by_model; the cool payload is one level down. Wrapping it
+        // keeps a single join implementation rather than a near-copy that drifts.
+        function ltJoinByDayCool(thermo) {
+            return ltJoinByDay({ by_model: ((thermo || {}).cool || {}).by_model || {} });
+        }
+
+        function renderCoolThermoCompare() {
+            const thermo = ltActiveThermo();
+            const cool = thermo.cool || {};
+            const [S1, S2] = ltCmpSeries();
+            if (S1.key === S2.key) {
+                document.getElementById('ltBody').innerHTML =
+                    `<div style="padding:18px 6px; color:#b45309;">Pick two <em>different</em> models to compare
+                     \u2014 both selectors are on ${S1.label}.</div>`;
+                return;
+            }
+            const missing = [S1, S2].filter(s => !((cool.by_model || {})[s.key] || []).length);
+            if (missing.length) {
+                document.getElementById('ltBody').innerHTML =
+                    `<div style="padding:18px 6px; color:#475569; line-height:1.6;">
+                       <strong>${missing.map(m => m.label).join(' and ')}</strong>
+                       ${missing.length > 1 ? 'have' : 'has'} no cool-season data, so there is nothing to compare.
+                       <br><span style="font-size:0.86rem;">Available: <strong>${(cool.models || []).map(m => ltLabel(m)).join(', ')}</strong>.</span>
+                     </div>`;
+                return;
+            }
+            const joined = ltJoinByDayCool(thermo);
+            const brkFt = cool.mixing_break_ft || 3000;
+            const lowFt = cool.low_ceiling_ft || 3000;
+            const noCeil = cool.no_ceiling_ft || 24000;
+
+            const cell = (r, fn) => (!r ? '<span style="color:#cbd5e1;">\u2014</span>' : fn(r));
+            const hhTxt = (h) => h == null ? '\u2014' : String(h).padStart(2, '0') + 'Z';
+            const brkTxt = (r) => r.brk_hh == null
+                ? (r.brk_near ? '<span style="color:#78350f;">near</span>'
+                              : '<span style="color:#3730a3;">capped</span>')
+                : hhTxt(r.brk_hh);
+            const ceilTxt = (r) => r.ceil_min == null ? '\u2014'
+                : (r.ceil_min >= noCeil ? '<span style="color:#0f766e;">no ceiling</span>'
+                   : ctNum(r.ceil_min) + ' ft');
+
+            let html = `<div style="font-size:0.8rem; color:#475569; margin:2px 0 8px; line-height:1.5;">
+                <strong>Cool season \u2014 ${S1.label} vs ${S2.label}.</strong> Third row per day is the difference;
+                a coloured chip means the two models would have you brief a different day.</div>`;
+            html += `<table style="width:100%; border-collapse:collapse; font-size:0.86rem;">
+              <thead><tr style="background:#f1f5f9; text-align:left;">
+                <th style="padding:8px 6px;">Day</th>
+                <th style="padding:8px 6px;">Model</th>
+                <th style="padding:8px 6px;" title="Day peak mixed-layer depth AGL">Mixing max</th>
+                <th style="padding:8px 6px;" title="First hour at or after ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z the layer exceeds ${brkFt.toLocaleString()} ft">Inversion break</th>
+                <th style="padding:8px 6px;">PBL Mom Mean</th>
+                <th style="padding:8px 6px;">PBL Mom Max</th>
+                <th style="padding:8px 6px;" title="Hours violating the Thick Cloud Layer rule">Thick cloud</th>
+                <th style="padding:8px 6px;" title="Lowest ceiling of the day">Min ceiling</th>
+                <th style="padding:8px 6px;" title="10Z transport flow, 1000\u2013700 mb">Airmass (10Z)</th>
+              </tr></thead><tbody>`;
+
+            if (!joined.length) {
+                html += `<tr><td colspan="9" style="padding:14px 6px; color:#94a3b8;">No overlapping forecast days for these two models.</td></tr>`;
+            }
+            joined.forEach((j, i) => {
+                const a = j[S1.key], b = j[S2.key];
+                const bg = i % 2 ? '#ffffff' : '#f8fafc';
+                const row = (r, s, first) => `<tr style="background:${bg};">
+                    ${first ? `<td rowspan="3" style="padding:8px 6px; font-weight:600; white-space:nowrap; border-bottom:1px solid #e2e8f0;">${j.day}
+                        <div style="${CT_SUB} font-weight:400;">${j.date}</div></td>` : ''}
+                    <td style="padding:6px; font-weight:600; color:${s.color}; white-space:nowrap;">${s.label}</td>
+                    <td style="padding:6px;">${cell(r, x => ctNum(x.ml_max) + ' ft')}</td>
+                    <td style="padding:6px;">${cell(r, brkTxt)}</td>
+                    <td style="padding:6px;">${cell(r, x => ctNum(x.mom_mean, 1) + ' kt')}</td>
+                    <td style="padding:6px;">${cell(r, x => ctNum(x.mom_max, 1) + ' kt')}</td>
+                    <td style="padding:6px;">${cell(r, x => x.thick_hrs ? x.thick_hrs + ' hr' + (x.thick_hrs === 1 ? '' : 's') : '<span style="color:#94a3b8;">none</span>')}</td>
+                    <td style="padding:6px;">${cell(r, ceilTxt)}</td>
+                    <td style="padding:6px; white-space:nowrap;">${cell(r, x => x.mf_dir == null ? '\u2014' : `${Math.round(x.mf_dir)}\u00b0 / ${Math.round(x.mf_spd)} kt`)}</td>
+                  </tr>`;
+                html += row(a, S1, true);
+                html += row(b, S2, false);
+
+                const d = (k) => (a && b && a[k] != null && b[k] != null) ? a[k] - b[k] : null;
+                // Break timing only differences when BOTH broke. One capped and one breaking is
+                // a categorical disagreement, not a two-hour one, and averaging it into a number
+                // would hide the thing most worth seeing.
+                const bothBroke = a && b && a.brk_hh != null && b.brk_hh != null;
+                const brkD = bothBroke ? a.brk_hh - b.brk_hh : null;
+                const brkSplit = (a && b && (a.brk_hh == null) !== (b.brk_hh == null))
+                    ? `<span title="one model breaks the inversion, the other does not" style="background:#fee2e2; color:#991b1b; border:1px solid #fca5a5; padding:1px 7px; border-radius:10px; font-weight:600; font-size:0.78rem;">break / capped</span>`
+                    : ltDeltaChip(brkD, 'brkhr');
+                html += `<tr style="background:${bg}; border-bottom:1px solid #e2e8f0;">
+                    <td style="padding:6px; color:#94a3b8; font-size:0.78rem;">\u0394</td>
+                    <td style="padding:6px;">${ltDeltaChip(d('ml_max'), 'mldep')}</td>
+                    <td style="padding:6px;">${brkSplit}</td>
+                    <td style="padding:6px;">${ltDeltaChip(d('mom_mean'), 'spd')}</td>
+                    <td style="padding:6px;">${ltDeltaChip(d('mom_max'), 'spd')}</td>
+                    <td style="padding:6px;">${ltDeltaChip(d('thick_hrs'), 'thickh')}</td>
+                    <td style="padding:6px;">${ltDeltaChip(
+                        // A sentinel is not a height, so differencing one against a real
+                        // ceiling would manufacture a 22,000 ft "disagreement" out of
+                        // "one model had a deck and the other had clear sky". Blank instead.
+                        (a && b && a.ceil_min != null && b.ceil_min != null
+                         && a.ceil_min < noCeil && b.ceil_min < noCeil)
+                            ? a.ceil_min - b.ceil_min : null, 'ceil')}</td>
+                    <td style="padding:6px;">${ltDeltaChip(ltAngDiff(a && a.mf_dir, b && b.mf_dir), 'dir')}</td>
+                  </tr>`;
+            });
+            html += `</tbody></table>`;
+            html += `<div style="font-size:0.76rem; color:#475569; margin-top:10px; line-height:1.55;">
+                <strong>break / capped</strong> \u2014 one model breaks the inversion and the other never does.
+                That is a categorical split, not a timing difference, so it is flagged instead of being
+                turned into a number. A minimum ceiling of <em>no ceiling</em> differences as a blank, since
+                ${noCeil.toLocaleString()} ft is a sentinel rather than a measurement.</div>`;
+            document.getElementById('ltBody').innerHTML = html;
+        }
+
         function renderCoolThermo() {
             const thermo = ltActiveThermo();
             const cool = thermo.cool || {};
             const sel = document.getElementById('ltModel');
             const model = sel ? sel.value : null;
+
+            if (ltIsCompare()) { renderCoolThermoCompare(); return; }
 
             // NO SILENT SUBSTITUTION. An earlier version fell back to cool.models[0] whenever
             // the selected model had no cool payload, which meant picking GEFS or ECENS in the
@@ -1732,6 +1853,13 @@
             ltg:  { watch: 15,   split: 30,   unit: '%',    dp: 0 },
             spd:  { watch: 8,    split: 15,   unit: ' kt',  dp: 0 },
             dir:  { watch: 40,   split: 80,   unit: '\u00b0', dp: 0 },
+            // Cool-season fields. Thresholds are set by what changes a decision, not by what
+            // is statistically large -- these are the magnitudes at which two models would
+            // have you brief a different day.
+            mldep: { watch: 1000, split: 2500, unit: ' ft', dp: 0 },   // mixed-layer depth
+            brkhr: { watch: 2,    split: 4,    unit: ' h',  dp: 0 },   // inversion-break timing
+            thickh:{ watch: 3,    split: 6,    unit: ' h',  dp: 0 },   // thick-cloud hour count
+            ceil:  { watch: 1000, split: 2500, unit: ' ft', dp: 0 },   // minimum ceiling
         };
         // Signed smallest angle from b to a, so 350\u00b0 vs 010\u00b0 reads as 20\u00b0, not 340\u00b0.
         function ltAngDiff(a, b) {
@@ -1941,14 +2069,14 @@
             const avail = ltSeasonModels();
             const prev = sel.value;
             let opts = avail.map(m => `<option value="${m}">${ltLabel(m)}</option>`).join('');
-            if (ltSeason !== 'cool' && avail.length >= 2) {
+            if (avail.length >= 2) {
                 if (!avail.includes(ltCmpA)) ltCmpA = avail[0];
                 if (!avail.includes(ltCmpB)) ltCmpB = avail.find(m => m !== ltCmpA) || avail[1];
                 opts += `<option value="${LT_CMP}">\u2696 Compare two models\u2026</option>`;
             }
             sel.innerHTML = opts;
             sel.value = avail.includes(prev) ? prev
-                      : (ltSeason !== 'cool' && prev === LT_CMP ? LT_CMP : (avail[0] || ''));
+                      : (prev === LT_CMP ? LT_CMP : (avail[0] || ''));
             ltRenderCmpPickers();
         }
         function ltSetSeason(s) {
