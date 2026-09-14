@@ -1392,22 +1392,21 @@
             const brkFt = cool.mixing_break_ft || 3000;
             const lowFt = cool.low_ceiling_ft || 3000;
 
+            // Kept deliberately short. The detail that used to live here is in the column
+            // header tooltips, where it is available on demand instead of occupying a third of
+            // a phone screen above the data every time the panel opens.
             let html = `<div style="font-size:0.8rem; color:#475569; margin:2px 0 8px; line-height:1.5;">
-                <strong>Cool season (Nov\u2013Mar).</strong> Convective indices are dropped &mdash; deep convection is
-                rare at the Cape in winter and the Cizek forest is a warm-season model. What scrubs instead is the
-                <strong>Thick Cloud Layer rule</strong> on frontal stratiform decks, low stratocumulus, and surface winds
-                from momentum mixed down once the nocturnal inversion breaks.
-                <br>Only the two rightmost <em>airmass</em> columns are 10Z values. Everything else is aggregated across
-                that forecast day's hours, so <em>max</em> means the day's peak and the hour beside it is when.</div>`;
+                <strong>Cool season (Nov\u2013Mar).</strong> Convective indices dropped. Every column except
+                <em>Airmass</em> is aggregated across the forecast day \u2014 hover a header for detail.</div>`;
 
             html += `<table style="width:100%; border-collapse:collapse; font-size:0.86rem;">
               <thead><tr style="background:#f1f5f9; text-align:left;">
                 <th style="padding:8px 6px;">Day</th>
-                <th style="padding:8px 6px; white-space:nowrap;" title="Mixed-layer depth AGL at 10Z, the day's peak, and the hour of that peak">Mixing&nbsp;(10Z\u2192max)</th>
-                <th style="padding:8px 6px;" title="Inversion break: first hour the mixed layer exceeds ${brkFt.toLocaleString()} ft AGL">Inversion break</th>
-                <th style="padding:8px 6px;" title="Day-mean of the hourly mixed-layer mean wind">PBL Mom Mean</th>
-                <th style="padding:8px 6px;" title="Day peak of the hourly mixed-layer max wind, and the hour it occurs">PBL Mom Max</th>
-                <th style="padding:8px 6px;" title="Hours violating the Thick Cloud Layer LLCC, and the thickest in-band depth">Thick cloud layer</th>
+                <th style="padding:8px 6px; white-space:nowrap;" title="Mixed-layer depth AGL (theta +1.5 K above the surface value): the 10Z value, the day's peak, and the hour of that peak. Exactly 1,000 ft is the floor of the diagnosis, meaning capped — not a measurement.">Mixing&nbsp;(10Z\u2192max)</th>
+                <th style="padding:8px 6px;" title="First hour at or after ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z that the mixed layer exceeds ${brkFt.toLocaleString()} ft AGL. The window matters: a UTC day at the Cape starts mid-evening local, so a deep layer at 00-06Z is the previous afternoon's residual mixing, not a sunrise break. The day peak still scans all 24 hours.">Inversion break</th>
+                <th style="padding:8px 6px;" title="Day-mean of the hourly mixed-layer mean wind. Same mixed-layer diagnosis as the matrix columns, so the numbers are directly comparable.">PBL Mom Mean</th>
+                <th style="padding:8px 6px;" title="Day peak of the hourly mixed-layer max wind, and the hour it occurs. Chip colours match the matrix legend's Max Momentum Layer bands (20/30/40 kt).">PBL Mom Max</th>
+                <th style="padding:8px 6px;" title="Hours where a deck at least 4,500 ft thick overlaps the 0C to -20C band, or where the in-band portion alone reaches 4,500 ft — plus the first such hour and the thickest in-band depth.">Thick cloud layer</th>
                 <th style="padding:8px 6px;" title="Lowest ceiling of the day, and how many hours sat at or below ${lowFt.toLocaleString()} ft">Low cloud</th>
                 <th style="padding:8px 6px;" title="0\u00b0C and \u221220\u00b0C heights at 10Z — these define the charging band the thick cloud rule tests">0\u00b0C / \u221220\u00b0C</th>
                 <th style="padding:8px 6px;" title="10Z transport flow: 1000\u2013700 mb mean and regime">Airmass (10Z)</th>
@@ -1462,18 +1461,14 @@
                 </tr>`;
             });
             html += `</tbody></table>`;
-            html += `<div style="font-size:0.75rem; color:#64748b; margin-top:10px; line-height:1.6;">
-                <strong>Reading it.</strong> <em>Mixing</em> is the diagnosed mixed-layer depth AGL (theta +1.5 K above
-                the surface value). A 10Z value of exactly 1,000 ft is the floor of that diagnosis, meaning
-                <em>capped</em> &mdash; not a measurement. <em>Inversion break</em> is the first hour
-                <strong>at or after ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z</strong>
-                that the layer exceeds ${brkFt.toLocaleString()} ft. The window matters: a UTC day at the Cape starts
-                mid-evening local, so a deep layer at 00\u201306Z is the <em>previous</em> afternoon's residual mixing,
-                not a sunrise break. <em>capped</em> means it never broke; <em>near</em> means the day peaked within 15%
-                of the threshold without crossing \u2014 a coin flip, not a forecast. The day <em>peak</em> still scans
-                all 24 hours, so a residual layer stays visible in the Mixing column even when it cannot be called a break. <em>PBL Mom</em> uses the same mixed-layer diagnosis as the matrix columns, so
-                the numbers are directly comparable. <em>Thick cloud layer</em> counts hours where a deck \u2265 4,500 ft
-                thick overlaps the 0\u00b0C to \u221220\u00b0C band, or where the in-band portion alone reaches 4,500 ft.</div>`;
+            // Only the three things a column header cannot carry: the two chip meanings and
+            // the diagnosis floor, each of which is a number that means "not a measurement".
+            html += `<div style="font-size:0.76rem; color:#475569; margin-top:10px; line-height:1.55;">
+                <strong>capped</strong> \u2014 never exceeded ${brkFt.toLocaleString()} ft after
+                ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z (a deep layer at
+                00\u201306Z is the previous afternoon's residual, not a break).
+                <strong>near</strong> \u2014 peaked within 15% without crossing.
+                A 10Z mixing value of exactly 1,000 ft is the diagnosis floor, not a measurement.</div>`;
             document.getElementById('ltBody').innerHTML = html;
         }
 
