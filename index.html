@@ -1326,6 +1326,133 @@
                      ${model ? `&middot; ${model.toUpperCase()} cycles every ${stepH} h` : ''}</span>`;
             el.innerHTML = html + note;
         }
+        // ---- Cool-season table ------------------------------------------------------------
+        // Every column except the airmass anchors is a DAY AGGREGATE, not a 10Z value. That is
+        // the point of the panel: "when does it mix out" and "how long is the ceiling down" are
+        // questions about a diurnal cycle. The 10Z sounding anchors the airmass and sets the
+        // isotherm band; the rest looks forward through that forecast day.
+        // Secondary line under a cell's headline value. Was 0.7rem/#64748b, which was both too
+        // pale to read at a glance and long enough to overflow a narrow column and collide with
+        // the next one. Bigger, darker, and allowed to wrap inside its own cell.
+        const CT_SUB = 'font-size:0.76rem; color:#475569; margin-top:3px; line-height:1.35; white-space:normal; overflow-wrap:anywhere;';
+        function ctHH(h) {
+            return (h == null) ? '<span style="color:#94a3b8;">\u2014</span>'
+                               : String(h).padStart(2, '0') + 'Z';
+        }
+        function ctNum(v, dp) {
+            return (v == null) ? '<span style="color:#94a3b8;">\u2014</span>'
+                               : (dp ? Number(v).toFixed(dp) : Math.round(v).toLocaleString());
+        }
+        function ctChip(txt, bg, fg) {
+            return `<span style="background:${bg}; color:${fg}; padding:1px 7px; border-radius:10px; font-weight:600; white-space:nowrap;">${txt}</span>`;
+        }
+        // Momentum thresholds mirror the matrix legend's Max Momentum Layer bands (20/30/40 kt)
+        // so a number means the same thing in both places.
+        function ctMomChip(v) {
+            if (v == null) return '<span style="color:#94a3b8;">\u2014</span>';
+            if (v >= 40) return ctChip(v + ' kt', '#7c2d12', '#fff');
+            if (v >= 30) return ctChip(v + ' kt', '#ea580c', '#fff');
+            if (v >= 20) return ctChip(v + ' kt', '#fed7aa', '#7c2d12');
+            return v + ' kt';
+        }
+        function renderCoolThermo() {
+            const thermo = ltActiveThermo();
+            const cool = thermo.cool || {};
+            const sel = document.getElementById('ltModel');
+            let model = sel ? sel.value : null;
+            // The compare entry has no cool equivalent; fall back to the first real model.
+            if (!model || model === LT_CMP || !(cool.by_model || {})[model]) {
+                model = (cool.models || [])[0];
+            }
+            const rows = (cool.by_model && cool.by_model[model]) || [];
+            const brkFt = cool.mixing_break_ft || 3000;
+            const lowFt = cool.low_ceiling_ft || 3000;
+
+            let html = `<div style="font-size:0.8rem; color:#475569; margin:2px 0 8px; line-height:1.5;">
+                <strong>Cool season (Nov\u2013Mar).</strong> Convective indices are dropped &mdash; deep convection is
+                rare at the Cape in winter and the Cizek forest is a warm-season model. What scrubs instead is the
+                <strong>Thick Cloud Layer rule</strong> on frontal stratiform decks, low stratocumulus, and surface winds
+                from momentum mixed down once the nocturnal inversion breaks.
+                <br>Only the two rightmost <em>airmass</em> columns are 10Z values. Everything else is aggregated across
+                that forecast day's hours, so <em>max</em> means the day's peak and the hour beside it is when.</div>`;
+
+            html += `<table style="width:100%; border-collapse:collapse; font-size:0.86rem;">
+              <thead><tr style="background:#f1f5f9; text-align:left;">
+                <th style="padding:8px 6px;">Day</th>
+                <th style="padding:8px 6px; white-space:nowrap;" title="Mixed-layer depth AGL at 10Z, the day's peak, and the hour of that peak">Mixing&nbsp;(10Z\u2192max)</th>
+                <th style="padding:8px 6px;" title="Inversion break: first hour the mixed layer exceeds ${brkFt.toLocaleString()} ft AGL">Inversion break</th>
+                <th style="padding:8px 6px;" title="Day-mean of the hourly mixed-layer mean wind">PBL Mom Mean</th>
+                <th style="padding:8px 6px;" title="Day peak of the hourly mixed-layer max wind, and the hour it occurs">PBL Mom Max</th>
+                <th style="padding:8px 6px;" title="Hours violating the Thick Cloud Layer LLCC, and the thickest in-band depth">Thick cloud layer</th>
+                <th style="padding:8px 6px;" title="Lowest ceiling of the day, and how many hours sat at or below ${lowFt.toLocaleString()} ft">Low cloud</th>
+                <th style="padding:8px 6px;" title="0\u00b0C and \u221220\u00b0C heights at 10Z — these define the charging band the thick cloud rule tests">0\u00b0C / \u221220\u00b0C</th>
+                <th style="padding:8px 6px;" title="10Z transport flow: 1000\u2013700 mb mean and regime">Airmass (10Z)</th>
+              </tr></thead><tbody>`;
+
+            if (!rows.length) {
+                html += `<tr><td colspan="9" style="padding:14px 6px; color:#94a3b8;">No cool-season rows for ${String(model || '').toUpperCase()} this run.</td></tr>`;
+            }
+            rows.forEach((r, i) => {
+                const bg = i % 2 ? '#ffffff' : '#f8fafc';
+                // A day the inversion never breaks is a forecast, not a gap: momentum stays
+                // aloft and the surface stays light. Say that rather than showing a dash.
+                // "capped" and "nearly broke" are different forecasts. A day that peaked just
+                // under the threshold gets its own chip rather than being flattened into capped.
+                const brk = (r.brk_hh == null)
+                    ? (r.brk_near
+                        ? ctChip('near', '#fde68a', '#78350f') +
+                          `<div style="${CT_SUB}">peaked just under ${brkFt.toLocaleString()} ft</div>`
+                        : ctChip('capped', '#e0e7ff', '#3730a3'))
+                    : ctChip(ctHH(r.brk_hh).replace(/<[^>]*>/g, ''), '#dcfce7', '#166534');
+                const thick = r.thick_hrs
+                    ? ctChip(`${r.thick_hrs} hr${r.thick_hrs === 1 ? '' : 's'}`, '#fecaca', '#7f1d1d') +
+                      `<div style="${CT_SUB}">from ${ctHH(r.thick_first_hh)}<br>max ${ctNum(r.thick_max_ft)} ft</div>`
+                    : '<span style="color:#94a3b8;">none</span>';
+                const noCeil = cool.no_ceiling_ft || 24000;
+                const low = (r.ceil_min == null) ? '<span style="color:#94a3b8;">\u2014</span>'
+                    : (r.ceil_min >= noCeil
+                        // Sentinel, not a measurement: no deck qualified as a ceiling all day.
+                        ? `<span style="color:#0f766e; font-weight:600;">no ceiling</span>
+                           <div style="${CT_SUB}">clear all day</div>`
+                        : `${r.ceil_min <= lowFt ? ctChip(ctNum(r.ceil_min) + ' ft', '#fef3c7', '#78350f') : ctNum(r.ceil_min) + ' ft'}
+                           <div style="${CT_SUB}">min at ${ctHH(r.ceil_min_hh)}<br>${r.low_hrs} hr${r.low_hrs === 1 ? '' : 's'} \u2264 ${lowFt.toLocaleString()} ft</div>`);
+                // n_hours is on the row because RAP and HRRR only reach ~18-21 h: their later
+                // days are partial, and a "day max" over 3 hours is not the same claim.
+                const partial = (r.n_hours != null && r.n_hours < 6)
+                    ? `<div style="font-size:0.74rem; color:#b45309; margin-top:3px; font-weight:600;">partial day (${r.n_hours} hr)</div>` : '';
+                html += `<tr style="background:${bg}; border-bottom:1px solid #e2e8f0;">
+                  <td style="padding:9px 8px; font-weight:600; white-space:nowrap;">${r.day}
+                      <div style="${CT_SUB} font-weight:400;">${r.date}</div>${partial}</td>
+                  <td style="padding:9px 8px;">${ctNum(r.ml_10z)} \u2192 <strong>${ctNum(r.ml_max)}</strong> ft
+                      <div style="${CT_SUB}">peak ${ctHH(r.ml_max_hh)}</div></td>
+                  <td style="padding:8px 6px;">${brk}</td>
+                  <td style="padding:8px 6px;">${ctNum(r.mom_mean, 1)}${r.mom_mean == null ? '' : ' kt'}</td>
+                  <td style="padding:9px 8px;">${ctMomChip(r.mom_max)}
+                      <div style="${CT_SUB}">at ${ctHH(r.mom_max_hh)}</div></td>
+                  <td style="padding:8px 6px;">${thick}</td>
+                  <td style="padding:8px 6px;">${low}</td>
+                  <td style="padding:8px 6px; white-space:nowrap;">${ctNum(r.h0c, 1)} / ${ctNum(r.h20c, 1)} kft</td>
+                  <td style="padding:9px 8px; white-space:nowrap;">${r.mf_dir == null ? '\u2014' : Math.round(r.mf_dir) + '\u00b0 / ' + Math.round(r.mf_spd) + ' kt'}
+                      <div style="${CT_SUB}">${r.regime || ''}${
+                        r.av_dir == null ? '' : `<br>aloft ${Math.round(r.av_dir)}\u00b0 / ${Math.round(r.av_spd)} kt`}</div></td>
+                </tr>`;
+            });
+            html += `</tbody></table>`;
+            html += `<div style="font-size:0.75rem; color:#64748b; margin-top:10px; line-height:1.6;">
+                <strong>Reading it.</strong> <em>Mixing</em> is the diagnosed mixed-layer depth AGL (theta +1.5 K above
+                the surface value). A 10Z value of exactly 1,000 ft is the floor of that diagnosis, meaning
+                <em>capped</em> &mdash; not a measurement. <em>Inversion break</em> is the first hour
+                <strong>at or after ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z</strong>
+                that the layer exceeds ${brkFt.toLocaleString()} ft. The window matters: a UTC day at the Cape starts
+                mid-evening local, so a deep layer at 00\u201306Z is the <em>previous</em> afternoon's residual mixing,
+                not a sunrise break. <em>capped</em> means it never broke; <em>near</em> means the day peaked within 15%
+                of the threshold without crossing \u2014 a coin flip, not a forecast. The day <em>peak</em> still scans
+                all 24 hours, so a residual layer stays visible in the Mixing column even when it cannot be called a break. <em>PBL Mom</em> uses the same mixed-layer diagnosis as the matrix columns, so
+                the numbers are directly comparable. <em>Thick cloud layer</em> counts hours where a deck \u2265 4,500 ft
+                thick overlaps the 0\u00b0C to \u221220\u00b0C band, or where the in-band portion alone reaches 4,500 ft.</div>`;
+            document.getElementById('ltBody').innerHTML = html;
+        }
+
         function showLaunchThermo() {
             if (!launchThermo || !(launchThermo.models || []).length) {
                 alert("No 10Z synoptic data in this run yet.");
@@ -1768,7 +1895,44 @@
             document.getElementById('ltBody').innerHTML = html;
         }
 
+        // Which 10Z panel is showing. 'warm' is the original convective table; 'cool' is the
+        // Nov-Mar table (mixing, momentum transport, thick cloud layer, low cloud). The two are
+        // separate payloads from separate backend builders over the SAME forecast days, so the
+        // toggle swaps the columns without moving the rows.
+        let ltSeason = 'warm';
+
+        function ltHasCool() {
+            const t = ltActiveThermo();
+            return !!(t && t.cool && (t.cool.models || []).length);
+        }
+        function ltSetSeason(s) {
+            if (s === 'cool' && !ltHasCool()) {
+                alert("No cool-season data in this run yet.");
+                return;
+            }
+            ltSeason = s;
+            ltPaintSeasonButtons();
+            renderLaunchThermo();
+        }
+        function ltPaintSeasonButtons() {
+            const on  = 'border:none; padding:4px 12px; cursor:pointer; font-size:0.82rem; background:#1e3a5f; color:#fff; font-weight:600;';
+            const off = 'border:none; padding:4px 12px; cursor:pointer; font-size:0.82rem; background:#fff; color:#475569;';
+            const w = document.getElementById('ltSeasonWarm');
+            const c = document.getElementById('ltSeasonCool');
+            if (!w || !c) return;
+            w.style.cssText = (ltSeason === 'warm' ? on : off);
+            c.style.cssText = (ltSeason === 'cool' ? on : off) + 'border-left:1px solid #cbd5e1;';
+            // A run built before the cool panel existed has no cool payload. Grey the button
+            // rather than hiding it, so the feature does not appear to come and go.
+            if (!ltHasCool()) {
+                c.style.cssText = off + 'border-left:1px solid #cbd5e1; opacity:0.45; cursor:not-allowed;';
+                c.title = 'No cool-season data in this run';
+            }
+        }
+
         function renderLaunchThermo() {
+            ltPaintSeasonButtons();
+            if (ltSeason === 'cool' && ltHasCool()) { renderCoolThermo(); return; }
             // The synthetic 'GFS vs ECMWF' dropdown entry renders a different table entirely.
             if (ltIsCompare()) { renderLaunchThermoCompare(); return; }
             const thermo = ltActiveThermo();
@@ -3405,7 +3569,17 @@
          style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.55); z-index:1000; align-items:flex-start; justify-content:center;">
       <div style="background:#fff; margin-top:5vh; max-width:1180px; width:96%; max-height:88vh; overflow:auto; border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,0.3);">
         <div style="display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid #e2e8f0; position:sticky; top:0; background:#fff;">
-          <div style="font-weight:700; color:#1e3a5f;">10Z Synoptic — <span id="ltSite">KXMR</span></div>
+          <div style="display:flex; align-items:center; gap:12px;">
+            <span style="font-weight:700; color:#1e3a5f;">10Z Synoptic — <span id="ltSite">KXMR</span></span>
+            <span id="ltSeason" style="display:inline-flex; border:1px solid #cbd5e1; border-radius:6px; overflow:hidden;">
+              <button id="ltSeasonWarm" onclick="ltSetSeason('warm')"
+                      title="Convective season: Thompson, PWAT, 700–500 RH, Cizek lightning"
+                      style="border:none; padding:4px 12px; cursor:pointer; font-size:0.82rem;">Warm Season</button>
+              <button id="ltSeasonCool" onclick="ltSetSeason('cool')"
+                      title="Cool season: mixing, PBL momentum transfer, thick cloud layer, low cloud"
+                      style="border:none; padding:4px 12px; cursor:pointer; font-size:0.82rem; border-left:1px solid #cbd5e1;">Cool Season</button>
+            </span>
+          </div>
           <div style="display:flex; align-items:center; gap:8px;">
             <label style="font-size:0.85rem; color:#475569;">Model:</label>
             <select id="ltModel" onchange="ltRenderCmpPickers(); renderLaunchThermoRuns(); renderLaunchThermo();" style="padding:4px 8px; border:1px solid #cbd5e1; border-radius:6px;"></select>
