@@ -5538,15 +5538,6 @@ def _cool_season_day(profiles, anchor):
     if not (ml or mom_max or ceils):
         return None
 
-    # Deep-mixing onset: the FIRST hour the mixed layer gets deeper than DEEP_MIX_FT.
-    # Deliberately a threshold crossing rather than a rate of change -- the profiles are
-    # hourly at best and 3-hourly for several models, so a derivative would mostly measure
-    # the sampling interval. None means the layer never got there, which on a Florida winter
-    # day is itself the forecast: momentum stays aloft and the surface stays light, whether or
-    # not the shallow nocturnal inversion eroded earlier (which this cannot see -- see above).
-    brk = next((hh for hh, v in sorted(ml)
-                if v >= DEEP_MIX_FT and hh in DEEP_MIX_HOURS), None)
-    # Day peak still scans every hour (see DEEP_MIX_HOURS).
     # Inversion erosion: first hour in the window where the lowest 500 ft is well mixed.
     # Distinct from deep mixing and usually EARLIER -- at the Cape in winter the nocturnal
     # inversion routinely erodes with the layer still under 1,500 ft, which is why the deep-mix
@@ -5563,6 +5554,34 @@ def _cool_season_day(profiles, anchor):
         _near = sorted(raw, key=lambda t: (abs(t[0] - 10), t[0]))
         raw_10z = round(_near[0][1]) if _near else None
 
+    # Deep-mixing onset: the first hour the layer is deep enough AND the surface is connected
+    # to it.
+    #
+    # THE SURFACE-CONNECTION TEST IS NOT OPTIONAL, and leaving it out produced onsets EARLIER
+    # than erosion -- which is impossible if the column means what it claims. The cause is the
+    # RESIDUAL LAYER: overnight, yesterday's mixed layer survives aloft as a deep neutral slab
+    # while a thin stable layer forms beneath it at the ground. The theta walk starts at the
+    # surface and climbs until it gains 1.5 K, so a weak 0.8 K surface inversion does not stop
+    # it -- it sails through and reports a 3,500 ft "mixed layer" at 10Z. The depth is real;
+    # the connection to the ground is not, and momentum in that slab is not reaching the
+    # surface while the stable layer is still there.
+    #
+    # Requiring ll_mixed at the same hour makes the column mean "momentum can now reach the
+    # surface" and guarantees onset >= erosion by construction.
+    _mixed_at = dict(mixed)
+    brk = next((hh for hh, v in sorted(ml)
+                if v >= DEEP_MIX_FT and hh in DEEP_MIX_HOURS
+                and (_mixed_at.get(hh) is not False)), None)
+    # Note the `is not False`: on a profile too coarse to evaluate, ll_mixed is None and the
+    # gate cannot be applied, so it falls back to depth alone rather than blanking a column
+    # that was working before. ero_res tells the frontend which regime a row is in.
+
+    # Residual layer at 10Z: deep by the theta walk, but the surface is still decoupled. Worth
+    # surfacing on its own -- it says there IS momentum stored aloft waiting for the inversion
+    # to go, which is a different morning from a genuinely shallow one.
+    resid_10z = bool(raw_10z is not None and raw_10z >= DEEP_MIX_FT
+                     and _mixed_at.get(10) is False)
+
     ml_peak = max(ml, key=lambda t: t[1]) if ml else None
     mom_peak = max(mom_max, key=lambda t: t[1]) if mom_max else None
     ceil_low = min(ceils, key=lambda t: t[1]) if ceils else None
@@ -5578,6 +5597,7 @@ def _cool_season_day(profiles, anchor):
         "ero_res": ero_res,
         "ero_already": ero_already,
         "ml_raw_10z": raw_10z,
+        "resid_10z": resid_10z,
         # True when the day peaked within 15% of the threshold without crossing it. A 2,991 ft
         # peak against a 3,000 ft threshold is a coin flip, not a shallow day, and rendering
         # both as a flat "shallow" chip hides the difference that matters.
