@@ -1354,6 +1354,19 @@
         }
         // Momentum thresholds mirror the matrix legend's Max Momentum Layer bands (20/30/40 kt)
         // so a number means the same thing in both places.
+        // Erosion chip. Three outcomes that must stay distinguishable:
+        //   an hour  -> the lowest 500 ft became well mixed then
+        //   "n/a"    -> every profile this day was too coarse to evaluate (isobaric/REFS).
+        //               NOT the same as "never eroded" -- rendering both as a dash would merge
+        //               a missing instrument with a real forecast.
+        //   "no"     -> evaluated all day and the surface layer stayed stratified
+        function ctEroChip(r) {
+            if (!r.ero_res) return `<span title="this model's profile is too vertically coarse near the surface to resolve erosion" style="color:#94a3b8; font-style:italic;">n/a</span>`;
+            if (r.ero_hh == null) return ctChip('no', '#e0e7ff', '#3730a3');
+            const hh = String(r.ero_hh).padStart(2, '0') + 'Z';
+            return r.ero_already ? ctChip(hh + '\u2264', '#d1fae5', '#065f46')
+                                 : ctChip(hh, '#dcfce7', '#166534');
+        }
         function ctMomChip(v) {
             if (v == null) return '<span style="color:#94a3b8;">\u2014</span>';
             if (v >= 40) return ctChip(v + ' kt', '#7c2d12', '#fff');
@@ -1396,7 +1409,7 @@
             const hhTxt = (h) => h == null ? '\u2014' : String(h).padStart(2, '0') + 'Z';
             const brkTxt = (r) => r.brk_hh == null
                 ? (r.brk_near ? '<span style="color:#78350f;">near</span>'
-                              : '<span style="color:#3730a3;">capped</span>')
+                              : '<span style="color:#3730a3;">shallow</span>')
                 : hhTxt(r.brk_hh);
             const ceilTxt = (r) => r.ceil_min == null ? '\u2014'
                 : (r.ceil_min >= noCeil ? '<span style="color:#0f766e;">no ceiling</span>'
@@ -1410,7 +1423,7 @@
                 <th style="padding:8px 6px;">Day</th>
                 <th style="padding:8px 6px;">Model</th>
                 <th style="padding:8px 6px;" title="Day peak mixed-layer depth AGL">Mixing max</th>
-                <th style="padding:8px 6px;" title="First hour at or after ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z the layer exceeds ${brkFt.toLocaleString()} ft">Inversion break</th>
+                <th style="padding:8px 6px;" title="First hour at or after ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z the layer exceeds ${brkFt.toLocaleString()} ft — when momentum aloft starts reaching the surface. Not an inversion-break detector.">Deep mixing</th>
                 <th style="padding:8px 6px;">PBL Mom Mean</th>
                 <th style="padding:8px 6px;">PBL Mom Max</th>
                 <th style="padding:8px 6px;" title="Hours violating the Thick Cloud Layer rule">Thick cloud</th>
@@ -1440,13 +1453,13 @@
                 html += row(b, S2, false);
 
                 const d = (k) => (a && b && a[k] != null && b[k] != null) ? a[k] - b[k] : null;
-                // Break timing only differences when BOTH broke. One capped and one breaking is
-                // a categorical disagreement, not a two-hour one, and averaging it into a number
-                // would hide the thing most worth seeing.
+                // Onset timing only differences when BOTH mixed out. One shallow and one mixing
+                // is a categorical disagreement, not a two-hour one, and averaging it into a
+                // number would hide the thing most worth seeing.
                 const bothBroke = a && b && a.brk_hh != null && b.brk_hh != null;
                 const brkD = bothBroke ? a.brk_hh - b.brk_hh : null;
                 const brkSplit = (a && b && (a.brk_hh == null) !== (b.brk_hh == null))
-                    ? `<span title="one model breaks the inversion, the other does not" style="background:#fee2e2; color:#991b1b; border:1px solid #fca5a5; padding:1px 7px; border-radius:10px; font-weight:600; font-size:0.78rem;">break / capped</span>`
+                    ? `<span title="one model mixes out, the other stays shallow all day" style="background:#fee2e2; color:#991b1b; border:1px solid #fca5a5; padding:1px 7px; border-radius:10px; font-weight:600; font-size:0.78rem;">mixes / shallow</span>`
                     : ltDeltaChip(brkD, 'brkhr');
                 html += `<tr style="background:${bg}; border-bottom:1px solid #e2e8f0;">
                     <td style="padding:6px; color:#94a3b8; font-size:0.78rem;">\u0394</td>
@@ -1467,9 +1480,9 @@
             });
             html += `</tbody></table>`;
             html += `<div style="font-size:0.76rem; color:#475569; margin-top:10px; line-height:1.55;">
-                <strong>break / capped</strong> \u2014 one model breaks the inversion and the other never does.
-                That is a categorical split, not a timing difference, so it is flagged instead of being
-                turned into a number. A minimum ceiling of <em>no ceiling</em> differences as a blank, since
+                <strong>mixes / shallow</strong> \u2014 one model mixes out past ${brkFt.toLocaleString()} ft and the
+                other never does. That is a categorical split, not a timing difference, so it is flagged instead of
+                being turned into a number. A minimum ceiling of <em>no ceiling</em> differences as a blank, since
                 ${noCeil.toLocaleString()} ft is a sentinel rather than a measurement.</div>`;
             document.getElementById('ltBody').innerHTML = html;
         }
@@ -1512,6 +1525,8 @@
             const rows = (cool.by_model && cool.by_model[model]) || [];
             const brkFt = cool.mixing_break_ft || 3000;
             const lowFt = cool.low_ceiling_ft || 3000;
+            const eroFt = cool.erosion_depth_ft || 500;
+            const eroK  = cool.erosion_dtheta_k || 0.5;
 
             // Kept deliberately short. The detail that used to live here is in the column
             // header tooltips, where it is available on demand instead of occupying a third of
@@ -1523,8 +1538,9 @@
             html += `<table style="width:100%; border-collapse:collapse; font-size:0.86rem;">
               <thead><tr style="background:#f1f5f9; text-align:left;">
                 <th style="padding:8px 6px;">Day</th>
-                <th style="padding:8px 6px; white-space:nowrap;" title="Mixed-layer depth AGL (theta +1.5 K above the surface value): the 10Z value, the day's peak, and the hour of that peak. Exactly 1,000 ft is the floor of the diagnosis, meaning capped — not a measurement.">Mixing&nbsp;(10Z\u2192max)</th>
-                <th style="padding:8px 6px;" title="First hour at or after ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z that the mixed layer exceeds ${brkFt.toLocaleString()} ft AGL. The window matters: a UTC day at the Cape starts mid-evening local, so a deep layer at 00-06Z is the previous afternoon's residual mixing, not a sunrise break. The day peak still scans all 24 hours.">Inversion break</th>
+                <th style="padding:8px 6px; white-space:nowrap;" title="Mixed-layer depth AGL (theta +1.5 K above the surface value): the 10Z value, the day's peak, and the hour of that peak. Exactly 1,000 ft is the floor of the diagnosis — the true layer may be shallower, and a nocturnal inversion can erode entirely below it.">Mixing&nbsp;(10Z\u2192max)</th>
+                <th style="padding:8px 6px;" title="First hour the lowest ${eroFt} ft becomes well mixed (theta spread under ${eroK} K) — the nocturnal inversion is gone and fog or stratus start lifting. Needs a vertically fine profile: BUFKIT columns resolve it, mandatory-isobaric ones (ECMWF, RRFS, REFS, and any coarse-fallback column) cannot and show n/a. A trailing ≤ means it was already mixed at the first hour of the window, i.e. it never restratified overnight.">Erosion</th>
+                <th style="padding:8px 6px;" title="First hour at or after ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z that the mixed layer exceeds ${brkFt.toLocaleString()} ft AGL — when momentum from aloft starts reaching the surface. Usually LATER than erosion; the gap between the two columns is the forecast.">Deep mixing</th>
                 <th style="padding:8px 6px;" title="Day-mean of the hourly mixed-layer mean wind. Same mixed-layer diagnosis as the matrix columns, so the numbers are directly comparable.">PBL Mom Mean</th>
                 <th style="padding:8px 6px;" title="Day peak of the hourly mixed-layer max wind, and the hour it occurs. Chip colours match the matrix legend's Max Momentum Layer bands (20/30/40 kt).">PBL Mom Max</th>
                 <th style="padding:8px 6px;" title="Hours where a deck at least 4,500 ft thick overlaps the 0C to -20C band, or where the in-band portion alone reaches 4,500 ft — plus the first such hour and the thickest in-band depth.">Thick cloud layer</th>
@@ -1534,19 +1550,19 @@
               </tr></thead><tbody>`;
 
             if (!rows.length) {
-                html += `<tr><td colspan="9" style="padding:14px 6px; color:#94a3b8;">No cool-season rows for ${String(model || '').toUpperCase()} this run.</td></tr>`;
+                html += `<tr><td colspan="10" style="padding:14px 6px; color:#94a3b8;">No cool-season rows for ${String(model || '').toUpperCase()} this run.</td></tr>`;
             }
             rows.forEach((r, i) => {
                 const bg = i % 2 ? '#ffffff' : '#f8fafc';
                 // A day the inversion never breaks is a forecast, not a gap: momentum stays
                 // aloft and the surface stays light. Say that rather than showing a dash.
-                // "capped" and "nearly broke" are different forecasts. A day that peaked just
-                // under the threshold gets its own chip rather than being flattened into capped.
+                // "shallow" and "nearly mixed out" are different forecasts. A day that peaked
+                // just under the threshold gets its own chip rather than being flattened in.
                 const brk = (r.brk_hh == null)
                     ? (r.brk_near
                         ? ctChip('near', '#fde68a', '#78350f') +
                           `<div style="${CT_SUB}">peaked just under ${brkFt.toLocaleString()} ft</div>`
-                        : ctChip('capped', '#e0e7ff', '#3730a3'))
+                        : ctChip('shallow', '#e0e7ff', '#3730a3'))
                     : ctChip(ctHH(r.brk_hh).replace(/<[^>]*>/g, ''), '#dcfce7', '#166534');
                 const thick = r.thick_hrs
                     ? ctChip(`${r.thick_hrs} hr${r.thick_hrs === 1 ? '' : 's'}`, '#fecaca', '#7f1d1d') +
@@ -1569,6 +1585,8 @@
                       <div style="${CT_SUB} font-weight:400;">${r.date}</div>${partial}</td>
                   <td style="padding:9px 8px;">${ctNum(r.ml_10z)} \u2192 <strong>${ctNum(r.ml_max)}</strong> ft
                       <div style="${CT_SUB}">peak ${ctHH(r.ml_max_hh)}</div></td>
+                  <td style="padding:8px 6px;">${ctEroChip(r)}${
+                     r.ml_raw_10z == null ? '' : `<div style="${CT_SUB}">10Z layer ${ctNum(r.ml_raw_10z)} ft</div>`}</td>
                   <td style="padding:8px 6px;">${brk}</td>
                   <td style="padding:8px 6px;">${ctNum(r.mom_mean, 1)}${r.mom_mean == null ? '' : ' kt'}</td>
                   <td style="padding:9px 8px;">${ctMomChip(r.mom_max)}
@@ -1585,11 +1603,17 @@
             // Only the three things a column header cannot carry: the two chip meanings and
             // the diagnosis floor, each of which is a number that means "not a measurement".
             html += `<div style="font-size:0.76rem; color:#475569; margin-top:10px; line-height:1.55;">
-                <strong>capped</strong> \u2014 never exceeded ${brkFt.toLocaleString()} ft after
+                <strong>Erosion</strong> is when the nocturnal inversion goes (lowest ${eroFt} ft well mixed);
+                <strong>Deep mixing</strong> is the later hour the layer gets deep enough for momentum aloft to reach
+                the surface \u2014 typically 2\u20133 hours apart in winter. Erosion reads <em>n/a</em> where the
+                profile is too coarse near the surface to resolve it: that means <em>cannot tell</em>, not
+                <em>never</em>. The <em>10Z layer</em> figure beneath it is the unclamped depth, so unlike the Mixing
+                column it can read below 1,000 ft.
+                <strong>shallow</strong> \u2014 never exceeded ${brkFt.toLocaleString()} ft after
                 ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z (a deep layer at
-                00\u201306Z is the previous afternoon's residual, not a break).
+                00\u201306Z is the previous afternoon's residual).
                 <strong>near</strong> \u2014 peaked within 15% without crossing.
-                A 10Z mixing value of exactly 1,000 ft is the diagnosis floor, not a measurement.</div>`;
+                A 10Z mixing value of exactly 1,000 ft is that floor, not a measurement.</div>`;
             document.getElementById('ltBody').innerHTML = html;
         }
 
