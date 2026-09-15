@@ -1540,7 +1540,7 @@
                 <th style="padding:8px 6px;">Day</th>
                 <th style="padding:8px 6px; white-space:nowrap;" title="Mixed-layer depth AGL (theta +1.5 K above the surface value): the 10Z value, the day's peak, and the hour of that peak. Exactly 1,000 ft is the floor of the diagnosis — the true layer may be shallower, and a nocturnal inversion can erode entirely below it.">Mixing&nbsp;(10Z\u2192max)</th>
                 <th style="padding:8px 6px;" title="First hour the lowest ${eroFt} ft becomes well mixed (theta spread under ${eroK} K) — the nocturnal inversion is gone and fog or stratus start lifting. Needs a vertically fine profile: BUFKIT columns resolve it, mandatory-isobaric ones (ECMWF, RRFS, REFS, and any coarse-fallback column) cannot and show n/a. A trailing ≤ means it was already mixed at the first hour of the window, i.e. it never restratified overnight.">Erosion</th>
-                <th style="padding:8px 6px;" title="First hour at or after ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z that the mixed layer exceeds ${brkFt.toLocaleString()} ft AGL — when momentum from aloft starts reaching the surface. Usually LATER than erosion; the gap between the two columns is the forecast.">Deep mixing</th>
+                <th style="padding:8px 6px;" title="First hour at or after ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z that the mixed layer exceeds ${brkFt.toLocaleString()} ft AGL AND the surface is connected to it. The surface test matters: a residual layer aloft can be 3,500 ft deep at 10Z with a stable layer still at the ground, and momentum in it is not reaching the surface. Never earlier than Erosion. On coarse profiles the surface test cannot be applied and this falls back to depth alone.">Deep mixing</th>
                 <th style="padding:8px 6px;" title="Day-mean of the hourly mixed-layer mean wind. Same mixed-layer diagnosis as the matrix columns, so the numbers are directly comparable.">PBL Mom Mean</th>
                 <th style="padding:8px 6px;" title="Day peak of the hourly mixed-layer max wind, and the hour it occurs. Chip colours match the matrix legend's Max Momentum Layer bands (20/30/40 kt).">PBL Mom Max</th>
                 <th style="padding:8px 6px;" title="Hours where a deck at least 4,500 ft thick overlaps the 0C to -20C band, or where the in-band portion alone reaches 4,500 ft — plus the first such hour and the thickest in-band depth.">Thick cloud layer</th>
@@ -1586,7 +1586,8 @@
                   <td style="padding:9px 8px;">${ctNum(r.ml_10z)} \u2192 <strong>${ctNum(r.ml_max)}</strong> ft
                       <div style="${CT_SUB}">peak ${ctHH(r.ml_max_hh)}</div></td>
                   <td style="padding:8px 6px;">${ctEroChip(r)}${
-                     r.ml_raw_10z == null ? '' : `<div style="${CT_SUB}">10Z layer ${ctNum(r.ml_raw_10z)} ft</div>`}</td>
+                     r.ml_raw_10z == null ? '' : `<div style="${CT_SUB}">10Z layer ${ctNum(r.ml_raw_10z)} ft${
+                       r.resid_10z ? ` <span title="deep neutral layer aloft at 10Z but the surface is still decoupled — yesterday's mixed layer surviving overnight, with momentum stored in it waiting for the inversion to go" style="color:#7c3aed; font-weight:600;">residual</span>` : ''}</div>`}</td>
                   <td style="padding:8px 6px;">${brk}</td>
                   <td style="padding:8px 6px;">${ctNum(r.mom_mean, 1)}${r.mom_mean == null ? '' : ' kt'}</td>
                   <td style="padding:9px 8px;">${ctMomChip(r.mom_max)}
@@ -1608,7 +1609,9 @@
                 the surface \u2014 typically 2\u20133 hours apart in winter. Erosion reads <em>n/a</em> where the
                 profile is too coarse near the surface to resolve it: that means <em>cannot tell</em>, not
                 <em>never</em>. The <em>10Z layer</em> figure beneath it is the unclamped depth, so unlike the Mixing
-                column it can read below 1,000 ft.
+                column it can read below 1,000 ft; <strong>residual</strong> there means that depth is yesterday's
+                mixed layer surviving aloft with the surface still decoupled beneath it \u2014 real momentum, stored,
+                waiting on the inversion.
                 <strong>shallow</strong> \u2014 never exceeded ${brkFt.toLocaleString()} ft after
                 ${String(cool.break_from_hh == null ? 10 : cool.break_from_hh).padStart(2,'0')}Z (a deep layer at
                 00\u201306Z is the previous afternoon's residual).
