@@ -10,7 +10,7 @@ name: Update IVT Maps
 # 3 hours -- move to '40 * * * *' if that matters more than the Actions minutes.
 on:
   schedule:
-    - cron: '7 * * * *'
+    - cron: '7 * * 1 *'
   workflow_dispatch:
     inputs:
       models:
