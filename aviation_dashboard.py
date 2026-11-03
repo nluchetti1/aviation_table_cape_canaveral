@@ -2947,17 +2947,17 @@ def _rrfs_grib_url(model_kind, date_str, cycle, f_hour_int):
     """Build the AWS S3 URL for an RRFS deterministic, REFS ensemble-mean, or HRRR
     pressure-level file. For REFS, uses the module-cached resolved filename pattern."""
     if model_kind == "refs":
-        # refs/para/refs.YYYYMMDD/HH/ensprod/refs.tHHz.mean.fFF.conus.grib2
+        # refs/prod/refs.YYYYMMDD/HH/ensprod/refs.tHHz.mean.fFF.conus.grib2
         # Note the extra ensprod/ level and the TWO-digit forecast hour; RRFS uses three.
         f_name = f"refs.t{cycle}z.mean.f{f_hour_int:02d}.conus.grib2"
-        return f"{RRFS_NOMADS_ROOT}/refs/para/refs.{date_str}/{cycle}/ensprod/{f_name}"
+        return f"{RRFS_NOMADS_ROOT}/refs/prod/refs.{date_str}/{cycle}/ensprod/{f_name}"
     elif model_kind == "hrrr":
         f_name = f"hrrr.t{cycle}z.wrfprsf{f_hour_int:02d}.grib2"
         return f"{HRRR_AWS_ROOT}/hrrr.{date_str}/conus/{f_name}"
     else:
-        # rrfs/para/rrfs.YYYYMMDD/HH/rrfs.tHHz.prslev.3km.fFFF.conus.grib2
+        # rrfs/prod/rrfs.YYYYMMDD/HH/rrfs.tHHz.prslev.3km.fFFF.conus.grib2
         f_name = f"rrfs.t{cycle}z.prslev.3km.f{f_hour_int:03d}.conus.grib2"
-        return f"{RRFS_NOMADS_ROOT}/rrfs/para/rrfs.{date_str}/{cycle}/{f_name}"
+        return f"{RRFS_NOMADS_ROOT}/rrfs/prod/rrfs.{date_str}/{cycle}/{f_name}"
 
 
 def fetch_rrfs_pad_hour(session, model_kind, date_str, cycle, f_hour_int, row_key, all_coords, debug=False):
@@ -4186,7 +4186,7 @@ def fetch_refs_echotop_probs():
     WINDOW_FH = 24  # end of the launch-planning window; also the tasks-loop depth below
 
     def _probe(d, cc, fh):
-        purl = (f"{RRFS_NOMADS_ROOT}/refs/para/refs.{d}/{cc}/ensprod/"
+        purl = (f"{RRFS_NOMADS_ROOT}/refs/prod/refs.{d}/{cc}/ensprod/"
                 f"refs.t{cc}z.prob.f{fh:02d}.conus.grib2.idx")
         try:
             r = session.get(purl, timeout=12)
@@ -4255,7 +4255,7 @@ def fetch_refs_echotop_probs():
     nbr_lock = threading.Lock()
 
     def _prob_url(fh):
-        return (f"{RRFS_NOMADS_ROOT}/refs/para/refs.{date_str}/{cycle}/ensprod/"
+        return (f"{RRFS_NOMADS_ROOT}/refs/prod/refs.{date_str}/{cycle}/ensprod/"
                 f"refs.t{cycle}z.prob.f{fh:02d}.conus.grib2")
 
     def _worker(fh, row_key):
